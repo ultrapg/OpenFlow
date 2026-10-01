@@ -142,9 +142,6 @@ class MainActivity : ComponentActivity() {
                                     .clickable {
                                         language = value
                                         prefs.edit().putString("language", value).apply()
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(context) && micPermissionState.status.isGranted) {
-                                            restartService()
-                                        }
                                     }
                                     .padding(8.dp),
                                     horizontalArrangement = Arrangement.Center
@@ -186,10 +183,6 @@ class MainActivity : ComponentActivity() {
                                 onValueChange = { bubbleSize = it },
                                 onValueChangeFinished = {
                                     prefs.edit().putFloat("bubble_size", bubbleSize).apply()
-                                    // Restart bubble to apply changes
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(context) && micPermissionState.status.isGranted) {
-                                        restartService()
-                                    }
                                 },
                                 valueRange = 36f..80f,
                                 steps = 10,

@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.WindowManager
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
 import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 import androidx.core.app.NotificationCompat
@@ -70,17 +71,34 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         return null
     }
 
+    private val prefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
+        if (key == "language") {
+            loadModel(currentModelType)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         savedStateRegistryController.performRestore(null)
-        startCustomForeground()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         loadModel(currentModelType)
         setupOverlayView()
+        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener)
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        startCustomForeground()
+        return START_STICKY
+    }
+
+    private var loadModelJob: Job? = null
+
     private fun loadModel(modelType: String) {
-        serviceScope.launch(Dispatchers.IO) {
+        val previousJob = loadModelJob
+        loadModelJob = serviceScope.launch(Dispatchers.IO) {
+            previousJob?.cancelAndJoin()
             val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
             val selectedLang = prefs.getString("language", "auto") ?: "auto"
 
@@ -247,8 +265,26 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     val currentState by bubbleState.collectAsState()
                     val isFocused by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
                     val prefs = androidx.compose.runtime.remember { getSharedPreferences("openflow_settings", Context.MODE_PRIVATE) }
-                    val showOnlyOnInputs = androidx.compose.runtime.remember { prefs.getBoolean("show_only_on_inputs", true) }
-                    val bubbleSize = androidx.compose.runtime.remember { prefs.getFloat("bubble_size", 52f) }
+                    var showOnlyOnInputs by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(prefs.getBoolean("show_only_on_inputs", true)) }
+                    var bubbleSize by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(prefs.getFloat("bubble_size", 52f)) }
+                    
+                    val listener = androidx.compose.runtime.remember {
+                        android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
+                            if (sharedPreferences != null && key != null) {
+                                when (key) {
+                                    "show_only_on_inputs" -> showOnlyOnInputs = sharedPreferences.getBoolean(key, true)
+                                    "bubble_size" -> bubbleSize = sharedPreferences.getFloat(key, 52f)
+                                }
+                            }
+                        }
+                    }
+                    
+                    androidx.compose.runtime.DisposableEffect(prefs, listener) {
+                        prefs.registerOnSharedPreferenceChangeListener(listener)
+                        onDispose {
+                            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+                        }
+                    }
                     val isEffectivelyFocused = if (showOnlyOnInputs) isFocused else true
 
                     BubbleOverlayComponent(
@@ -399,6 +435,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     override fun onDestroy() {
         super.onDestroy()
+        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+        prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         GlobalScope.launch { audioController.release() }
         speechEngine?.release()
         serviceScope.cancel()
