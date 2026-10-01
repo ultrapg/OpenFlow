@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">OpenFlow</string>
+    <string name="accessibility_service_label">OpenFlow Text Injection</string>
+    <string name="accessibility_service_description">Ermöglicht der OpenFlow Bubble, gesprochenen Text direkt in andere Apps einzufügen.</string>
+</resources>
