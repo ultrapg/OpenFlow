@@ -1,36 +1,40 @@
 # OpenFlow
 
-Willkommen bei **OpenFlow**, einer vollkommen offline funktionierenden, hochpräzisen Speech-to-Text (Sprache-zu-Text) App für Android. 
-
-Diese App wurde entwickelt, um Sprache extrem schnell, präzise und datenschutzfreundlich direkt auf deinem Smartphone zu transkribieren.
+Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) dictation app for Android with a system-wide floating bubble and accessibility text injection.
 
 ## 🚀 Features
-- **100% Offline:** Deine Audiodaten verlassen niemals dein Gerät. Alles wird lokal über C++ (Sherpa-ONNX) berechnet.
-- **Hohe Genauigkeit:** Nutzt das fortschrittliche NVIDIA Canary 180M Modell für perfekte Satzzeichen, Groß-/Kleinschreibung und Denglisch-Support.
-- **Auto-Spracherkennung (LID):** Ein winziges Whisper-Modell (int8) lauscht kurz, erkennt automatisch, ob du Deutsch oder Englisch sprichst, und steuert das Hauptmodell entsprechend.
-- **Überall diktieren:** Fügt den gesprochenen Text über einen Accessibility-Service automatisch in jedes beliebige Textfeld auf deinem Handy ein.
-- **Floating Bubble UI:** Eine kleine schwebende Blase bleibt immer griffbereit am Bildschirmrand.
+- **On-Device Audio AI Pipeline:** All audio inference runs locally on your smartphone via **LiteRT** (CPU + GPU/OpenCL acceleration). Your voice recordings never leave your device.
+- **4-Stage Desert Ant Labs Audio Ecosystem:**
+  - **`Clear` (`clear-studio`, 24 MB):** Neural speech enhancement and denoising in noisy environments.
+  - **`Ear` (22 MB):** Spoken language identification (107 languages) that automatically routes dictation across supported European languages or falls back to your preferred language.
+  - **`Voz` (337 MB):** High-accuracy multilingual transcription across 25 European languages with automatic punctuation, capitalization, word-level timestamps ($80\text{ ms}$ resolution), and custom vocabulary biasing.
+  - **`Uhm` (24 MB):** Temporal acoustic filler detector ($20\text{ ms}$ frame resolution) that strips hesitations (`uh`, `um`, `hmm`) by cross-referencing `Voz` word timestamps without deleting legitimate words.
+- **Resumable Background Model Downloads:**
+  - **Lightweight APK (~73 MB for `arm64-v8a`):** Speech models are downloaded in-app on first launch (or when toggled on in Settings) with full local storage management.
+  - **Live Telemetry:** Real-time download speed (`MB/s` or `KB/s`), estimated time remaining (ETA), active file name, and byte progress (`MB / Total MB`).
+  - **Background Execution & HTTP Range Resume:** Runs in a foreground service with a live status-bar progress notification and `Range: bytes=<offset>-` support so downloads continue when switching apps, survive slow/unstable internet connections with automatic exponential-backoff retries, and can be paused and resumed anytime without losing progress.
+- **Dictate Everywhere:** Automatically injects transcribed text into any focused input field via Android's Accessibility Service, with automatic clipboard fallback.
+- **Floating Bubble UI:** Always-accessible, draggable overlay bubble with real-time RMS audio visualization.
 
-## 📦 Installation
+## 📦 Building & Installation
 
-Du findest die fertige APK direkt hier im Repository im Ordner `release`. Lade sie einfach herunter und installiere sie auf deinem Android-Gerät.
-
-### WICHTIG: Modelle & Bibliotheken herunterladen (Nur für Entwickler)
-Da die KI-Modelle und C++ Bibliotheken zu groß für GitHub sind, liegen sie nicht in diesem Repository. Wenn du den Code klonst und selbst kompilieren möchtest, führe einfach dieses Skript im Hauptverzeichnis aus:
+Clone the repository and build directly with Gradle or Android Studio—no manual model download scripts required:
 
 ```bash
-./setup_project.sh
+# Build debug APK
+./gradlew assembleDebug
+
+# Build signed arm64-v8a release APK (~73 MB)
+./gradlew assembleRelease
 ```
 
-Das Skript lädt automatisch die C++ Bibliotheken (`.aar`) sowie die stark komprimierten (INT8) Versionen von **NVIDIA Canary** und **Whisper Tiny** herunter und platziert alles exakt im richtigen Ordner. Danach kannst du die App fehlerfrei in Android Studio bauen!
+On first launch, OpenFlow's onboarding flow lets you customize which optional models (`Ear`, `Clear`, `Uhm`) to download alongside `Voz`.
 
-## 🛠️ Gebaut mit
-- [Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx)
-- Android Jetpack Compose
+## 🛠️ Built With
+- **Powered by [Desert Ant Labs](https://desertant.com)** (`Voz`, `Ear`, `Clear`, `Uhm` v4.0.0 on LiteRT)
+- Android Jetpack Compose & Material 3
 - Kotlin Coroutines
 
-## 📜 Lizenz
-Dieses Projekt ist unter der **GNU General Public License v3.0 (GPL-3.0)** lizenziert. Weitere Informationen findest du in der `LICENSE`-Datei.
-
----
-Entwickelt von [@ultrapg](https://github.com/ultrapg)
+## 📜 License & Attribution
+- **OpenFlow Source Code:** Licensed under the **Apache License, Version 2.0** (`Apache-2.0`). See [`LICENSE`](LICENSE) for full terms.
+- **Desert Ant Labs SDKs & Model Weights:** Provided under the [Desert Ant Labs Source-Available License v1.0](https://license.desertant.com/1.0). Free for personal, academic, and commercial products up to **100,000 Monthly Active Users / Devices (MAU/MAD)** per model, per platform (`Voz`, `Ear`, `Clear`, `Uhm`). Commercial deployments exceeding 100K MAU/MAD require a commercial license from Desert Ant Labs.

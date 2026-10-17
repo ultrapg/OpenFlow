@@ -1,9 +1,26 @@
+/*
+ * Copyright 2026 OpenFlow Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.voicebubble.openflow.overlay
 
 import android.annotation.SuppressLint
 import android.app.*
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
@@ -18,7 +35,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
-import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.*
 import androidx.savedstate.SavedStateRegistry
@@ -29,12 +45,11 @@ import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilitySer
 import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.database.AppDatabase
 import com.voicebubble.openflow.core.database.TranscriptionRecord
-import com.voicebubble.openflow.core.speech.SherpaSpeechEngine
+import com.voicebubble.openflow.core.speech.SmartPipeline
+import com.voicebubble.openflow.settings.ModelSettings
+import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
-import java.io.File
-import java.io.FileOutputStream
-import java.util.zip.ZipInputStream
 
 enum class OverlayBubbleState {
     IDLE,
@@ -56,24 +71,22 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     private lateinit var layoutParams: WindowManager.LayoutParams
 
     private val audioController = AudioRecordingController()
-    private var speechEngine: SherpaSpeechEngine? = null
+    private lateinit var smartPipeline: SmartPipeline
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    private var currentModelType: String = "nemo-canary-180m"
-
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
-
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)
         return null
     }
 
-    private val prefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
-        if (key == "language") {
-            loadModel(currentModelType)
+    private val modelPrefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        val updatedSettings = ModelSettings.load(this@FloatingBubbleService)
+        serviceScope.launch(Dispatchers.IO) {
+            smartPipeline.reloadSettings(updatedSettings)
         }
     }
 
@@ -81,10 +94,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         super.onCreate()
         savedStateRegistryController.performRestore(null)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        loadModel(currentModelType)
+        smartPipeline = SmartPipeline.getInstance(this)
+        initializePipeline()
         setupOverlayView()
-        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
-        prefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        val modelPrefs = ModelSettings.getPreferences(this)
+        modelPrefs.registerOnSharedPreferenceChangeListener(modelPrefsListener)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -93,100 +107,43 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         return START_STICKY
     }
 
-    private var loadModelJob: Job? = null
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && ::smartPipeline.isInitialized) {
+            smartPipeline.onTrimMemory(level)
+        }
+    }
 
-    private fun loadModel(modelType: String) {
-        val previousJob = loadModelJob
-        loadModelJob = serviceScope.launch(Dispatchers.IO) {
+    private var initPipelineJob: Job? = null
+
+    private fun initializePipeline() {
+        val previousJob = initPipelineJob
+        initPipelineJob = serviceScope.launch(Dispatchers.IO) {
             previousJob?.cancelAndJoin()
-            val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
-            val selectedLang = prefs.getString("language", "auto") ?: "auto"
-
-            currentModelType = modelType
-            speechEngine?.release()
-            speechEngine = null
-
-            val modelDir = File(filesDir, "models/$modelType")
-            if (!modelDir.exists()) {
-                modelDir.mkdirs()
-            }
-
-            val lidDir = File(filesDir, "models/lid/sherpa-onnx-whisper-tiny")
-            if (selectedLang == "auto" && !lidDir.exists()) {
-                lidDir.mkdirs()
-            }
-
-            val hotwordsFile = File(filesDir, "hotwords.txt")
-            if (!hotwordsFile.exists()) {
-                try {
-                    hotwordsFile.writeText("OpenFlow\nTranskription")
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-
-            val copyAssets = { assetsPath: String, targetDir: File ->
-                try {
-                    val assetFiles = assets.list(assetsPath)
-                    if (assetFiles != null && assetFiles.isNotEmpty()) {
-                        for (filename in assetFiles) {
-                            val outFile = File(targetDir, filename)
-                            if (outFile.exists() && outFile.length() > 0) continue
-                            try {
-                                this@FloatingBubbleService.assets.open("$assetsPath/$filename").use { inputStream ->
-                                    FileOutputStream(outFile).use { outputStream ->
-                                        inputStream.copyTo(outputStream)
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-
-            copyAssets("models/$modelType", modelDir)
-            if (selectedLang == "auto") {
-                copyAssets("models/lid/sherpa-onnx-whisper-tiny", lidDir)
-            }
-
-            val tokensFile = "$modelDir/tokens.txt"
-            if (File(modelDir, "encoder.int8.onnx").exists() && File(tokensFile).exists()) {
-                try {
-                    speechEngine = SherpaSpeechEngine(
-                        modelType = modelType,
-                        modelPath = modelDir.absolutePath,
-                        tokensPath = tokensFile,
-                        hotwordsPath = hotwordsFile.absolutePath,
-                        lidPath = if (selectedLang == "auto") lidDir.absolutePath else null,
-                        defaultLang = if (selectedLang == "auto") "de" else selectedLang
-                    ).apply { initialize() }
-                    withContext(Dispatchers.Main) {
+            try {
+                smartPipeline.reloadSettings(ModelSettings.load(this@FloatingBubbleService))
+                val ready = smartPipeline.initialize()
+                withContext(Dispatchers.Main) {
+                    if (ready) {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,
-                            "Modell geladen",
+                            "Desert Ant audio pipeline ready",
                             android.widget.Toast.LENGTH_SHORT
                         ).show()
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    modelDir.deleteRecursively()
-                    withContext(Dispatchers.Main) {
+                    } else {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,
-                            "Fehler beim Laden",
+                            "Please download the Voz speech model in the app first.",
                             android.widget.Toast.LENGTH_LONG
                         ).show()
                     }
                 }
-            } else {
+            } catch (e: Exception) {
+                e.printStackTrace()
                 withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         this@FloatingBubbleService,
-                        "Fehler: Modell-Dateien fehlen!",
+                        "Initialization error: ${e.message}",
                         android.widget.Toast.LENGTH_LONG
                     ).show()
                 }
@@ -199,7 +156,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 channelId,
-                "Spracheingabe-Dienst",
+                "Voice Dictation Service",
                 NotificationManager.IMPORTANCE_LOW
             )
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
@@ -208,12 +165,14 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, com.voicebubble.openflow.MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK },
+            Intent(this, com.voicebubble.openflow.MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("OpenFlow aktiv")
-            .setContentText("Tippe auf die Bubble zum Diktieren.")
+            .setContentTitle("OpenFlow Active")
+            .setContentText("Tap the floating bubble to dictate.")
             .setSmallIcon(com.voicebubble.openflow.R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -246,7 +205,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 WindowManager.LayoutParams.TYPE_PHONE
             },
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.LEFT
@@ -264,10 +223,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 OpenFlowTheme {
                     val currentState by bubbleState.collectAsState()
                     val isFocused by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
-                    val prefs = androidx.compose.runtime.remember { getSharedPreferences("openflow_settings", Context.MODE_PRIVATE) }
-                    var showOnlyOnInputs by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(prefs.getBoolean("show_only_on_inputs", true)) }
-                    var bubbleSize by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(prefs.getFloat("bubble_size", 52f)) }
-                    
+                    val prefs = androidx.compose.runtime.remember {
+                        getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+                    }
+                    var showOnlyOnInputs by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(prefs.getBoolean("show_only_on_inputs", true))
+                    }
+                    var bubbleSize by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(prefs.getFloat("bubble_size", 52f))
+                    }
+
                     val listener = androidx.compose.runtime.remember {
                         android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
                             if (sharedPreferences != null && key != null) {
@@ -278,7 +243,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                         }
                     }
-                    
+
                     androidx.compose.runtime.DisposableEffect(prefs, listener) {
                         prefs.registerOnSharedPreferenceChangeListener(listener)
                         onDispose {
@@ -330,7 +295,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             windowManager.addView(composeView, layoutParams)
         } catch (e: Exception) {
             e.printStackTrace()
-            android.widget.Toast.makeText(this, "Fehler: Overlay-Berechtigung fehlt!", android.widget.Toast.LENGTH_LONG).show()
+            android.widget.Toast.makeText(
+                this,
+                "Error: Missing overlay permission!",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
             stopSelf()
         }
     }
@@ -360,7 +329,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
                 vibrator.vibrate(duration)
             }
-        } catch (e: Exception) {}
+        } catch (_: Exception) {
+        }
     }
 
     private fun processAudio(samples: FloatArray) {
@@ -370,13 +340,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             try {
                 processingProgress.value = ""
 
-                var chunkText = speechEngine?.transcribe(samples) { current, total ->
-                    if (total > 1) {
-                        processingProgress.value = "$current / $total"
-                    }
-                } ?: ""
+                val chunkText = smartPipeline.transcribe(samples) { stageLabel ->
+                    processingProgress.value = stageLabel
+                }
 
-                var finalText = chunkText.trim()
+                val finalText = chunkText.trim()
                     .replace(Regex(" +([.,!?:;%€])"), "$1")
                     .replace("O K", "OK")
                     .replace("o k", "ok")
@@ -391,7 +359,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", finalText))
                         withContext(Dispatchers.Main) {
-                            android.widget.Toast.makeText(this@FloatingBubbleService, "In Zwischenablage kopiert", android.widget.Toast.LENGTH_SHORT).show()
+                            android.widget.Toast.makeText(
+                                this@FloatingBubbleService,
+                                "Copied to clipboard",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
                         }
                     }
 
@@ -404,7 +376,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 transcribedText = finalText,
                                 durationMs = (samples.size / 16f).toLong(),
                                 audioSamplesCount = samples.size,
-                                modelIdentifier = currentModelType,
+                                modelIdentifier = "desert-ant-voz-4.0.0",
                                 wasInjectedSuccessfully = isFocused
                             )
                         )
@@ -415,9 +387,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
                 processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.SUCCESS
-                kotlinx.coroutines.delay(1500)
+                delay(1500)
                 bubbleState.value = OverlayBubbleState.IDLE
-
             } catch (e: Exception) {
                 e.printStackTrace()
                 processingProgress.value = ""
@@ -425,7 +396,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         this@FloatingBubbleService,
-                        "Verarbeitungsfehler: ${e.message}",
+                        "Transcription error: ${e.message}",
                         android.widget.Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -435,10 +406,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     override fun onDestroy() {
         super.onDestroy()
-        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
-        prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        val modelPrefs = ModelSettings.getPreferences(this)
+        modelPrefs.unregisterOnSharedPreferenceChangeListener(modelPrefsListener)
         GlobalScope.launch { audioController.release() }
-        speechEngine?.release()
+        GlobalScope.launch { smartPipeline.shutdown() }
         serviceScope.cancel()
         if (::composeView.isInitialized) {
             try {
