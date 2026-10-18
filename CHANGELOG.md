@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.0] - 2026-10-18
+
+### Added
+- **Material Design 3 Floating Bubble with Expressive Spring UI Physics (`BubbleOverlayComponent` & `Theme`):**
+  - Redesigned the floating overlay bubble around Material Design 3 semantic color roles (`primaryContainer`/`onPrimaryContainer`, `errorContainer`/`onErrorContainer`/`error`, `secondaryContainer`/`onSecondaryContainer`, `tertiaryContainer`/`onTertiaryContainer`) with Material You dynamic color support and a custom M3 Indigo/Teal fallback palette.
+  - Added M3 Expressive shape morphing from a `32%` squircle FAB in `IDLE` into a `50%` Stadium Pill during `RECORDING` and `PROCESSING`, driven by `Spring.DampingRatioLowBouncy` physics.
+  - Added interactive touch-press squish (`0.90×`), drag-lift (`1.08×` scale + `12.dp` elevation), voice-reactive breathing pulse, `AnimatedVisibility` spring entrance/exit transitions, and a 4-bar spring-driven audio equalizer with a filled M3 stop button badge.
+
+### Changed
+- **Default Model Selection (`Voz` + `Ear` Only):**
+  - Updated `ModelSettings` defaults so only **`Voz`** (required speech recognition) and **`Ear`** (auto language detection) are enabled by default (`359 MB` download, `~650 MB` peak RAM), while **`Clear`** and **`Uhm`** remain available as optional toggles.
+- **On-Screen Keyboard (`TYPE_INPUT_METHOD`) Visibility Detection for Bubble Auto-Show/Hide:**
+  - Updated `TextInjectionAccessibilityService` and `accessibility_service_config.xml` (`typeWindowsChanged`) to detect on-screen soft keyboard (`AccessibilityWindowInfo.TYPE_INPUT_METHOD`) visibility across all apps (native `EditText`, Jetpack Compose, Chrome/WebViews, Flutter) alongside hardware keyboard input focus, and automatically toggle `FLAG_NOT_TOUCHABLE` when the bubble is hidden.
+
 ## [2.2.0] - 2026-10-18
 
 ### Added

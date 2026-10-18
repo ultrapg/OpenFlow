@@ -166,6 +166,14 @@ class SmartPipelineTest {
         assertEquals(550, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).estimatedPeakRamMb)
         assertEquals(337, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).activeDiskFootprintMb)
 
+        val defaultSettings = ModelSettings()
+        assertTrue(defaultSettings.vozEnabled)
+        assertTrue(defaultSettings.earEnabled)
+        assertFalse(defaultSettings.clearEnabled)
+        assertFalse(defaultSettings.uhmEnabled)
+        assertEquals(650, defaultSettings.estimatedPeakRamMb)
+        assertEquals(359, defaultSettings.activeDiskFootprintMb)
+
         assertEquals(25, Voz.supportedLanguages.size)
         assertTrue("de" in Voz.supportedLanguages && "en" in Voz.supportedLanguages)
     }

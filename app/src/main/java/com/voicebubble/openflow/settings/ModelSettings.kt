@@ -137,8 +137,8 @@ enum class HardwareAccelerator(
  */
 data class ModelSettings(
     val earEnabled: Boolean = true,
-    val clearEnabled: Boolean = true,
-    val uhmEnabled: Boolean = true,
+    val clearEnabled: Boolean = false,
+    val uhmEnabled: Boolean = false,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -219,8 +219,8 @@ data class ModelSettings(
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
-                clearEnabled = prefs.getBoolean(KEY_CLEAR_ENABLED, true),
-                uhmEnabled = prefs.getBoolean(KEY_UHM_ENABLED, true),
+                clearEnabled = prefs.getBoolean(KEY_CLEAR_ENABLED, false),
+                uhmEnabled = prefs.getBoolean(KEY_UHM_ENABLED, false),
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel

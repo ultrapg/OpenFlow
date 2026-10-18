@@ -75,7 +75,7 @@ class MainActivity : ComponentActivity() {
             }
 
             var showOnlyOnInputs by remember {
-                mutableStateOf(prefs.getBoolean(FloatingBubbleService.KEY_SHOW_ONLY_ON_INPUTS, false))
+                mutableStateOf(prefs.getBoolean(FloatingBubbleService.KEY_SHOW_ONLY_ON_INPUTS, true))
             }
             var hapticFeedback by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
             var bubbleSize by remember { mutableFloatStateOf(prefs.getFloat("bubble_size", 52f)) }

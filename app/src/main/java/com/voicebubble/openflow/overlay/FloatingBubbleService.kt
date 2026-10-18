@@ -362,7 +362,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     }
                     var showOnlyOnInputs by androidx.compose.runtime.remember {
                         androidx.compose.runtime.mutableStateOf(
-                            settingsPrefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, false)
+                            settingsPrefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
                         )
                     }
                     var bubbleSize by androidx.compose.runtime.remember {
@@ -376,7 +376,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             if (sharedPreferences != null && key != null) {
                                 when (key) {
                                     KEY_SHOW_ONLY_ON_INPUTS -> {
-                                        showOnlyOnInputs = sharedPreferences.getBoolean(key, false)
+                                        showOnlyOnInputs = sharedPreferences.getBoolean(key, true)
                                     }
                                     "bubble_size" -> {
                                         bubbleSize = sharedPreferences.getFloat(key, 52f).coerceIn(36f, 80f)
@@ -393,11 +393,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         }
                     }
 
-                    // Never hide the bubble if Accessibility Service isn't connected, so it never vanishes unexpectedly
+                    // Show only when keyboard / input field is active if Accessibility Service is connected
                     val isEffectivelyFocused = if (showOnlyOnInputs && isAccessibilityConnected) {
                         isFocused
                     } else {
                         true
+                    }
+                    val isBubbleVisible = isEffectivelyFocused || currentState != OverlayBubbleState.IDLE
+
+                    androidx.compose.runtime.LaunchedEffect(isBubbleVisible) {
+                        setOverlayTouchable(isBubbleVisible)
                     }
 
                     BubbleOverlayComponent(
@@ -486,6 +491,23 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         } else {
             layoutParams.flags = layoutParams.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
         }
+        try {
+            if (composeView.isAttachedToWindow) {
+                windowManager.updateViewLayout(composeView, layoutParams)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun setOverlayTouchable(touchable: Boolean) {
+        if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
+        val newFlags = if (touchable) {
+            layoutParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        } else {
+            layoutParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        if (newFlags == layoutParams.flags) return
+        layoutParams.flags = newFlags
         try {
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)

@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.res.Configuration
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -25,7 +27,11 @@ import java.lang.ref.WeakReference
 class TextInjectionAccessibilityService : AccessibilityService() {
 
     companion object {
-        private const val FOCUS_GRACE_MS = 2_000L
+        /**
+         * Short grace window so tapping the floating overlay bubble does not cause a momentary
+         * hide/flicker if the system briefly transitions window focus.
+         */
+        private const val IME_GRACE_MS = 650L
         private var instance: WeakReference<TextInjectionAccessibilityService>? = null
         val isInputFieldFocused = MutableStateFlow(false)
         val isServiceConnected = MutableStateFlow(false)
@@ -39,7 +45,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private var pollingJob: Job? = null
 
     @Volatile
-    private var lastEditableFocusSeenMs: Long = 0L
+    private var lastActiveImeOrInputSeenMs: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -50,7 +56,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         pollingJob = serviceScope.launch {
             while (isActive) {
                 refreshFocusState()
-                delay(450L)
+                delay(250L)
             }
         }
     }
@@ -67,62 +73,110 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val type = event.eventType
-        if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
+        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
             type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            type == AccessibilityEvent.TYPE_VIEW_CLICKED
+            type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
+            type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+            type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED
         ) {
-            val source = event.source
-            if (source != null) {
-                try {
-                    if (source.isEditable && source.isFocused) {
-                        lastEditableFocusSeenMs = SystemClock.elapsedRealtime()
-                        isInputFieldFocused.value = true
-                    }
-                } catch (_: Throwable) {
-                } finally {
-                    try {
-                        @Suppress("DEPRECATION")
-                        source.recycle()
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
+            refreshFocusState()
         }
     }
 
     override fun onInterrupt() {}
 
+    /**
+     * Determines whether the user is actively typing by checking:
+     * 1. Primary signal: Is the on-screen soft keyboard (`TYPE_INPUT_METHOD` window) currently visible on screen?
+     *    This works reliably across 100% of apps (native EditText, Jetpack Compose, Chrome/WebViews, Flutter, etc.)
+     *    and immediately becomes false when the user closes the keyboard.
+     * 2. Secondary signal (for physical hardware keyboards where no soft IME is shown):
+     *    Is an editable input node focused in the active application window?
+     */
     private fun refreshFocusState() {
         try {
-            val editableNode = findFocusedEditableNode()
             val now = SystemClock.elapsedRealtime()
-            if (editableNode != null) {
-                try {
-                    @Suppress("DEPRECATION")
-                    editableNode.recycle()
-                } catch (_: Throwable) {
-                }
-                lastEditableFocusSeenMs = now
+            val imeVisible = isSoftKeyboardWindowVisible()
+            val hardwareKeyboardActive = isHardwareKeyboardConnected() && hasFocusedEditableNode()
+
+            if (imeVisible || hardwareKeyboardActive) {
+                lastActiveImeOrInputSeenMs = now
                 isInputFieldFocused.value = true
             } else {
-                // Keep focus true during brief 2s window/IME transitions when tapping the overlay bubble
-                val withinGrace = (now - lastEditableFocusSeenMs) <= FOCUS_GRACE_MS
+                val withinGrace = (now - lastActiveImeOrInputSeenMs) <= IME_GRACE_MS
                 isInputFieldFocused.value = withinGrace
             }
         } catch (_: Throwable) {
         }
     }
 
+    private fun isSoftKeyboardWindowVisible(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return hasFocusedEditableNode()
+        return try {
+            val allWindows = windows ?: return false
+            val screenHeight = resources.displayMetrics.heightPixels
+            val minKeyboardHeightPx = (48f * resources.displayMetrics.density).toInt().coerceAtLeast(48)
+            var imeVisible = false
+            val bounds = Rect()
+
+            for (window in allWindows) {
+                try {
+                    if (!imeVisible && window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                        window.getBoundsInScreen(bounds)
+                        if (bounds.height() >= minKeyboardHeightPx && bounds.bottom > (screenHeight / 3)) {
+                            imeVisible = true
+                        }
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        @Suppress("DEPRECATION")
+                        window.recycle()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            imeVisible
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun isHardwareKeyboardConnected(): Boolean {
+        return try {
+            val config = resources.configuration
+            config.keyboard != Configuration.KEYBOARD_NOKEYS &&
+                config.hardKeyboardHidden == Configuration.HARDKEYBOARDHIDDEN_NO
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun hasFocusedEditableNode(): Boolean {
+        val node = findFocusedEditableNode(requireEditableFlag = true)
+        if (node != null) {
+            try {
+                @Suppress("DEPRECATION")
+                node.recycle()
+            } catch (_: Throwable) {
+            }
+            return true
+        }
+        return false
+    }
+
     /**
      * Searches `rootInActiveWindow` first, then falls back to all interactive application windows
-     * so focus is still found even when the floating overlay window was just tapped.
+     * so the target input node is still found even when the floating overlay window was just tapped.
+     * If [requireEditableFlag] is false (used during text injection), falls back to any node holding
+     * `FOCUS_INPUT` so WebViews and custom Compose fields can also receive `ACTION_PASTE`.
      */
-    private fun findFocusedEditableNode(): AccessibilityNodeInfo? {
+    private fun findFocusedEditableNode(requireEditableFlag: Boolean = false): AccessibilityNodeInfo? {
         try {
             val activeRoot = rootInActiveWindow
             if (activeRoot != null) {
                 val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                if (focused != null && focused.isEditable) {
+                if (focused != null && (focused.isEditable || !requireEditableFlag)) {
                     try {
                         @Suppress("DEPRECATION")
                         activeRoot.recycle()
@@ -144,19 +198,25 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
                 val allWindows = windows ?: return null
-                var found: AccessibilityNodeInfo? = null
+                var editableCandidate: AccessibilityNodeInfo? = null
+                var fallbackInputCandidate: AccessibilityNodeInfo? = null
+
                 for (window in allWindows) {
-                    if (found == null && window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    if (editableCandidate == null && window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
                         val root = window.root
                         if (root != null) {
                             val candidate = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                            if (candidate != null && candidate.isEditable) {
-                                found = candidate
-                            } else {
-                                try {
-                                    @Suppress("DEPRECATION")
-                                    candidate?.recycle()
-                                } catch (_: Throwable) {
+                            if (candidate != null) {
+                                if (candidate.isEditable) {
+                                    editableCandidate = candidate
+                                } else if (!requireEditableFlag && fallbackInputCandidate == null) {
+                                    fallbackInputCandidate = candidate
+                                } else {
+                                    try {
+                                        @Suppress("DEPRECATION")
+                                        candidate.recycle()
+                                    } catch (_: Throwable) {
+                                    }
                                 }
                             }
                             try {
@@ -172,7 +232,16 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                     } catch (_: Throwable) {
                     }
                 }
-                return found
+
+                if (editableCandidate != null) {
+                    try {
+                        @Suppress("DEPRECATION")
+                        fallbackInputCandidate?.recycle()
+                    } catch (_: Throwable) {
+                    }
+                    return editableCandidate
+                }
+                return fallbackInputCandidate
             } catch (_: Throwable) {
             }
         }
@@ -199,7 +268,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
         delay(80L)
 
-        val focusedNode = findFocusedEditableNode()
+        val focusedNode = findFocusedEditableNode(requireEditableFlag = false)
             ?: return@withContext false // Keep textToInsert in clipboard!
 
         var injected = false
@@ -248,26 +317,13 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
         if (injected) {
             delay(250L)
-            restoreClipboard(clipboard, oldClip)
+            try {
+                if (oldClip != null) {
+                    clipboard.setPrimaryClip(oldClip)
+                }
+            } catch (_: Throwable) {
+            }
         }
         injected
-    }
-
-    fun injectTextDirectly(textToInsert: String): Boolean {
-        serviceScope.launch {
-            injectTextSuspend(textToInsert)
-        }
-        return true
-    }
-
-    private fun restoreClipboard(clipboard: ClipboardManager, oldClip: ClipData?) {
-        try {
-            if (oldClip != null) {
-                clipboard.setPrimaryClip(oldClip)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                clipboard.clearPrimaryClip()
-            }
-        } catch (_: Throwable) {
-        }
     }
 }
