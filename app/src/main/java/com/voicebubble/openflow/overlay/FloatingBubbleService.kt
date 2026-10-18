@@ -87,8 +87,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     companion object {
         const val ACTION_REFRESH_SETTINGS = "com.voicebubble.openflow.ACTION_REFRESH_SETTINGS"
-        const val KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v2"
-        const val LEGACY_KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs"
+        const val KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v3"
+        const val LEGACY_KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v2"
+        const val KEY_BUBBLE_DISAPPEAR_DELAY_MS = "bubble_disappear_delay_ms"
+        const val DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS = 500L
         private const val CHANNEL_ID = "bubble_service_channel"
         private const val NOTIFICATION_ID = 1001
 
@@ -325,6 +327,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val metrics = resources.displayMetrics
         val savedX = prefs.getInt("bubble_x", 80).coerceIn(0, (metrics.widthPixels - 140).coerceAtLeast(0))
         val savedY = prefs.getInt("bubble_y", 400).coerceIn(0, (metrics.heightPixels - 180).coerceAtLeast(0))
+        val initialShowOnlyOnKeyboard = prefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
+        val initiallyVisible = !initialShowOnlyOnKeyboard || TextInjectionAccessibilityService.isInputFieldFocused.value
 
         layoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -336,12 +340,14 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 WindowManager.LayoutParams.TYPE_PHONE
             },
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                (if (initiallyVisible) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.LEFT
             x = savedX
             y = savedY
+            alpha = if (initiallyVisible) 1.0f else 0.0f
         }
 
         val themeContext = android.view.ContextThemeWrapper(this, com.voicebubble.openflow.R.style.Theme_OpenFlow)
@@ -353,8 +359,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             setContent {
                 OpenFlowTheme {
                     val currentState by bubbleState.collectAsState()
-                    val isFocused by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
                     val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
+                    val isAccessibilityImeVisible by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
                     val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
 
                     val settingsPrefs = androidx.compose.runtime.remember {
@@ -365,10 +371,27 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             settingsPrefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
                         )
                     }
+                    var disappearDelayMs by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(
+                            settingsPrefs.getLong(KEY_BUBBLE_DISAPPEAR_DELAY_MS, DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS)
+                                .coerceIn(0L, 10_000L)
+                        )
+                    }
                     var bubbleSize by androidx.compose.runtime.remember {
                         androidx.compose.runtime.mutableStateOf(
                             settingsPrefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
                         )
+                    }
+                    var isWindowInsetsImeVisible by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(false)
+                    }
+
+                    // Poll WindowInsetsCompat.Type.ime() on API 30+ as a direct fallback if Accessibility Service is not yet enabled
+                    androidx.compose.runtime.LaunchedEffect(isAccessibilityConnected) {
+                        while (!isAccessibilityConnected) {
+                            isWindowInsetsImeVisible = checkWindowInsetsImeVisible()
+                            delay(180L)
+                        }
                     }
 
                     val listener = androidx.compose.runtime.remember {
@@ -377,6 +400,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 when (key) {
                                     KEY_SHOW_ONLY_ON_INPUTS -> {
                                         showOnlyOnInputs = sharedPreferences.getBoolean(key, true)
+                                    }
+                                    KEY_BUBBLE_DISAPPEAR_DELAY_MS -> {
+                                        disappearDelayMs = sharedPreferences.getLong(
+                                            key,
+                                            DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS
+                                        ).coerceIn(0L, 10_000L)
                                     }
                                     "bubble_size" -> {
                                         bubbleSize = sharedPreferences.getFloat(key, 52f).coerceIn(36f, 80f)
@@ -393,22 +422,40 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         }
                     }
 
-                    // Show only when keyboard / input field is active if Accessibility Service is connected
-                    val isEffectivelyFocused = if (showOnlyOnInputs && isAccessibilityConnected) {
-                        isFocused
+                    val isKeyboardCurrentlyOnScreen = if (isAccessibilityConnected) {
+                        isAccessibilityImeVisible
                     } else {
-                        true
+                        isWindowInsetsImeVisible
                     }
-                    val isBubbleVisible = isEffectivelyFocused || currentState != OverlayBubbleState.IDLE
+                    val rawShouldShow = !showOnlyOnInputs ||
+                        isKeyboardCurrentlyOnScreen ||
+                        currentState != OverlayBubbleState.IDLE
 
-                    androidx.compose.runtime.LaunchedEffect(isBubbleVisible) {
-                        setOverlayTouchable(isBubbleVisible)
+                    var isBubbleVisible by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(rawShouldShow)
+                    }
+
+                    androidx.compose.runtime.LaunchedEffect(rawShouldShow, disappearDelayMs) {
+                        if (rawShouldShow) {
+                            setOverlayWindowVisibleAndTouchable(visible = true, touchable = true)
+                            isBubbleVisible = true
+                        } else {
+                            if (disappearDelayMs > 0L) {
+                                delay(disappearDelayMs)
+                            }
+                            isBubbleVisible = false
+                            // Immediately disable touch interception while exit animation plays
+                            setOverlayWindowVisibleAndTouchable(visible = true, touchable = false)
+                            delay(160L)
+                            // Completely hide the WindowManager surface so SurfaceFlinger never leaves a frozen frame
+                            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                        }
                     }
 
                     BubbleOverlayComponent(
                         audioController = audioController,
                         bubbleState = currentState,
-                        isInputFieldFocused = isEffectivelyFocused,
+                        isInputFieldFocused = isBubbleVisible,
                         processingProgress = processingProgress.collectAsState(initial = "").value,
                         bubbleSize = bubbleSize,
                         pipelinePhase = pipelineStatus.phase,
@@ -484,6 +531,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
+    private fun checkWindowInsetsImeVisible(): Boolean {
+        if (!::composeView.isInitialized || !composeView.isAttachedToWindow) return false
+        return try {
+            val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(composeView) ?: return false
+            rootInsets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private fun setKeepScreenOn(keep: Boolean) {
         if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
         if (keep) {
@@ -499,15 +556,17 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
-    private fun setOverlayTouchable(touchable: Boolean) {
+    private fun setOverlayWindowVisibleAndTouchable(visible: Boolean, touchable: Boolean) {
         if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
         val newFlags = if (touchable) {
             layoutParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
         } else {
             layoutParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         }
-        if (newFlags == layoutParams.flags) return
+        val newAlpha = if (visible) 1.0f else 0.0f
+        if (newFlags == layoutParams.flags && layoutParams.alpha == newAlpha) return
         layoutParams.flags = newFlags
+        layoutParams.alpha = newAlpha
         try {
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)

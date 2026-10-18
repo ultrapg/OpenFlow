@@ -2,6 +2,17 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.1] - 2026-10-18
+
+### Added
+- **Configurable Bubble Disappear Delay (`0.0s` – `5.0s`):**
+  - Added a **Bubble Disappear Delay** slider in **Floating Bubble Settings** (`KEY_BUBBLE_DISAPPEAR_DELAY_MS`, default `0.5s` / `500 ms`, adjustable from `Instant (0.0s)` to `5.0s` in `0.25s` increments) controlling how long the floating bubble remains on screen after the keyboard closes.
+
+### Fixed
+- **Strict On-Screen Keyboard (`TYPE_INPUT_METHOD` & `WindowInsets.Type.ime()`) Visibility Enforcement:**
+  - Removed the false-positive hardware keyboard fallback (`Configuration.keyboard`) and `else -> true` Accessibility Service bypass that previously caused the bubble to stay visible when no keyboard was open.
+  - Required a visible `TYPE_INPUT_METHOD` root hierarchy (`imeRoot.isVisibleToUser && imeRoot.childCount > 0`) or active `WindowInsetsCompat.Type.ime()` inset, bumped the preference key to `show_only_on_inputs_v3` (default `true`), and set `WindowManager.LayoutParams.alpha = 0f` + `FLAG_NOT_TOUCHABLE` after the exit animation so `SurfaceFlinger` never leaves a frozen surface frame on screen when the keyboard closes.
+
 ## [2.3.0] - 2026-10-18
 
 ### Added

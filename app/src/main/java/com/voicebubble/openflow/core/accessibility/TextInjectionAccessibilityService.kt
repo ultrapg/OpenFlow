@@ -4,11 +4,9 @@ import android.accessibilityservice.AccessibilityService
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -27,12 +25,13 @@ import java.lang.ref.WeakReference
 class TextInjectionAccessibilityService : AccessibilityService() {
 
     companion object {
-        /**
-         * Short grace window so tapping the floating overlay bubble does not cause a momentary
-         * hide/flicker if the system briefly transitions window focus.
-         */
-        private const val IME_GRACE_MS = 650L
         private var instance: WeakReference<TextInjectionAccessibilityService>? = null
+
+        /**
+         * Emits `true` strictly when the on-screen soft keyboard (`TYPE_INPUT_METHOD`) is visible
+         * on screen, and `false` immediately when the keyboard is hidden.
+         * Any disappear delay is applied downstream in `FloatingBubbleService` based on user settings.
+         */
         val isInputFieldFocused = MutableStateFlow(false)
         val isServiceConnected = MutableStateFlow(false)
 
@@ -44,9 +43,6 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var pollingJob: Job? = null
 
-    @Volatile
-    private var lastActiveImeOrInputSeenMs: Long = 0L
-
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = WeakReference(this)
@@ -55,8 +51,8 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
             while (isActive) {
-                refreshFocusState()
-                delay(250L)
+                refreshKeyboardVisibilityState()
+                delay(180L)
             }
         }
     }
@@ -79,43 +75,34 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
             type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED
         ) {
-            refreshFocusState()
+            refreshKeyboardVisibilityState()
         }
     }
 
     override fun onInterrupt() {}
 
     /**
-     * Determines whether the user is actively typing by checking:
-     * 1. Primary signal: Is the on-screen soft keyboard (`TYPE_INPUT_METHOD` window) currently visible on screen?
-     *    This works reliably across 100% of apps (native EditText, Jetpack Compose, Chrome/WebViews, Flutter, etc.)
-     *    and immediately becomes false when the user closes the keyboard.
-     * 2. Secondary signal (for physical hardware keyboards where no soft IME is shown):
-     *    Is an editable input node focused in the active application window?
+     * Strictly checks whether the on-screen soft keyboard (`TYPE_INPUT_METHOD` window) is currently
+     * visible on screen. Does NOT fall back to `hasFocusedEditableNode()` alone, because Android
+     * `EditText` views often retain view focus even after the user dismisses the keyboard.
      */
-    private fun refreshFocusState() {
+    private fun refreshKeyboardVisibilityState() {
         try {
-            val now = SystemClock.elapsedRealtime()
-            val imeVisible = isSoftKeyboardWindowVisible()
-            val hardwareKeyboardActive = isHardwareKeyboardConnected() && hasFocusedEditableNode()
-
-            if (imeVisible || hardwareKeyboardActive) {
-                lastActiveImeOrInputSeenMs = now
-                isInputFieldFocused.value = true
-            } else {
-                val withinGrace = (now - lastActiveImeOrInputSeenMs) <= IME_GRACE_MS
-                isInputFieldFocused.value = withinGrace
-            }
+            isInputFieldFocused.value = isSoftKeyboardWindowVisible()
         } catch (_: Throwable) {
         }
     }
 
     private fun isSoftKeyboardWindowVisible(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return hasFocusedEditableNode()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
         return try {
             val allWindows = windows ?: return false
-            val screenHeight = resources.displayMetrics.heightPixels
-            val minKeyboardHeightPx = (48f * resources.displayMetrics.density).toInt().coerceAtLeast(48)
+            val dm = resources.displayMetrics
+            val screenHeight = dm.heightPixels
+            val screenWidth = dm.widthPixels
+            // A real on-screen keyboard is at least 110dp tall and spans most of the screen width
+            val minKeyboardHeightPx = (110f * dm.density).toInt().coerceAtLeast(110)
+            val minKeyboardWidthPx = (screenWidth / 2).coerceAtLeast(120)
             var imeVisible = false
             val bounds = Rect()
 
@@ -123,8 +110,30 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 try {
                     if (!imeVisible && window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
                         window.getBoundsInScreen(bounds)
-                        if (bounds.height() >= minKeyboardHeightPx && bounds.bottom > (screenHeight / 3)) {
-                            imeVisible = true
+                        val hasValidGeometry = bounds.height() >= minKeyboardHeightPx &&
+                            bounds.width() >= minKeyboardWidthPx &&
+                            bounds.bottom > (screenHeight * 2 / 3)
+
+                        if (hasValidGeometry) {
+                            val imeRoot = try {
+                                window.root
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            val rootVisible = if (imeRoot != null) {
+                                val vis = imeRoot.isVisibleToUser
+                                try {
+                                    @Suppress("DEPRECATION")
+                                    imeRoot.recycle()
+                                } catch (_: Throwable) {
+                                }
+                                vis
+                            } else {
+                                true
+                            }
+                            if (rootVisible) {
+                                imeVisible = true
+                            }
                         }
                     }
                 } catch (_: Throwable) {
@@ -140,29 +149,6 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         } catch (_: Throwable) {
             false
         }
-    }
-
-    private fun isHardwareKeyboardConnected(): Boolean {
-        return try {
-            val config = resources.configuration
-            config.keyboard != Configuration.KEYBOARD_NOKEYS &&
-                config.hardKeyboardHidden == Configuration.HARDKEYBOARDHIDDEN_NO
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun hasFocusedEditableNode(): Boolean {
-        val node = findFocusedEditableNode(requireEditableFlag = true)
-        if (node != null) {
-            try {
-                @Suppress("DEPRECATION")
-                node.recycle()
-            } catch (_: Throwable) {
-            }
-            return true
-        }
-        return false
     }
 
     /**

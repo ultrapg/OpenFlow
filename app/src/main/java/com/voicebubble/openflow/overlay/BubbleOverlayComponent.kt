@@ -97,25 +97,22 @@ fun BubbleOverlayComponent(
     onStopRecording: () -> Unit
 ) {
     val isVisible = isInputFieldFocused || bubbleState != OverlayBubbleState.IDLE
-
-    AnimatedVisibility(
-        visible = isVisible,
-        enter = scaleIn(
-            initialScale = 0.35f,
-            animationSpec = spring(
+    val visibilityProgress by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0f,
+        animationSpec = if (isVisible) {
+            spring(
                 dampingRatio = Spring.DampingRatioMediumBouncy,
                 stiffness = Spring.StiffnessMedium
             )
-        ) + fadeIn(animationSpec = tween(150)),
-        exit = scaleOut(
-            targetScale = 0.35f,
-            animationSpec = tween(130, easing = FastOutSlowInEasing)
-        ) + fadeOut(animationSpec = tween(120)),
-        label = "m3BubbleVisibility"
-    ) {
-        val colorScheme = MaterialTheme.colorScheme
-        val isLoadingModels = pipelinePhase == PipelinePhase.LOADING || pipelinePhase == PipelinePhase.WARMING_UP
-        val rms by audioController.rmsLevel.collectAsState()
+        } else {
+            tween(durationMillis = 150, easing = FastOutSlowInEasing)
+        },
+        label = "m3BubbleVisibilityProgress"
+    )
+
+    val colorScheme = MaterialTheme.colorScheme
+    val isLoadingModels = pipelinePhase == PipelinePhase.LOADING || pipelinePhase == PipelinePhase.WARMING_UP
+    val rms by audioController.rmsLevel.collectAsState()
 
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
@@ -185,6 +182,7 @@ fun BubbleOverlayComponent(
 
     val shadowElevation by animateDpAsState(
         targetValue = when {
+            !isVisible -> 0.dp
             isDragging -> 12.dp
             bubbleState == OverlayBubbleState.RECORDING -> 9.dp
             isPressed -> 3.dp
@@ -229,14 +227,17 @@ fun BubbleOverlayComponent(
     )
 
     val bubbleShape = RoundedCornerShape(cornerRadius)
+    val effectiveScale = (scale * (0.35f + 0.65f * visibilityProgress)).coerceAtLeast(0.01f)
+    val effectiveAlpha = visibilityProgress.coerceIn(0f, 1f)
 
     // Outer padding gives room for bouncy spring overshoot and M3 elevation shadow inside the overlay window
     Box(
         modifier = Modifier
             .padding(6.dp)
             .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
+                scaleX = effectiveScale
+                scaleY = effectiveScale
+                alpha = effectiveAlpha
             },
         contentAlignment = Alignment.Center
     ) {
@@ -420,7 +421,6 @@ fun BubbleOverlayComponent(
                 }
             }
         }
-    }
     }
 }
 

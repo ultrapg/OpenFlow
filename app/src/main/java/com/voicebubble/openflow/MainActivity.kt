@@ -77,6 +77,14 @@ class MainActivity : ComponentActivity() {
             var showOnlyOnInputs by remember {
                 mutableStateOf(prefs.getBoolean(FloatingBubbleService.KEY_SHOW_ONLY_ON_INPUTS, true))
             }
+            var disappearDelayMs by remember {
+                mutableLongStateOf(
+                    prefs.getLong(
+                        FloatingBubbleService.KEY_BUBBLE_DISAPPEAR_DELAY_MS,
+                        FloatingBubbleService.DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS
+                    ).coerceIn(0L, 5_000L)
+                )
+            }
             var hapticFeedback by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
             var bubbleSize by remember { mutableFloatStateOf(prefs.getFloat("bubble_size", 52f)) }
 
@@ -314,16 +322,50 @@ class MainActivity : ComponentActivity() {
                                     }
                                 )
                                 Text(
-                                    "Only show bubble when a text field is focused",
+                                    "Only show bubble when keyboard is on screen",
                                     color = MaterialTheme.colorScheme.onBackground
                                 )
                             }
                             if (showOnlyOnInputs && !isAccessibilityConnected) {
                                 Text(
-                                    text = "Note: Accessibility Service is not enabled yet, so the bubble remains visible everywhere until connected.",
+                                    text = "Tip: Enable Accessibility Service above for instant keyboard detection across all apps and automatic text pasting.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(start = 12.dp, bottom = 4.dp)
+                                )
+                            }
+                            if (showOnlyOnInputs) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                val delaySecondsFormatted = if (disappearDelayMs == 0L) {
+                                    "Instant (0.0s)"
+                                } else {
+                                    String.format(java.util.Locale.US, "%.2fs (%d ms)", disappearDelayMs / 1000.0, disappearDelayMs)
+                                }
+                                Text(
+                                    text = "Disappear Delay After Keyboard Closes: $delaySecondsFormatted",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                    modifier = Modifier.padding(start = 12.dp)
+                                )
+                                Slider(
+                                    value = disappearDelayMs.toFloat(),
+                                    onValueChange = { raw ->
+                                        val snapped = ((raw / 250f).toInt() * 250L).coerceIn(0L, 5_000L)
+                                        disappearDelayMs = snapped
+                                    },
+                                    onValueChangeFinished = {
+                                        prefs.edit()
+                                            .putLong(FloatingBubbleService.KEY_BUBBLE_DISAPPEAR_DELAY_MS, disappearDelayMs)
+                                            .apply()
+                                        if (isBubbleServiceRunning) {
+                                            startOrRefreshBubbleService()
+                                        }
+                                    },
+                                    valueRange = 0f..5_000f,
+                                    steps = 19,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp)
                                 )
                             }
 
