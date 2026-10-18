@@ -25,6 +25,7 @@ import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import ai.desertant.voz.Voz
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -136,7 +137,7 @@ class SmartPipelineTest {
             customVocabulary = listOf("OpenFlow", "LiteRT", "Parakeet")
         )
 
-        assertEquals("OpenFlow nutzt LiteRT und paraket.", cleaned)
+        assertEquals("OpenFlow nutzt LiteRT und Parakeet.", cleaned)
     }
 
     @Test
@@ -193,4 +194,152 @@ class SmartPipelineTest {
             }
         }
     }
+
+    @Test
+    fun `trimLeadingAndTrailingSilence removes dead air while preserving speech padding`() {
+        // 1. Empty input -> empty output
+        assertEquals(0, com.voicebubble.openflow.core.speech.trimLeadingAndTrailingSilence(FloatArray(0)).size)
+
+        // 2. All silence below threshold -> empty output (skips native inference completely)
+        val pureSilence = FloatArray(16_000) { 0.0005f }
+        assertEquals(0, com.voicebubble.openflow.core.speech.trimLeadingAndTrailingSilence(pureSilence).size)
+
+        // 3. 1s silence + 0.5s speech + 1s silence -> trimmed to 0.5s speech + 2 * padSamples
+        val samples = FloatArray(40_000) { idx ->
+            if (idx in 16_000 until 24_000) 0.25f else 0.0002f
+        }
+        val pad = 1_600 // 100 ms pad
+        val trimmed = com.voicebubble.openflow.core.speech.trimLeadingAndTrailingSilence(
+            samples = samples,
+            threshold = 0.0035f,
+            padSamples = pad
+        )
+        val expectedLength = (24_000 - 16_000) + (2 * pad)
+        assertEquals(expectedLength, trimmed.size)
+        // First sample after leading pad should be speech
+        assertEquals(0.25f, trimmed[pad], 1e-5f)
+
+        // 4. Speech from first to last sample -> returns original array unchanged
+        val fullSpeech = FloatArray(4_000) { 0.15f }
+        val unchanged = com.voicebubble.openflow.core.speech.trimLeadingAndTrailingSilence(fullSpeech)
+        assertEquals(fullSpeech.size, unchanged.size)
+    }
+
+    @Test
+    fun `DesertAntModelStorage fast verification checks sizes part files and stamps without JNI`() {
+        val tempRoot = java.nio.file.Files.createTempDirectory("openflow_model_test").toFile()
+        try {
+            val earArtifacts = com.voicebubble.openflow.settings.ModelDownloadManager.MODEL_SPECS[
+                com.voicebubble.openflow.settings.DesertAntModel.EAR
+            ]!!.second
+
+            // Initially empty directory -> not complete
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(tempRoot, earArtifacts))
+
+            // Create files with wrong sizes -> not complete
+            for (artifact in earArtifacts) {
+                java.io.File(tempRoot, artifact.relativePath).writeBytes(ByteArray(16))
+            }
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(tempRoot, earArtifacts))
+
+            // Use synthetic small artifacts to test exact byte-size + .part + stamp logic
+            val testArtifacts = listOf(
+                com.voicebubble.openflow.settings.ModelFileArtifact("a.tflite", 128L, "a".repeat(64)),
+                com.voicebubble.openflow.settings.ModelFileArtifact("b.litert", 64L, "b".repeat(64))
+            )
+            val subDir = java.io.File(tempRoot, "synthetic").apply { mkdirs() }
+            java.io.File(subDir, "a.tflite").writeBytes(ByteArray(128))
+            java.io.File(subDir, "b.litert").writeBytes(ByteArray(64))
+
+            // Calling isModelDirectoryComplete must create .dal-meta/manifest but MUST NOT forge .openflow_verified stamps
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(subDir, testArtifacts))
+            assertTrue(java.io.File(subDir, ".dal-meta/manifest").exists())
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.isArtifactAlreadyVerified(subDir, testArtifacts[0]))
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.areAllArtifactsVerified(subDir, testArtifacts))
+
+            // Write manifest and verification stamp -> both directory and per-artifact checks are true
+            com.voicebubble.openflow.settings.DesertAntModelStorage.writeModelManifestAndStamp(subDir, testArtifacts)
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(subDir, testArtifacts))
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.areAllArtifactsVerified(subDir, testArtifacts))
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.isArtifactAlreadyVerified(subDir, testArtifacts[0]))
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.isArtifactAlreadyVerified(subDir, testArtifacts[1]))
+
+            // If an in-progress .part file exists -> not complete and not verified
+            val partFile = java.io.File(subDir, "a.tflite.part").apply { writeBytes(ByteArray(10)) }
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(subDir, testArtifacts))
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.areAllArtifactsVerified(subDir, testArtifacts))
+            assertFalse(com.voicebubble.openflow.settings.DesertAntModelStorage.isArtifactAlreadyVerified(subDir, testArtifacts[0]))
+            partFile.delete()
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDirectoryComplete(subDir, testArtifacts))
+            assertTrue(com.voicebubble.openflow.settings.DesertAntModelStorage.areAllArtifactsVerified(subDir, testArtifacts))
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `ModelDownloadManager verifySha256Incremental validates digest and reports progress`() = kotlinx.coroutines.runBlocking {
+        val tempFile = java.io.File.createTempFile("openflow_sha256_test", ".bin")
+        try {
+            val payload = ByteArray(1_200_000) { (it % 251).toByte() }
+            tempFile.writeBytes(payload)
+
+            val expectedDigest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(payload)
+                .joinToString("") { "%02x".format(it) }
+
+            val progressUpdates = mutableListOf<Int>()
+            val valid = com.voicebubble.openflow.settings.ModelDownloadManager.verifySha256Incremental(
+                file = tempFile,
+                expectedHex = expectedDigest,
+                onVerifyProgress = { pct -> progressUpdates.add(pct) }
+            )
+            assertTrue(valid)
+            assertTrue(progressUpdates.isNotEmpty())
+            assertEquals(100, progressUpdates.last())
+
+            val invalid = com.voicebubble.openflow.settings.ModelDownloadManager.verifySha256Incremental(
+                file = tempFile,
+                expectedHex = "0".repeat(64)
+            )
+            assertFalse(invalid)
+        } finally {
+            tempFile.delete()
+        }
+    }
+
+    @Test
+    fun `HardwareAccelerator resolves ids and defaults safely`() {
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId("auto")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.NPU,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId("npu")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.GPU,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId("gpu")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.CPU,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId("cpu")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId("unknown_value")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+            com.voicebubble.openflow.settings.HardwareAccelerator.fromId(null)
+        )
+    }
 }
+
+
+
+
+
+
+

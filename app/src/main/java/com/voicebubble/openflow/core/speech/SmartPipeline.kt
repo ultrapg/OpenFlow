@@ -26,44 +26,105 @@ import ai.desertant.uhm.mergeFillerFrames
 import ai.desertant.voz.Transcription
 import ai.desertant.voz.Voz
 import ai.desertant.voz.Word
+import android.app.ActivityManager
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.os.Build
+import android.os.SystemClock
+import android.system.Os
 import android.util.Log
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
+import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToLong
 
 /**
+ * Per-model runtime load status exposed to the UI.
+ */
+enum class ModelLoadState(val label: String) {
+    DISABLED("Disabled"),
+    NOT_DOWNLOADED("Not Downloaded"),
+    STANDBY("Standby (On Disk)"),
+    LOADING("Loading..."),
+    LOADED("Loaded in RAM"),
+    ACTIVE("Running Inference"),
+    ERROR("Load Error")
+}
+
+/**
+ * High-level lifecycle phase of [SmartPipeline].
+ */
+enum class PipelinePhase(val label: String) {
+    UNINITIALIZED("Not Loaded"),
+    LOADING("Loading Models..."),
+    WARMING_UP("Warming Up Accelerator..."),
+    READY("Models Loaded & Ready"),
+    TRANSCRIBING("Transcribing..."),
+    STANDBY_EVICTED("Optional Models on Standby"),
+    ERROR("Attention Needed")
+}
+
+/**
+ * Observable snapshot of the speech pipeline's loaded models, active hardware accelerator,
+ * and most recent inference performance.
+ */
+data class PipelineStatus(
+    val phase: PipelinePhase = PipelinePhase.UNINITIALIZED,
+    val configuredAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
+    val activeAcceleratorLabel: String = "Auto (GPU / CPU)",
+    val modelStates: Map<DesertAntModel, ModelLoadState> = mapOf(
+        DesertAntModel.VOZ to ModelLoadState.STANDBY,
+        DesertAntModel.EAR to ModelLoadState.STANDBY,
+        DesertAntModel.CLEAR to ModelLoadState.STANDBY,
+        DesertAntModel.UHM to ModelLoadState.STANDBY
+    ),
+    val statusMessage: String = "Models on disk — ready to load",
+    val lastInferenceMs: Long? = null,
+    val lastAudioDurationMs: Long? = null,
+    val lastWarmupMs: Long? = null,
+    val loadedCount: Int = 0,
+    val enabledCount: Int = 1
+) {
+    val isReady: Boolean
+        get() = phase == PipelinePhase.READY ||
+            phase == PipelinePhase.STANDBY_EVICTED ||
+            modelStates[DesertAntModel.VOZ] == ModelLoadState.LOADED
+}
+
+/**
  * Orchestrates the 4-stage Desert Ant Labs on-device audio AI pipeline:
  * 1. `Clear` (`clear-studio` profile) — Speech enhancement & noise suppression
- * 2. `Ear` || `Uhm` — Parallel language identification & 20 ms acoustic filler frame detection
+ * 2. `Ear` -> `Uhm` — Sequential language identification & 20 ms acoustic filler frame detection
  * 3. `Voz` — Multilingual speech-to-text with word-level timestamps (80 ms resolution)
  * 4. Temporal Filler Subtraction & Text Normalization
  *
- * Concurrency & Memory Guarantees:
- * - All lifecycle and inference mutations (`initialize`, `transcribe`, `reloadSettings`,
- *   `evictOptionalModels`, `shutdown`) are serialized by a single coroutine [Mutex].
- * - `settings` is held as a mutable `@Volatile` property updated immediately inside `reloadSettings`.
- * - Zero unsafe non-null assertions (`!!`) on nullable model references.
- * - Keeps `Voz` warm while active and evicts auxiliary models (`Clear`, `Ear`, `Uhm`) after
- *   [IDLE_TIMEOUT_MS] (180 seconds) of inactivity or on `TRIM_MEMORY_RUNNING_LOW`.
+ * Concurrency, Speed & Memory Guarantees:
+ * - Passes explicit verified revision directories to `Voz`, `Ear`, `Clear`, and `Uhm`, bypassing
+ *   `ModelStore`'s 1.2 GB pure-Swift `SoftwareSHA256` memory spike on load and inference.
+ * - Executes all native LiteRT stages strictly sequentially under [pipelineMutex] to prevent
+ *   concurrent OpenCL / `libLiteRt.so` driver race crashes when all 4 models are enabled.
+ * - Pre-warms `Voz` during [initialize] so the first dictation starts with zero compilation delay.
+ * - Trims leading/trailing dead silence before inference and bounds `Ear` language identification
+ *   to a 5.5-second speech window for faster turnaround.
  */
 class SmartPipeline(
     context: Context,
@@ -73,10 +134,14 @@ class SmartPipeline(
     companion object {
         private const val TAG = "SmartPipeline"
         const val SAMPLE_RATE_HZ: Double = 16_000.0
-        const val IDLE_TIMEOUT_MS: Long = 180_000L
+        const val IDLE_TIMEOUT_MS: Long = 30 * 60_000L // 30 minutes warm retention
         const val FILLER_MERGE_MAX_GAP_MS: Long = 40L
         const val FILLER_BOUNDARY_TOLERANCE_MS: Long = 80L
         const val FILLER_OVERLAP_THRESHOLD: Double = 0.50
+        private const val SILENCE_THRESHOLD: Float = 0.0035f
+        private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
+        private const val MAX_CLEAR_DURATION_SAMPLES: Int = 25 * 16_000 // 25s cap for 48kHz STFT
+        private const val MAX_EAR_WINDOW_SAMPLES: Int = 88_000 // 5.5s @ 16 kHz
 
         @Volatile
         private var sharedInstance: SmartPipeline? = null
@@ -99,51 +164,160 @@ class SmartPipeline(
     var settings: ModelSettings = initialSettings
         private set
 
+    private var appliedAccelerator: HardwareAccelerator? = null
+
     private var voz: Voz? = null
     private var ear: Ear? = null
     private var clear: Clear? = null
     private var uhm: Uhm? = null
 
+    private var vozWarmedUp: Boolean = false
+    private var earWarmedUp: Boolean = false
+    private var clearWarmedUp: Boolean = false
+
     @Volatile
     private var isTranscribing: Boolean = false
 
+    private val _pipelineStatus = MutableStateFlow(
+        PipelineStatus(
+            configuredAccelerator = initialSettings.hardwareAccelerator,
+            activeAcceleratorLabel = resolveAcceleratorLabel(initialSettings.hardwareAccelerator),
+            enabledCount = initialSettings.enabledModels().size
+        )
+    )
+    val pipelineStatus: StateFlow<PipelineStatus> = _pipelineStatus.asStateFlow()
+
     /**
-     * Initializes `Voz` and any currently enabled & downloaded auxiliary models inside [pipelineMutex].
+     * Refreshes on-disk vs loaded model states without acquiring native locks if idle.
      */
-    suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
+    fun refreshStatusSnapshot() {
+        val snap = settings
+        updateStatusSnapshot(
+            activeSettings = snap,
+            phaseOverride = null,
+            messageOverride = null
+        )
+    }
+
+    /**
+     * Initializes `Voz` and any currently enabled & downloaded auxiliary models inside [pipelineMutex],
+     * pre-warming LiteRT sessions so the first dictation has zero compilation lag.
+     */
+    suspend fun initialize(warmUp: Boolean = true): Boolean = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
+            val startMs = SystemClock.elapsedRealtime()
             val currentSettings = settings
-            val vozLoaded = ensureVozLocked()
-            ensureAuxiliaryModelsLocked(currentSettings)
+            applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator)
+
+            updateStatusSnapshot(
+                activeSettings = currentSettings,
+                phaseOverride = PipelinePhase.LOADING,
+                messageOverride = "Loading enabled models on ${resolveAcceleratorLabel(currentSettings.hardwareAccelerator)}..."
+            )
+
+            val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
+            ensureAuxiliaryModelsLocked(currentSettings, warmUp = warmUp)
             resetIdleEvictionTimerLocked()
+
+            val elapsedMs = SystemClock.elapsedRealtime() - startMs
+            val finalPhase = if (vozLoaded) {
+                PipelinePhase.READY
+            } else if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
+                PipelinePhase.UNINITIALIZED
+            } else {
+                PipelinePhase.ERROR
+            }
+            val finalMsg = when (finalPhase) {
+                PipelinePhase.READY -> {
+                    val count = countLoadedModelsLocked(currentSettings)
+                    "$count/${currentSettings.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(currentSettings.hardwareAccelerator)})"
+                }
+                PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
+                else -> "Failed to load Voz speech model"
+            }
+
+            _pipelineStatus.value = _pipelineStatus.value.copy(
+                lastWarmupMs = if (vozLoaded) elapsedMs else _pipelineStatus.value.lastWarmupMs
+            )
+            updateStatusSnapshot(
+                activeSettings = currentSettings,
+                phaseOverride = finalPhase,
+                messageOverride = finalMsg
+            )
             vozLoaded
         }
     }
 
     /**
-     * Updates [settings] immediately and synchronizes loaded auxiliary models under [pipelineMutex].
+     * Launches [initialize] on the singleton's background scope so model loading and LiteRT
+     * warm-up complete even if the calling Activity or Composable leaves the screen.
      */
-    suspend fun reloadSettings(newSettings: ModelSettings) = withContext(Dispatchers.IO) {
+    fun initializeAsync(warmUp: Boolean = true) {
+        idleScope.launch {
+            initialize(warmUp = warmUp)
+        }
+    }
+
+    /**
+     * Launches [reloadSettings] on the singleton's background scope.
+     */
+    fun reloadSettingsAsync(newSettings: ModelSettings) {
+        settings = newSettings
+        idleScope.launch {
+            reloadSettings(newSettings)
+        }
+    }
+
+    /**
+     * Updates [settings] immediately and synchronizes loaded models & hardware accelerator under [pipelineMutex].
+     */
+    suspend fun reloadSettings(newSettings: ModelSettings) = withContext(Dispatchers.Default) {
         settings = newSettings
         pipelineMutex.withLock {
             val snapshot = settings
-            if (!snapshot.clearEnabled) {
+            val accelChanged = appliedAccelerator != null && appliedAccelerator != snapshot.hardwareAccelerator
+            applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator)
+
+            if (accelChanged) {
+                Log.i(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; reloading sessions.")
                 closeClearLocked()
-            }
-            if (!snapshot.earEnabled) {
                 closeEarLocked()
-            }
-            if (!snapshot.uhmEnabled) {
                 closeUhmLocked()
+                closeVozLocked()
+            } else {
+                if (!snapshot.clearEnabled) closeClearLocked()
+                if (!snapshot.earEnabled) closeEarLocked()
+                if (!snapshot.uhmEnabled) closeUhmLocked()
             }
-            ensureVozLocked()
-            ensureAuxiliaryModelsLocked(snapshot)
+
+            updateStatusSnapshot(
+                activeSettings = snapshot,
+                phaseOverride = PipelinePhase.LOADING,
+                messageOverride = "Updating model pipeline (${resolveAcceleratorLabel(snapshot.hardwareAccelerator)})..."
+            )
+
+            val vozOk = ensureVozLocked(snapshot, warmUp = true)
+            ensureAuxiliaryModelsLocked(snapshot, warmUp = true)
             resetIdleEvictionTimerLocked()
+
+            val phase = if (vozOk) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
+            val count = countLoadedModelsLocked(snapshot)
+            val msg = if (vozOk) {
+                "$count/${snapshot.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(snapshot.hardwareAccelerator)})"
+            } else {
+                "Waiting for model download"
+            }
+            updateStatusSnapshot(
+                activeSettings = snapshot,
+                phaseOverride = phase,
+                messageOverride = msg
+            )
         }
     }
 
     /**
      * Executes the 4-stage Desert Ant audio pipeline on 16 kHz mono PCM [samples] in-memory.
+     * All stages execute strictly sequentially to prevent concurrent OpenCL / LiteRT native crashes.
      */
     suspend fun transcribe(
         samples: FloatArray,
@@ -151,69 +325,86 @@ class SmartPipeline(
     ): String = withContext(Dispatchers.Default) {
         if (samples.isEmpty()) return@withContext ""
 
+        // Fast silence trim before acquiring native sessions
+        val trimmedSamples = trimLeadingAndTrailingSilence(samples)
+        if (trimmedSamples.isEmpty()) return@withContext ""
+
+        val audioDurationMs = ((trimmedSamples.size.toDouble() / SAMPLE_RATE_HZ) * 1000.0).roundToLong()
+
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
             isTranscribing = true
+            val inferenceStartMs = SystemClock.elapsedRealtime()
             try {
                 val activeSettings = settings
+                applyHardwareAcceleratorSettingsLocked(activeSettings.hardwareAccelerator)
 
-                // Ensure models are warm and ready (handles lazy reload after 180s idle eviction)
-                if (!ensureVozLocked()) {
+                // Ensure models are ready
+                if (!ensureVozLocked(activeSettings, warmUp = false)) {
                     throw IllegalStateException("Voz speech recognition model is not downloaded.")
                 }
-                ensureAuxiliaryModelsLocked(activeSettings)
+                ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
 
                 // =========================================================================
                 // Stage 1: Audio Enhancement (`Clear` with `clear-studio` profile)
                 // =========================================================================
-                val enhancedSamples = runClearStageLocked(samples, activeSettings, onStageProgress)
+                val enhancedSamples = runClearStageLocked(trimmedSamples, activeSettings, onStageProgress)
 
-                // =========================================================================
-                // Stage 2 & Stage 3: Parallel `Ear` || `Uhm`, with `Voz` starting
-                // immediately after `Ear` finishes (without waiting for `Uhm`).
-                // =========================================================================
-                coroutineScope {
-                    val uhmInstance = if (activeSettings.uhmEnabled) uhm else null
-                    val uhmDeferred = async(Dispatchers.Default) {
-                        if (uhmInstance != null && safeIsUhmDownloaded(uhmInstance)) {
-                            try {
-                                uhmInstance.detect(enhancedSamples, SAMPLE_RATE_HZ)
-                            } catch (t: Throwable) {
-                                Log.w(TAG, "Uhm filler inference failed; bypassing filler removal: ${t.message}")
-                                emptyList()
-                            }
-                        } else {
-                            emptyList()
-                        }
-                    }
-
-                    // Run `Ear` language identification (or fall back immediately if disabled/unavailable)
-                    val resolvedLanguage = resolveLanguageLocked(enhancedSamples, activeSettings, onStageProgress)
-
-                    // Start `Voz` immediately once `Ear` resolves the language, while `uhmDeferred` runs concurrently
-                    onStageProgress?.invoke("Voz ($resolvedLanguage)")
-                    val transcription = runVozWithRetryLocked(
-                        samples = enhancedSamples,
-                        language = resolvedLanguage,
-                        customVocabulary = activeSettings.customVocabulary
-                    )
-
-                    // =========================================================================
-                    // Stage 4: Temporal Filler Subtraction & Text Normalization
-                    // =========================================================================
-                    val uhmFrames = uhmDeferred.await()
-                    val finalTranscript = reconcileTranscript(
-                        transcription = transcription,
-                        uhmFrames = uhmFrames,
-                        uhmEnabled = activeSettings.uhmEnabled,
-                        customVocabulary = activeSettings.customVocabulary
-                    )
-
-                    finalTranscript
+                // Only release Clear's native session between stages if the OS reports critical memory pressure.
+                // Keeping Clear warmed up avoids calling eglTerminate on the shared process EGLDisplay
+                // and prevents re-compiling clear-studio.tflite on every dictation.
+                if (activeSettings.clearEnabled && isSystemMemoryLow()) {
+                    releaseClearNativeBuffersBetweenStagesLocked()
                 }
+
+                // =========================================================================
+                // Stage 2A: Spoken Language Identification (`Ear`) — Strictly Sequential
+                // =========================================================================
+                val resolvedLanguage = resolveLanguageLocked(enhancedSamples, activeSettings, onStageProgress)
+
+                // =========================================================================
+                // Stage 2B: Acoustic Filler Detection (`Uhm`) — Strictly Sequential
+                // =========================================================================
+                val uhmFrames = runUhmStageLocked(enhancedSamples, activeSettings, onStageProgress)
+
+                // =========================================================================
+                // Stage 3: Multilingual Speech-to-Text (`Voz`) — Strictly Sequential
+                // =========================================================================
+                setModelActiveStatusLocked(activeSettings, DesertAntModel.VOZ, "Transcribing with Voz ($resolvedLanguage)...")
+                onStageProgress?.invoke("Voz ($resolvedLanguage)")
+                val transcription = runVozWithRetryLocked(
+                    samples = enhancedSamples,
+                    language = resolvedLanguage,
+                    customVocabulary = activeSettings.customVocabulary,
+                    activeSettings = activeSettings
+                )
+
+                // =========================================================================
+                // Stage 4: Temporal Filler Subtraction & Text Normalization
+                // =========================================================================
+                val finalTranscript = reconcileTranscript(
+                    transcription = transcription,
+                    uhmFrames = uhmFrames,
+                    uhmEnabled = activeSettings.uhmEnabled,
+                    customVocabulary = activeSettings.customVocabulary
+                )
+
+                val totalInferenceMs = (SystemClock.elapsedRealtime() - inferenceStartMs).coerceAtLeast(1L)
+                _pipelineStatus.value = _pipelineStatus.value.copy(
+                    lastInferenceMs = totalInferenceMs,
+                    lastAudioDurationMs = audioDurationMs
+                )
+                finalTranscript
             } finally {
                 isTranscribing = false
+                val snap = settings
+                val count = countLoadedModelsLocked(snap)
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "$count/${snap.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(snap.hardwareAccelerator)})"
+                )
                 resetIdleEvictionTimerLocked()
             }
         }
@@ -221,15 +412,20 @@ class SmartPipeline(
 
     /**
      * Evicts optional models (`Clear`, `Ear`, `Uhm`) from native RAM while keeping `Voz` resident.
-     * Safe to invoke from the 180-second inactivity timer or `ComponentCallbacks2.onTrimMemory`.
      */
-    suspend fun evictOptionalModels() = withContext(Dispatchers.IO) {
+    suspend fun evictOptionalModels() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             if (!isTranscribing) {
                 Log.i(TAG, "Evicting optional models (Clear, Ear, Uhm) to free native RAM; keeping Voz resident.")
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
+                val snap = settings
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (voz != null) PipelinePhase.STANDBY_EVICTED else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "Voz loaded in RAM • Optional models on standby"
+                )
             }
         }
     }
@@ -248,7 +444,7 @@ class SmartPipeline(
     /**
      * Releases all native LiteRT sessions (`Clear`, `Ear`, `Uhm`, and `Voz`).
      */
-    suspend fun shutdown() = withContext(Dispatchers.IO) {
+    suspend fun shutdown() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
@@ -256,12 +452,105 @@ class SmartPipeline(
             closeEarLocked()
             closeUhmLocked()
             closeVozLocked()
+            val snap = settings
+            updateStatusSnapshot(
+                activeSettings = snap,
+                phaseOverride = PipelinePhase.UNINITIALIZED,
+                messageOverride = "Models unloaded from RAM"
+            )
         }
     }
 
     // =========================================================================
-    // Internal Stage Helpers (Must be called inside `pipelineMutex.withLock`)
+    // Internal Stage & Hardware Helpers (Must be called inside `pipelineMutex.withLock`)
     // =========================================================================
+
+    private fun applyHardwareAcceleratorSettingsLocked(accelerator: HardwareAccelerator) {
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val (numThreads, useNpu, useGpu) = when (accelerator) {
+            HardwareAccelerator.CPU -> Triple(min(8, max(4, cores - 1)), "0", "0")
+            HardwareAccelerator.NPU -> Triple(min(6, max(4, (cores * 2) / 3)), "1", "1")
+            HardwareAccelerator.GPU -> Triple(min(4, max(2, cores / 2)), "0", "1")
+            HardwareAccelerator.AUTO -> Triple(min(6, max(4, cores / 2)), "1", "1")
+        }
+        try {
+            Os.setenv("DAL_LITERT_THREADS", numThreads.toString(), true)
+            Os.setenv("DAL_ACCELERATOR", accelerator.id, true)
+            Os.setenv("LITERT_USE_NPU", useNpu, true)
+            Os.setenv("LITERT_USE_GPU", useGpu, true)
+        } catch (_: Throwable) {
+        }
+        appliedAccelerator = accelerator
+    }
+
+    private fun resolveAcceleratorLabel(accelerator: HardwareAccelerator): String {
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val hasOpenClGpu = hasOpenClGpuSupport()
+        val hasNpu = hasNpuSupport()
+        return when (accelerator) {
+            HardwareAccelerator.AUTO -> when {
+                hasNpu && hasOpenClGpu -> "Auto (NPU / OpenCL GPU)"
+                hasOpenClGpu -> "Auto (GPU OpenCL + XNNPACK)"
+                else -> "Auto (CPU XNNPACK ${min(8, max(4, cores - 1))}T)"
+            }
+            HardwareAccelerator.NPU -> if (hasNpu) {
+                "NPU Accelerator (+ GPU/CPU Fallback)"
+            } else if (hasOpenClGpu) {
+                "GPU OpenCL (NPU Fallback)"
+            } else {
+                "CPU XNNPACK (NPU Fallback)"
+            }
+            HardwareAccelerator.GPU -> if (hasOpenClGpu) {
+                "GPU (OpenCL) + XNNPACK"
+            } else {
+                "CPU XNNPACK (GPU Fallback)"
+            }
+            HardwareAccelerator.CPU -> "CPU (XNNPACK ${min(8, max(4, cores - 1))}-Thread)"
+        }
+    }
+
+    private fun hasOpenClGpuSupport(): Boolean {
+        return try {
+            val openClPaths = listOf(
+                "/vendor/lib64/libOpenCL.so",
+                "/system/vendor/lib64/libOpenCL.so",
+                "/system/lib64/libOpenCL.so",
+                "/vendor/lib64/egl/libGLES_mali.so"
+            )
+            openClPaths.any { File(it).exists() }
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    private fun hasNpuSupport(): Boolean {
+        return try {
+            val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                (Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL).lowercase(Locale.ROOT)
+            } else {
+                (Build.HARDWARE + " " + Build.BOARD).lowercase(Locale.ROOT)
+            }
+            soc.contains("qcom") || soc.contains("qualcomm") || soc.contains("snapdragon") ||
+                soc.contains("mediatek") || soc.contains("mt") || soc.contains("dimensity") ||
+                soc.contains("tensor") || soc.contains("exynos") ||
+                File("/vendor/lib64/libcdsprpc.so").exists() ||
+                File("/vendor/lib64/libneuron_adapter.so").exists()
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun isSystemMemoryLow(): Boolean {
+        return try {
+            val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            val availMb = memInfo.availMem / (1024L * 1024L)
+            memInfo.lowMemory || availMb < 450L
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     private suspend fun runClearStageLocked(
         rawSamples: FloatArray,
@@ -269,13 +558,27 @@ class SmartPipeline(
         onStageProgress: ((String) -> Unit)?
     ): FloatArray {
         if (!activeSettings.clearEnabled) return rawSamples
-        val clearInstance = clear ?: return rawSamples
-        if (!safeIsClearDownloaded(clearInstance)) {
-            Log.w(TAG, "Clear is enabled in settings, but clear-studio model files are not downloaded; bypassing Clear.")
+        if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
+            return rawSamples
+        }
+        // Guard against huge 48 kHz STFT allocations on very long recordings or critically low RAM
+        if (rawSamples.size > MAX_CLEAR_DURATION_SAMPLES || isSystemMemoryLow()) {
+            Log.i(TAG, "Skipping Clear on long/low-memory clip (${rawSamples.size} samples) to preserve RAM for Voz.")
             return rawSamples
         }
 
+        val clearInstance = clear ?: run {
+            val clearDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.CLEAR).absolutePath
+            try {
+                Clear(appContext, clearDir).also { clear = it }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to recreate Clear instance: ${t.message}")
+                return rawSamples
+            }
+        }
+
         return try {
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.CLEAR, "Enhancing audio with Clear...")
             onStageProgress?.invoke("Clear")
             val options = ai.desertant.clear.Options(
                 strength = 1.0,
@@ -287,11 +590,31 @@ class SmartPipeline(
                 sampleRate = SAMPLE_RATE_HZ,
                 options = options
             )
+            clearWarmedUp = true
             val enhanced = result.samples
             if (enhanced.isNotEmpty()) enhanced else rawSamples
         } catch (t: Throwable) {
             Log.w(TAG, "Clear enhancement failed, falling back to raw PCM audio: ${t.message}")
+            closeClearLocked()
+            System.gc()
             rawSamples
+        }
+    }
+
+    private fun releaseClearNativeBuffersBetweenStagesLocked() {
+        val existing = clear ?: return
+        try {
+            existing.close()
+        } catch (_: Throwable) {
+        }
+        clear = null
+        clearWarmedUp = false
+        if (DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
+            try {
+                val clearDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.CLEAR).absolutePath
+                clear = Clear(appContext, clearDir)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -309,20 +632,30 @@ class SmartPipeline(
         if (!activeSettings.earEnabled) {
             return fallbackLanguage
         }
-
-        val earInstance = ear ?: return fallbackLanguage
-        if (!safeIsEarDownloaded(earInstance)) {
-            Log.w(TAG, "Ear is enabled in settings, but model files are not downloaded; falling back to $fallbackLanguage.")
+        // Very short utterances (< 0.9s) do not have enough acoustic context for reliable language ID
+        if (samples.size < 14_400) {
+            return fallbackLanguage
+        }
+        if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
             return fallbackLanguage
         }
 
+        val earInstance = ear ?: return fallbackLanguage
+
         return try {
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.EAR, "Detecting language with Ear...")
             onStageProgress?.invoke("Ear")
+            val earInput = if (samples.size > MAX_EAR_WINDOW_SAMPLES) {
+                samples.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
+            } else {
+                samples
+            }
             val detection = earInstance.identify(
-                samples = samples,
+                samples = earInput,
                 sampleRate = SAMPLE_RATE_HZ,
-                options = ai.desertant.ear.Options(windows = 3)
+                options = ai.desertant.ear.Options(windows = 2)
             )
+            earWarmedUp = true
             val detectedLang = detection.language?.lowercase(Locale.ROOT)
             if (detection.isReliable && detectedLang != null && detectedLang in Voz.supportedLanguages) {
                 detectedLang
@@ -331,17 +664,39 @@ class SmartPipeline(
             }
         } catch (t: Throwable) {
             Log.w(TAG, "Ear language detection failed, falling back to $fallbackLanguage: ${t.message}")
+            closeEarLocked()
             fallbackLanguage
+        }
+    }
+
+    private suspend fun runUhmStageLocked(
+        samples: FloatArray,
+        activeSettings: ModelSettings,
+        onStageProgress: ((String) -> Unit)?
+    ): List<FrameClassification> {
+        if (!activeSettings.uhmEnabled) return emptyList()
+        if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM)) {
+            return emptyList()
+        }
+        val uhmInstance = uhm ?: return emptyList()
+        return try {
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.UHM, "Analyzing hesitations with Uhm...")
+            onStageProgress?.invoke("Uhm")
+            uhmInstance.detect(samples, SAMPLE_RATE_HZ)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Uhm filler inference failed; bypassing filler removal: ${t.message}")
+            emptyList()
         }
     }
 
     private suspend fun runVozWithRetryLocked(
         samples: FloatArray,
         language: String,
-        customVocabulary: List<String>
+        customVocabulary: List<String>,
+        activeSettings: ModelSettings
     ): Transcription {
         val firstVoz = voz ?: run {
-            ensureVozLocked()
+            ensureVozLocked(activeSettings, warmUp = false)
             voz
         } ?: throw IllegalStateException("Voz speech engine could not be initialized.")
 
@@ -351,11 +706,17 @@ class SmartPipeline(
                 sampleRate = SAMPLE_RATE_HZ,
                 language = language,
                 customVocabulary = customVocabulary
-            )
+            ).also {
+                vozWarmedUp = true
+            }
         } catch (firstError: Throwable) {
-            Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); re-initializing and retrying once.")
+            Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); freeing auxiliary RAM and retrying once.")
+            // Free optional native sessions before retrying Voz to guarantee maximum memory headroom
+            closeClearLocked()
+            closeEarLocked()
             closeVozLocked()
-            if (!ensureVozLocked()) {
+            System.gc()
+            if (!ensureVozLocked(activeSettings, warmUp = false)) {
                 throw IllegalStateException("Transcription failed after re-initialization: ${firstError.message}", firstError)
             }
             val retryVoz = voz ?: throw IllegalStateException("Voz unavailable on retry.", firstError)
@@ -364,68 +725,268 @@ class SmartPipeline(
                 sampleRate = SAMPLE_RATE_HZ,
                 language = language,
                 customVocabulary = customVocabulary
-            )
+            ).also {
+                vozWarmedUp = true
+                // Restore auxiliary model handles after retry succeeds
+                ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
+            }
         }
     }
 
-    private fun ensureVozLocked(): Boolean {
-        val existing = voz
-        if (existing != null) {
-            if (safeIsVozDownloaded(existing)) return true
+    private suspend fun ensureVozLocked(activeSettings: ModelSettings, warmUp: Boolean): Boolean {
+        if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
             closeVozLocked()
+            return false
         }
-        return try {
-            val candidate = Voz(appContext)
-            if (candidate.isDownloaded()) {
-                voz = candidate
-                true
-            } else {
-                candidate.close()
+
+        if (voz == null) {
+            try {
+                updateSingleModelStateLocked(
+                    activeSettings = activeSettings,
+                    model = DesertAntModel.VOZ,
+                    state = ModelLoadState.LOADING,
+                    message = "Loading Voz speech recognition model..."
+                )
+                val vozDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.VOZ).absolutePath
+                voz = Voz(appContext, vozDir)
+                vozWarmedUp = false
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to initialize Voz: ${t.message}", t)
+                closeVozLocked()
+                return false
+            }
+        }
+
+        val currentVoz = voz ?: return false
+        if (warmUp && !vozWarmedUp) {
+            try {
+                updateSingleModelStateLocked(
+                    activeSettings = activeSettings,
+                    model = DesertAntModel.VOZ,
+                    state = ModelLoadState.LOADING,
+                    message = "Warming up Voz on ${resolveAcceleratorLabel(activeSettings.hardwareAccelerator)}..."
+                )
+                val warmupSilence = FloatArray(3_200) // 200 ms silent frame
+                currentVoz.transcribe(samples = warmupSilence, sampleRate = SAMPLE_RATE_HZ)
+                vozWarmedUp = true
+            } catch (t: Throwable) {
+                Log.w(TAG, "Voz warm-up deferred to first dictation: ${t.message}")
+            }
+        }
+        return true
+    }
+
+    private suspend fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings, warmUp: Boolean) {
+        val lowMem = isSystemMemoryLow()
+
+        // 1. Ear
+        if (activeSettings.earEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
+            if (ear == null) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.EAR,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading Ear language detector..."
+                    )
+                    val earDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR).absolutePath
+                    ear = Ear(appContext, earDir)
+                    earWarmedUp = false
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not initialize Ear: ${t.message}")
+                    closeEarLocked()
+                }
+            }
+            val currentEar = ear
+            if (warmUp && currentEar != null && !earWarmedUp && !lowMem) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.EAR,
+                        state = ModelLoadState.LOADING,
+                        message = "Warming up Ear language detector..."
+                    )
+                    val warmupSilence = FloatArray(3_200)
+                    currentEar.identify(
+                        samples = warmupSilence,
+                        sampleRate = SAMPLE_RATE_HZ,
+                        options = ai.desertant.ear.Options(windows = 1)
+                    )
+                    earWarmedUp = true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Ear warm-up deferred: ${t.message}")
+                }
+            }
+        } else if (!activeSettings.earEnabled) {
+            closeEarLocked()
+        }
+
+        // 2. Clear
+        if (activeSettings.clearEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
+            if (clear == null) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.CLEAR,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading Clear noise suppression..."
+                    )
+                    val clearDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.CLEAR).absolutePath
+                    clear = Clear(appContext, clearDir)
+                    clearWarmedUp = false
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not initialize Clear: ${t.message}")
+                    closeClearLocked()
+                }
+            }
+            val currentClear = clear
+            if (warmUp && currentClear != null && !clearWarmedUp && !lowMem) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.CLEAR,
+                        state = ModelLoadState.LOADING,
+                        message = "Warming up Clear noise suppression..."
+                    )
+                    val warmupSilence = FloatArray(1_600)
+                    currentClear.enhance(
+                        samples = warmupSilence,
+                        sampleRate = SAMPLE_RATE_HZ,
+                        options = ai.desertant.clear.Options(
+                            strength = 1.0,
+                            sampleRate = SAMPLE_RATE_HZ,
+                            channelMode = ChannelMode.MONO
+                        )
+                    )
+                    clearWarmedUp = true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Clear warm-up deferred: ${t.message}")
+                }
+            }
+        } else if (!activeSettings.clearEnabled) {
+            closeClearLocked()
+        }
+
+        // 3. Uhm
+        if (activeSettings.uhmEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM)) {
+            if (uhm == null) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.UHM,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading Uhm filler detector..."
+                    )
+                    val uhmDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.UHM).absolutePath
+                    uhm = Uhm(appContext, uhmDir)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not initialize Uhm: ${t.message}")
+                    closeUhmLocked()
+                }
+            }
+        } else if (!activeSettings.uhmEnabled) {
+            closeUhmLocked()
+        }
+    }
+
+    private fun countLoadedModelsLocked(activeSettings: ModelSettings): Int {
+        var count = 0
+        if (voz != null) count++
+        if (activeSettings.earEnabled && ear != null) count++
+        if (activeSettings.clearEnabled && clear != null) count++
+        if (activeSettings.uhmEnabled && uhm != null) count++
+        return count
+    }
+
+    private fun computeModelStatesSnapshot(
+        activeSettings: ModelSettings,
+        activeStageModel: DesertAntModel? = null,
+        loadingModel: DesertAntModel? = null
+    ): Map<DesertAntModel, ModelLoadState> {
+        val result = linkedMapOf<DesertAntModel, ModelLoadState>()
+        for (model in DesertAntModel.entries) {
+            val enabled = activeSettings.isModelEnabled(model)
+            val downloaded = try {
+                DesertAntModelStorage.isModelDownloaded(appContext, model)
+            } catch (_: Throwable) {
                 false
             }
-        } catch (t: Throwable) {
-            Log.e(TAG, "Failed to initialize Voz: ${t.message}")
-            false
+            val instanceLoaded = when (model) {
+                DesertAntModel.VOZ -> voz != null
+                DesertAntModel.EAR -> ear != null
+                DesertAntModel.CLEAR -> clear != null
+                DesertAntModel.UHM -> uhm != null
+            }
+            result[model] = when {
+                !enabled -> ModelLoadState.DISABLED
+                !downloaded -> ModelLoadState.NOT_DOWNLOADED
+                activeStageModel == model -> ModelLoadState.ACTIVE
+                loadingModel == model -> ModelLoadState.LOADING
+                instanceLoaded -> ModelLoadState.LOADED
+                else -> ModelLoadState.STANDBY
+            }
         }
+        return result
     }
 
-    private fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings) {
-        if (activeSettings.clearEnabled && clear == null) {
-            try {
-                val candidate = Clear(appContext)
-                if (candidate.isDownloaded()) {
-                    clear = candidate
-                } else {
-                    candidate.close()
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Could not initialize Clear: ${t.message}")
-            }
+    private fun updateSingleModelStateLocked(
+        activeSettings: ModelSettings,
+        model: DesertAntModel,
+        state: ModelLoadState,
+        message: String
+    ) {
+        val map = computeModelStatesSnapshot(
+            activeSettings = activeSettings,
+            activeStageModel = if (state == ModelLoadState.ACTIVE) model else null,
+            loadingModel = if (state == ModelLoadState.LOADING) model else null
+        )
+        _pipelineStatus.value = _pipelineStatus.value.copy(
+            phase = if (state == ModelLoadState.ACTIVE) PipelinePhase.TRANSCRIBING else PipelinePhase.LOADING,
+            configuredAccelerator = activeSettings.hardwareAccelerator,
+            activeAcceleratorLabel = resolveAcceleratorLabel(activeSettings.hardwareAccelerator),
+            modelStates = map,
+            statusMessage = message,
+            loadedCount = countLoadedModelsLocked(activeSettings),
+            enabledCount = activeSettings.enabledModels().size
+        )
+    }
+
+    private fun setModelActiveStatusLocked(
+        activeSettings: ModelSettings,
+        model: DesertAntModel,
+        message: String
+    ) {
+        updateSingleModelStateLocked(
+            activeSettings = activeSettings,
+            model = model,
+            state = ModelLoadState.ACTIVE,
+            message = message
+        )
+    }
+
+    private fun updateStatusSnapshot(
+        activeSettings: ModelSettings,
+        phaseOverride: PipelinePhase?,
+        messageOverride: String?
+    ) {
+        val states = computeModelStatesSnapshot(activeSettings)
+        val loaded = countLoadedModelsLocked(activeSettings)
+        val enabled = activeSettings.enabledModels().size
+        val resolvedPhase = phaseOverride ?: when {
+            isTranscribing -> PipelinePhase.TRANSCRIBING
+            voz != null -> PipelinePhase.READY
+            else -> PipelinePhase.UNINITIALIZED
         }
-        if (activeSettings.earEnabled && ear == null) {
-            try {
-                val candidate = Ear(appContext)
-                if (candidate.isDownloaded()) {
-                    ear = candidate
-                } else {
-                    candidate.close()
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Could not initialize Ear: ${t.message}")
-            }
-        }
-        if (activeSettings.uhmEnabled && uhm == null) {
-            try {
-                val candidate = Uhm(appContext)
-                if (candidate.isDownloaded()) {
-                    uhm = candidate
-                } else {
-                    candidate.close()
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Could not initialize Uhm: ${t.message}")
-            }
-        }
+        val resolvedMsg = messageOverride ?: _pipelineStatus.value.statusMessage
+        _pipelineStatus.value = _pipelineStatus.value.copy(
+            phase = resolvedPhase,
+            configuredAccelerator = activeSettings.hardwareAccelerator,
+            activeAcceleratorLabel = resolveAcceleratorLabel(activeSettings.hardwareAccelerator),
+            modelStates = states,
+            statusMessage = resolvedMsg,
+            loadedCount = loaded,
+            enabledCount = enabled
+        )
     }
 
     private fun resetIdleEvictionTimerLocked() {
@@ -439,6 +1000,7 @@ class SmartPipeline(
     private fun closeVozLocked() {
         val instance = voz
         voz = null
+        vozWarmedUp = false
         if (instance != null) {
             try {
                 instance.close()
@@ -450,6 +1012,7 @@ class SmartPipeline(
     private fun closeEarLocked() {
         val instance = ear
         ear = null
+        earWarmedUp = false
         if (instance != null) {
             try {
                 instance.close()
@@ -461,6 +1024,7 @@ class SmartPipeline(
     private fun closeClearLocked() {
         val instance = clear
         clear = null
+        clearWarmedUp = false
         if (instance != null) {
             try {
                 instance.close()
@@ -479,30 +1043,41 @@ class SmartPipeline(
             }
         }
     }
+}
 
-    private fun safeIsVozDownloaded(instance: Voz): Boolean = try {
-        instance.isDownloaded()
-    } catch (_: Throwable) {
-        false
+/**
+ * Trims leading and trailing dead silence below [threshold] while preserving up to [padSamples]
+ * of natural speech margin on both ends. Returns an empty array if the entire buffer is silence.
+ */
+fun trimLeadingAndTrailingSilence(
+    samples: FloatArray,
+    threshold: Float = 0.0035f,
+    padSamples: Int = 2_560
+): FloatArray {
+    if (samples.isEmpty()) return samples
+    var firstVoice = -1
+    for (i in samples.indices) {
+        if (abs(samples[i]) >= threshold) {
+            firstVoice = i
+            break
+        }
+    }
+    if (firstVoice == -1) return FloatArray(0)
+
+    var lastVoice = firstVoice
+    for (i in samples.lastIndex downTo firstVoice) {
+        if (abs(samples[i]) >= threshold) {
+            lastVoice = i
+            break
+        }
     }
 
-    private fun safeIsEarDownloaded(instance: Ear): Boolean = try {
-        instance.isDownloaded()
-    } catch (_: Throwable) {
-        false
+    val start = max(0, firstVoice - padSamples)
+    val endExclusive = min(samples.size, lastVoice + padSamples + 1)
+    if (start == 0 && endExclusive == samples.size) {
+        return samples
     }
-
-    private fun safeIsClearDownloaded(instance: Clear): Boolean = try {
-        instance.isDownloaded()
-    } catch (_: Throwable) {
-        false
-    }
-
-    private fun safeIsUhmDownloaded(instance: Uhm): Boolean = try {
-        instance.isDownloaded()
-    } catch (_: Throwable) {
-        false
-    }
+    return samples.copyOfRange(start, endExclusive)
 }
 
 /**
@@ -715,6 +1290,8 @@ fun applyCustomVocabulary(text: String, customVocabulary: List<String>): String 
         updated = updated.replace(Regex("\\b$escaped\\b", RegexOption.IGNORE_CASE), trimmed)
     }
     return updated
+        .split(' ')
+        .joinToString(" ") { token -> biasWordWithCustomVocabulary(token, customVocabulary) }
 }
 
 private fun biasWordWithCustomVocabulary(wordText: String, customVocabulary: List<String>): String {

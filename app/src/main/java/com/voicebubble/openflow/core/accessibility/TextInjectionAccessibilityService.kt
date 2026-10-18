@@ -1,64 +1,56 @@
 package com.voicebubble.openflow.core.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.isActive
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.lang.ref.WeakReference
-import android.os.Build
 
 class TextInjectionAccessibilityService : AccessibilityService() {
 
     companion object {
+        private const val FOCUS_GRACE_MS = 2_000L
         private var instance: WeakReference<TextInjectionAccessibilityService>? = null
-        val isInputFieldFocused = kotlinx.coroutines.flow.MutableStateFlow(false)
-        
+        val isInputFieldFocused = MutableStateFlow(false)
+        val isServiceConnected = MutableStateFlow(false)
+
         fun getSharedInstance(): TextInjectionAccessibilityService? {
             return instance?.get()
         }
     }
 
-    private var pollingJob: kotlinx.coroutines.Job? = null
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var pollingJob: Job? = null
+
+    @Volatile
+    private var lastEditableFocusSeenMs: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = WeakReference(this)
-        
-        pollingJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            while (isActive) {
-                try {
-                    val rootNode = rootInActiveWindow
-                    var isFocused = false
-                    if (rootNode != null) {
-                        val focusedNode = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                        isFocused = focusedNode != null && focusedNode.isEditable
-                        focusedNode?.recycle()
-                        rootNode.recycle()
-                    }
+        isServiceConnected.value = true
 
-                    // Check if keyboard is visible
-                    var isKeyboardVisible = false
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                        val allWindows = windows
-                        for (window in allWindows) {
-                            if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
-                                isKeyboardVisible = true
-                            }
-                            window.recycle()
-                        }
-                    } else {
-                        // Fallback for old Android versions
-                        isKeyboardVisible = isFocused
-                    }
-                    
-                    isInputFieldFocused.value = isFocused && isKeyboardVisible
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-                kotlinx.coroutines.delay(500)
+        pollingJob?.cancel()
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                refreshFocusState()
+                delay(450L)
             }
         }
     }
@@ -66,86 +58,216 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        isServiceConnected.value = false
         isInputFieldFocused.value = false
         pollingJob?.cancel()
+        serviceScope.cancel()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // We now rely purely on the polling job for focus + keyboard detection
+        if (event == null) return
+        val type = event.eventType
+        if (type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
+            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            type == AccessibilityEvent.TYPE_VIEW_CLICKED
+        ) {
+            val source = event.source
+            if (source != null) {
+                try {
+                    if (source.isEditable && source.isFocused) {
+                        lastEditableFocusSeenMs = SystemClock.elapsedRealtime()
+                        isInputFieldFocused.value = true
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        @Suppress("DEPRECATION")
+                        source.recycle()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
     }
 
     override fun onInterrupt() {}
 
-    fun injectTextDirectly(textToInsert: String): Boolean {
-        val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        val oldClip = clipboard.primaryClip
-        
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-            // Set new text to clipboard
-            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("OpenFlow", textToInsert))
-            
-            // Wait for clipboard propagation without blocking main thread
-            kotlinx.coroutines.delay(100)
-            
-            val rootNode = rootInActiveWindow
-            if (rootNode == null) {
-                restoreClipboard(clipboard, oldClip)
-                return@launch
+    private fun refreshFocusState() {
+        try {
+            val editableNode = findFocusedEditableNode()
+            val now = SystemClock.elapsedRealtime()
+            if (editableNode != null) {
+                try {
+                    @Suppress("DEPRECATION")
+                    editableNode.recycle()
+                } catch (_: Throwable) {
+                }
+                lastEditableFocusSeenMs = now
+                isInputFieldFocused.value = true
+            } else {
+                // Keep focus true during brief 2s window/IME transitions when tapping the overlay bubble
+                val withinGrace = (now - lastEditableFocusSeenMs) <= FOCUS_GRACE_MS
+                isInputFieldFocused.value = withinGrace
             }
-            
-            val focusedNode = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            if (focusedNode != null && focusedNode.isEditable) {
-                var success = focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                
-                if (!success && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    // Fallback to ACTION_SET_TEXT
-                    val currentText = focusedNode.text?.toString() ?: ""
-                    val start = focusedNode.textSelectionStart
-                    val end = focusedNode.textSelectionEnd
-                    
-                    val newText = if (start in 0..currentText.length && end in 0..currentText.length) {
-                        val realStart = minOf(start, end)
-                        val realEnd = maxOf(start, end)
-                        currentText.substring(0, realStart) + textToInsert + currentText.substring(realEnd)
-                    } else {
-                        if (currentText.isNotEmpty()) "$currentText $textToInsert" else textToInsert
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Searches `rootInActiveWindow` first, then falls back to all interactive application windows
+     * so focus is still found even when the floating overlay window was just tapped.
+     */
+    private fun findFocusedEditableNode(): AccessibilityNodeInfo? {
+        try {
+            val activeRoot = rootInActiveWindow
+            if (activeRoot != null) {
+                val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                if (focused != null && focused.isEditable) {
+                    try {
+                        @Suppress("DEPRECATION")
+                        activeRoot.recycle()
+                    } catch (_: Throwable) {
                     }
-                    
-                    val arguments = Bundle()
-                    arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText)
-                    success = focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
-                    
-                    if (success) {
-                        val newCursorPos = if (start in 0..currentText.length) minOf(start, end) + textToInsert.length else newText.length
-                        val selectionArgs = Bundle()
-                        selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursorPos)
-                        selectionArgs.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursorPos)
-                        focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+                    return focused
+                }
+                try {
+                    @Suppress("DEPRECATION")
+                    focused?.recycle()
+                    @Suppress("DEPRECATION")
+                    activeRoot.recycle()
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                val allWindows = windows ?: return null
+                var found: AccessibilityNodeInfo? = null
+                for (window in allWindows) {
+                    if (found == null && window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                        val root = window.root
+                        if (root != null) {
+                            val candidate = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                            if (candidate != null && candidate.isEditable) {
+                                found = candidate
+                            } else {
+                                try {
+                                    @Suppress("DEPRECATION")
+                                    candidate?.recycle()
+                                } catch (_: Throwable) {
+                                }
+                            }
+                            try {
+                                @Suppress("DEPRECATION")
+                                root.recycle()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    try {
+                        @Suppress("DEPRECATION")
+                        window.recycle()
+                    } catch (_: Throwable) {
                     }
                 }
-                focusedNode.recycle()
+                return found
+            } catch (_: Throwable) {
             }
-            rootNode.recycle()
-            
-            // Restore old clip after target app had time to paste
-            kotlinx.coroutines.delay(300)
+        }
+        return null
+    }
+
+    /**
+     * Injects [textToInsert] into the currently focused editable field and returns `true` only if
+     * the text was actually pasted or set into an editable node. If no editable node is available,
+     * leaves [textToInsert] on the clipboard and returns `false` so the user never loses dictated text.
+     */
+    suspend fun injectTextSuspend(textToInsert: String): Boolean = withContext(Dispatchers.Main) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val oldClip = try {
+            clipboard.primaryClip
+        } catch (_: Throwable) {
+            null
+        }
+
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", textToInsert))
+        } catch (_: Throwable) {
+        }
+
+        delay(80L)
+
+        val focusedNode = findFocusedEditableNode()
+            ?: return@withContext false // Keep textToInsert in clipboard!
+
+        var injected = false
+        try {
+            injected = focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            if (!injected && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                val currentText = focusedNode.text?.toString() ?: ""
+                val start = focusedNode.textSelectionStart
+                val end = focusedNode.textSelectionEnd
+
+                val newText = if (start in 0..currentText.length && end in 0..currentText.length) {
+                    val realStart = minOf(start, end)
+                    val realEnd = maxOf(start, end)
+                    currentText.substring(0, realStart) + textToInsert + currentText.substring(realEnd)
+                } else {
+                    if (currentText.isNotEmpty()) "$currentText $textToInsert" else textToInsert
+                }
+
+                val arguments = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText)
+                }
+                injected = focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+
+                if (injected) {
+                    val newCursorPos = if (start in 0..currentText.length) {
+                        minOf(start, end) + textToInsert.length
+                    } else {
+                        newText.length
+                    }
+                    val selectionArgs = Bundle().apply {
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newCursorPos)
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newCursorPos)
+                    }
+                    focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selectionArgs)
+                }
+            }
+        } catch (_: Throwable) {
+            injected = false
+        } finally {
+            try {
+                @Suppress("DEPRECATION")
+                focusedNode.recycle()
+            } catch (_: Throwable) {
+            }
+        }
+
+        if (injected) {
+            delay(250L)
             restoreClipboard(clipboard, oldClip)
         }
-        
+        injected
+    }
+
+    fun injectTextDirectly(textToInsert: String): Boolean {
+        serviceScope.launch {
+            injectTextSuspend(textToInsert)
+        }
         return true
     }
 
-    private fun restoreClipboard(clipboard: android.content.ClipboardManager, oldClip: android.content.ClipData?) {
+    private fun restoreClipboard(clipboard: ClipboardManager, oldClip: ClipData?) {
         try {
             if (oldClip != null) {
                 clipboard.setPrimaryClip(oldClip)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 clipboard.clearPrimaryClip()
-            } else {
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Throwable) {
         }
     }
 }

@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.audio.AudioRecordingController
+import com.voicebubble.openflow.core.speech.PipelinePhase
 
 @Composable
 fun BubbleOverlayComponent(
@@ -32,6 +33,8 @@ fun BubbleOverlayComponent(
     isInputFieldFocused: Boolean,
     processingProgress: String,
     bubbleSize: Float = 52f,
+    pipelinePhase: PipelinePhase = PipelinePhase.READY,
+    isModelLoaded: Boolean = true,
     onDragDelta: (Float, Float) -> Unit,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit
@@ -40,22 +43,25 @@ fun BubbleOverlayComponent(
         return
     }
 
+    val isLoadingModels = pipelinePhase == PipelinePhase.LOADING || pipelinePhase == PipelinePhase.WARMING_UP
+
     val width by animateDpAsState(
         targetValue = when (bubbleState) {
             OverlayBubbleState.RECORDING -> (bubbleSize + 24).dp
             else -> bubbleSize.dp
         },
-        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow)
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+        label = "bubbleWidth"
     )
 
     val height by animateDpAsState(
         targetValue = bubbleSize.dp,
-        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow)
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+        label = "bubbleHeight"
     )
 
     val themePrimary = androidx.compose.material3.MaterialTheme.colorScheme.primary
     val themeSecondary = androidx.compose.material3.MaterialTheme.colorScheme.secondary
-    val errorColor = androidx.compose.material3.MaterialTheme.colorScheme.error
     val onPrimary = androidx.compose.material3.MaterialTheme.colorScheme.onPrimary
     val backgroundColor = when (bubbleState) {
         OverlayBubbleState.RECORDING -> Color(0xFFE53935)
@@ -73,7 +79,9 @@ fun BubbleOverlayComponent(
             .pointerInput(Unit) {
                 detectDragGestures { change, dragAmount ->
                     change.consume()
-                    onDragDelta(dragAmount.x, dragAmount.y)
+                    if (!dragAmount.x.isNaN() && !dragAmount.y.isNaN()) {
+                        onDragDelta(dragAmount.x, dragAmount.y)
+                    }
                 }
             }
             .clickable {
@@ -87,12 +95,41 @@ fun BubbleOverlayComponent(
     ) {
         when (bubbleState) {
             OverlayBubbleState.IDLE -> {
-                Icon(
-                    Icons.Default.Mic,
-                    contentDescription = "Mic",
-                    tint = onPrimary,
-                    modifier = Modifier.size((bubbleSize * 0.46f).dp)
-                )
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isLoadingModels) {
+                        CircularProgressIndicator(
+                            color = Color(0xFFFFD54F),
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size((bubbleSize * 0.76f).dp)
+                        )
+                    }
+                    Icon(
+                        Icons.Default.Mic,
+                        contentDescription = "Mic",
+                        tint = onPrimary,
+                        modifier = Modifier.size((bubbleSize * 0.46f).dp)
+                    )
+                    // Status dot in bottom-right corner indicating model load readiness in RAM
+                    val dotColor = when {
+                        isLoadingModels -> Color(0xFFFFB300) // Amber: loading/warming up
+                        isModelLoaded -> Color(0xFF00E676)   // Green: loaded in RAM & ready
+                        else -> Color(0xFFB0BEC5)            // Gray: standby/unloaded
+                    }
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = (bubbleSize * 0.14f).dp, bottom = (bubbleSize * 0.14f).dp)
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.35f))
+                            .padding(1.5.dp)
+                            .clip(CircleShape)
+                            .background(dotColor)
+                    )
+                }
             }
             OverlayBubbleState.RECORDING -> {
                 RecordingBarsComponent(audioController = audioController, onPrimary = onPrimary)

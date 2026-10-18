@@ -16,19 +16,27 @@
 
 package com.voicebubble.openflow.overlay
 
+import android.Manifest
 import android.annotation.SuppressLint
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
 import androidx.compose.runtime.collectAsState
@@ -36,7 +44,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
 import androidx.core.app.NotificationCompat
-import androidx.lifecycle.*
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
@@ -45,11 +58,23 @@ import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilitySer
 import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.database.AppDatabase
 import com.voicebubble.openflow.core.database.TranscriptionRecord
+import com.voicebubble.openflow.core.speech.PipelineStatus
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.ui.theme.OpenFlowTheme
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 enum class OverlayBubbleState {
     IDLE,
@@ -60,6 +85,17 @@ enum class OverlayBubbleState {
 
 class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStateRegistryOwner {
 
+    companion object {
+        const val ACTION_REFRESH_SETTINGS = "com.voicebubble.openflow.ACTION_REFRESH_SETTINGS"
+        const val KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v2"
+        const val LEGACY_KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs"
+        private const val CHANNEL_ID = "bubble_service_channel"
+        private const val NOTIFICATION_ID = 1001
+
+        private val _isRunning = MutableStateFlow(false)
+        val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+    }
+
     override val viewModelStore: ViewModelStore = ViewModelStore()
 
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
@@ -69,11 +105,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     private lateinit var windowManager: WindowManager
     private lateinit var composeView: ComposeView
     private lateinit var layoutParams: WindowManager.LayoutParams
+    private var isOverlayAttached = false
 
     private val audioController = AudioRecordingController()
     private lateinit var smartPipeline: SmartPipeline
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var dictationWakeLock: PowerManager.WakeLock? = null
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
@@ -85,26 +123,74 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val modelPrefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         val updatedSettings = ModelSettings.load(this@FloatingBubbleService)
-        serviceScope.launch(Dispatchers.IO) {
+        serviceScope.launch(Dispatchers.Default) {
             smartPipeline.reloadSettings(updatedSettings)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        _isRunning.value = true
         savedStateRegistryController.performRestore(null)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         smartPipeline = SmartPipeline.getInstance(this)
-        initializePipeline()
+
+        // Start foreground immediately in onCreate to satisfy Android 8-15 strict FGS timeout
+        startCustomForeground(smartPipeline.pipelineStatus.value)
+
         setupOverlayView()
+        initializePipeline()
+
         val modelPrefs = ModelSettings.getPreferences(this)
         modelPrefs.registerOnSharedPreferenceChangeListener(modelPrefsListener)
+
+        // Keep status-bar notification updated with live model load & accelerator status
+        serviceScope.launch {
+            smartPipeline.pipelineStatus.collect { status ->
+                updateForegroundNotification(status)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        startCustomForeground()
+        _isRunning.value = true
+        startCustomForeground(smartPipeline.pipelineStatus.value)
+
+        if (!isOverlayAttached && Settings.canDrawOverlays(this)) {
+            setupOverlayView()
+        }
+
+        if (intent?.action == ACTION_REFRESH_SETTINGS) {
+            clampBubblePositionToScreen()
+            serviceScope.launch(Dispatchers.Default) {
+                smartPipeline.reloadSettings(ModelSettings.load(this@FloatingBubbleService))
+            }
+        }
         return START_STICKY
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        clampBubblePositionToScreen()
+    }
+
+    private fun clampBubblePositionToScreen() {
+        if (!isOverlayAttached || !::layoutParams.isInitialized || !::composeView.isInitialized) return
+        try {
+            val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+            val bubbleSizeDp = prefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
+            val dm = resources.displayMetrics
+            val bubblePx = (bubbleSizeDp * dm.density).roundToInt().coerceAtLeast(96)
+            val maxX = (dm.widthPixels - bubblePx).coerceAtLeast(0)
+            val maxY = (dm.heightPixels - bubblePx).coerceAtLeast(0)
+            layoutParams.x = layoutParams.x.coerceIn(0, maxX)
+            layoutParams.y = layoutParams.y.coerceIn(0, maxY)
+            if (composeView.isAttachedToWindow) {
+                windowManager.updateViewLayout(composeView, layoutParams)
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onTrimMemory(level: Int) {
@@ -118,44 +204,34 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private fun initializePipeline() {
         val previousJob = initPipelineJob
-        initPipelineJob = serviceScope.launch(Dispatchers.IO) {
+        initPipelineJob = serviceScope.launch(Dispatchers.Default) {
             previousJob?.cancelAndJoin()
             try {
-                smartPipeline.reloadSettings(ModelSettings.load(this@FloatingBubbleService))
-                val ready = smartPipeline.initialize()
+                val loadedSettings = ModelSettings.load(this@FloatingBubbleService)
+                val ready = smartPipeline.initialize(warmUp = true)
                 withContext(Dispatchers.Main) {
-                    if (ready) {
+                    if (!ready && !com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDownloaded(
+                            this@FloatingBubbleService,
+                            com.voicebubble.openflow.settings.DesertAntModel.VOZ
+                        )
+                    ) {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,
-                            "Desert Ant audio pipeline ready",
-                            android.widget.Toast.LENGTH_SHORT
-                        ).show()
-                    } else {
-                        android.widget.Toast.makeText(
-                            this@FloatingBubbleService,
-                            "Please download the Voz speech model in the app first.",
+                            "Please download the Voz speech model in OpenFlow first.",
                             android.widget.Toast.LENGTH_LONG
                         ).show()
                     }
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(
-                        this@FloatingBubbleService,
-                        "Initialization error: ${e.message}",
-                        android.widget.Toast.LENGTH_LONG
-                    ).show()
-                }
+            } catch (t: Throwable) {
+                t.printStackTrace()
             }
         }
     }
 
-    private fun startCustomForeground() {
-        val channelId = "bubble_service_channel"
+    private fun buildForegroundNotification(status: PipelineStatus): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                channelId,
+                CHANNEL_ID,
                 "Voice Dictation Service",
                 NotificationManager.IMPORTANCE_LOW
             )
@@ -166,35 +242,90 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             this,
             0,
             Intent(this, com.voicebubble.openflow.MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("OpenFlow Active")
-            .setContentText("Tap the floating bubble to dictate.")
+
+        val title = if (status.isReady) {
+            "OpenFlow Active • ${status.loadedCount}/${status.enabledCount} Models in RAM"
+        } else {
+            "OpenFlow Active • ${status.phase.label}"
+        }
+        val subtitle = "${status.activeAcceleratorLabel} — Tap floating bubble to dictate"
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(subtitle)
             .setSmallIcon(com.voicebubble.openflow.R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
+    }
 
+    private fun startCustomForeground(status: PipelineStatus) {
+        val notification = buildForegroundNotification(status)
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val hasMicPerm = ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                val fgsType = if (hasMicPerm) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                }
+                try {
+                    startForeground(NOTIFICATION_ID, notification, fgsType)
+                } catch (_: Throwable) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    )
+                }
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 startForeground(
-                    1001,
+                    NOTIFICATION_ID,
                     notification,
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 )
             } else {
-                startForeground(1001, notification)
+                startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (t: Throwable) {
+            t.printStackTrace()
+        }
+    }
+
+    private fun updateForegroundNotification(status: PipelineStatus) {
+        try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID, buildForegroundNotification(status))
+        } catch (_: Throwable) {
         }
     }
 
     @SuppressLint("RtlHardcoded")
     private fun setupOverlayView() {
+        if (isOverlayAttached) return
+        if (!Settings.canDrawOverlays(this)) {
+            android.widget.Toast.makeText(
+                this,
+                "Overlay permission is required to display the floating bubble.",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+            stopSelf()
+            return
+        }
+
+        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+        val metrics = resources.displayMetrics
+        val savedX = prefs.getInt("bubble_x", 80).coerceIn(0, (metrics.widthPixels - 140).coerceAtLeast(0))
+        val savedY = prefs.getInt("bubble_y", 400).coerceIn(0, (metrics.heightPixels - 180).coerceAtLeast(0))
+
         layoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -205,12 +336,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 WindowManager.LayoutParams.TYPE_PHONE
             },
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.LEFT
-            x = 80
-            y = 400
+            x = savedX
+            y = savedY
         }
 
         val themeContext = android.view.ContextThemeWrapper(this, com.voicebubble.openflow.R.style.Theme_OpenFlow)
@@ -223,34 +354,51 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 OpenFlowTheme {
                     val currentState by bubbleState.collectAsState()
                     val isFocused by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
-                    val prefs = androidx.compose.runtime.remember {
+                    val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
+                    val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
+
+                    val settingsPrefs = androidx.compose.runtime.remember {
                         getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
                     }
                     var showOnlyOnInputs by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(prefs.getBoolean("show_only_on_inputs", true))
+                        androidx.compose.runtime.mutableStateOf(
+                            settingsPrefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, false)
+                        )
                     }
                     var bubbleSize by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(prefs.getFloat("bubble_size", 52f))
+                        androidx.compose.runtime.mutableStateOf(
+                            settingsPrefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
+                        )
                     }
 
                     val listener = androidx.compose.runtime.remember {
                         android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
                             if (sharedPreferences != null && key != null) {
                                 when (key) {
-                                    "show_only_on_inputs" -> showOnlyOnInputs = sharedPreferences.getBoolean(key, true)
-                                    "bubble_size" -> bubbleSize = sharedPreferences.getFloat(key, 52f)
+                                    KEY_SHOW_ONLY_ON_INPUTS -> {
+                                        showOnlyOnInputs = sharedPreferences.getBoolean(key, false)
+                                    }
+                                    "bubble_size" -> {
+                                        bubbleSize = sharedPreferences.getFloat(key, 52f).coerceIn(36f, 80f)
+                                    }
                                 }
                             }
                         }
                     }
 
-                    androidx.compose.runtime.DisposableEffect(prefs, listener) {
-                        prefs.registerOnSharedPreferenceChangeListener(listener)
+                    androidx.compose.runtime.DisposableEffect(settingsPrefs, listener) {
+                        settingsPrefs.registerOnSharedPreferenceChangeListener(listener)
                         onDispose {
-                            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+                            settingsPrefs.unregisterOnSharedPreferenceChangeListener(listener)
                         }
                     }
-                    val isEffectivelyFocused = if (showOnlyOnInputs) isFocused else true
+
+                    // Never hide the bubble if Accessibility Service isn't connected, so it never vanishes unexpectedly
+                    val isEffectivelyFocused = if (showOnlyOnInputs && isAccessibilityConnected) {
+                        isFocused
+                    } else {
+                        true
+                    }
 
                     BubbleOverlayComponent(
                         audioController = audioController,
@@ -258,21 +406,51 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         isInputFieldFocused = isEffectivelyFocused,
                         processingProgress = processingProgress.collectAsState(initial = "").value,
                         bubbleSize = bubbleSize,
+                        pipelinePhase = pipelineStatus.phase,
+                        isModelLoaded = pipelineStatus.isReady,
                         onDragDelta = { dx, dy ->
-                            this@FloatingBubbleService.layoutParams.x += dx.toInt()
-                            this@FloatingBubbleService.layoutParams.y += dy.toInt()
+                            if (dx.isNaN() || dy.isNaN()) return@BubbleOverlayComponent
+                            val dm = resources.displayMetrics
+                            val bubblePx = (bubbleSize * dm.density).roundToInt().coerceAtLeast(96)
+                            val maxX = (dm.widthPixels - bubblePx).coerceAtLeast(0)
+                            val maxY = (dm.heightPixels - bubblePx).coerceAtLeast(0)
+
+                            this@FloatingBubbleService.layoutParams.x =
+                                (this@FloatingBubbleService.layoutParams.x + dx.roundToInt()).coerceIn(0, maxX)
+                            this@FloatingBubbleService.layoutParams.y =
+                                (this@FloatingBubbleService.layoutParams.y + dy.roundToInt()).coerceIn(0, maxY)
+
                             try {
-                                windowManager.updateViewLayout(
-                                    composeView,
-                                    this@FloatingBubbleService.layoutParams
-                                )
-                            } catch (e: Exception) {
-                                e.printStackTrace()
+                                if (::composeView.isInitialized && composeView.isAttachedToWindow) {
+                                    windowManager.updateViewLayout(
+                                        composeView,
+                                        this@FloatingBubbleService.layoutParams
+                                    )
+                                    settingsPrefs.edit()
+                                        .putInt("bubble_x", this@FloatingBubbleService.layoutParams.x)
+                                        .putInt("bubble_y", this@FloatingBubbleService.layoutParams.y)
+                                        .apply()
+                                }
+                            } catch (t: Throwable) {
+                                t.printStackTrace()
                             }
                         },
                         onStartRecording = {
+                            if (ContextCompat.checkSelfPermission(
+                                    this@FloatingBubbleService,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                android.widget.Toast.makeText(
+                                    this@FloatingBubbleService,
+                                    "Microphone permission is required to record speech.",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                                return@BubbleOverlayComponent
+                            }
+                            acquireDictationWakeLock()
                             bubbleState.value = OverlayBubbleState.RECORDING
-                            if (prefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
+                            if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             setKeepScreenOn(true)
                             serviceScope.launch {
                                 audioController.startRecording(this)
@@ -293,18 +471,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         try {
             windowManager.addView(composeView, layoutParams)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            android.widget.Toast.makeText(
-                this,
-                "Error: Missing overlay permission!",
-                android.widget.Toast.LENGTH_LONG
-            ).show()
+            isOverlayAttached = true
+        } catch (t: Throwable) {
+            t.printStackTrace()
+            isOverlayAttached = false
             stopSelf()
         }
     }
 
     private fun setKeepScreenOn(keep: Boolean) {
+        if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
         if (keep) {
             layoutParams.flags = layoutParams.flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         } else {
@@ -314,8 +490,32 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun acquireDictationWakeLock() {
+        try {
+            if (dictationWakeLock?.isHeld == true) return
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            dictationWakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "OpenFlow::DictationWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(3 * 60 * 1000L) // 3-minute safety timeout per dictation
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun releaseDictationWakeLock() {
+        try {
+            dictationWakeLock?.let {
+                if (it.isHeld) it.release()
+            }
+            dictationWakeLock = null
+        } catch (_: Throwable) {
         }
     }
 
@@ -329,7 +529,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
                 vibrator.vibrate(duration)
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -351,11 +551,15 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     .replace(Regex("\\s+"), " ")
 
                 if (finalText.isNotBlank()) {
-                    val isFocused = TextInjectionAccessibilityService.isInputFieldFocused.value
-                    if (isFocused) {
-                        val accessibilityService = TextInjectionAccessibilityService.getSharedInstance()
-                        accessibilityService?.injectTextDirectly(finalText)
+                    val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
+                    val accessibilityService = TextInjectionAccessibilityService.getSharedInstance()
+                    val injected = if (autoPasteEnabled && accessibilityService != null) {
+                        accessibilityService.injectTextSuspend(finalText)
                     } else {
+                        false
+                    }
+
+                    if (!injected) {
                         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", finalText))
                         withContext(Dispatchers.Main) {
@@ -377,7 +581,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 durationMs = (samples.size / 16f).toLong(),
                                 audioSamplesCount = samples.size,
                                 modelIdentifier = "desert-ant-voz-4.0.0",
-                                wasInjectedSuccessfully = isFocused
+                                wasInjectedSuccessfully = injected
                             )
                         )
                     } catch (e: Exception) {
@@ -387,36 +591,42 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
                 processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.SUCCESS
-                delay(1500)
+                delay(1200)
                 bubbleState.value = OverlayBubbleState.IDLE
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (t: Throwable) {
+                t.printStackTrace()
                 processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.IDLE
                 withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         this@FloatingBubbleService,
-                        "Transcription error: ${e.message}",
+                        "Transcription error: ${t.message}",
                         android.widget.Toast.LENGTH_SHORT
                     ).show()
                 }
+            } finally {
+                releaseDictationWakeLock()
             }
         }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-        val modelPrefs = ModelSettings.getPreferences(this)
-        modelPrefs.unregisterOnSharedPreferenceChangeListener(modelPrefsListener)
-        GlobalScope.launch { audioController.release() }
-        GlobalScope.launch { smartPipeline.shutdown() }
+        _isRunning.value = false
+        releaseDictationWakeLock()
+        try {
+            val modelPrefs = ModelSettings.getPreferences(this)
+            modelPrefs.unregisterOnSharedPreferenceChangeListener(modelPrefsListener)
+        } catch (_: Throwable) {
+        }
+        audioController.releaseNow()
         serviceScope.cancel()
-        if (::composeView.isInitialized) {
+        if (::composeView.isInitialized && isOverlayAttached) {
             try {
                 windowManager.removeView(composeView)
-            } catch (e: Exception) {
-                e.printStackTrace()
+            } catch (_: Throwable) {
             }
+            isOverlayAttached = false
         }
+        super.onDestroy()
     }
 }

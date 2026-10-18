@@ -33,17 +33,20 @@ class AudioRecordingController {
 
     suspend fun release() {
         controllerMutex.withLock {
-            try {
-                if (audioRecord?.state == AudioRecord.STATE_INITIALIZED && audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord?.stop()
-                }
-            } catch (e: IllegalStateException) {
-                e.printStackTrace()
-            }
-            recordingJob?.cancelAndJoin()
-            recordingJob = null
-            releaseInternal()
+            releaseNow()
         }
+    }
+
+    fun releaseNow() {
+        recordingJob?.cancel()
+        recordingJob = null
+        try {
+            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED && audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                audioRecord?.stop()
+            }
+        } catch (_: Throwable) {
+        }
+        releaseInternal()
     }
 
     @SuppressLint("MissingPermission")

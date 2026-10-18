@@ -89,7 +89,8 @@ data class DownloadSessionState(
     val etaSeconds: Long? = null,
     val statusNote: String? = null,
     val errorMessage: String? = null,
-    val modelStatuses: Map<DesertAntModel, ModelQueueStatus> = emptyMap()
+    val modelStatuses: Map<DesertAntModel, ModelQueueStatus> = emptyMap(),
+    val pendingAutoEnableModels: Set<DesertAntModel> = emptySet()
 ) {
     val modelProgress: Float
         get() = if (modelTotalBytes > 0L) {
@@ -167,6 +168,7 @@ data class DownloadSessionState(
 object ModelDownloadManager {
     private const val TAG = "ModelDownloadManager"
     private const val MAX_STALL_RETRIES = 15
+    private const val MAX_INTEGRITY_RETRIES = 3
     private const val CONNECT_TIMEOUT_MS = 45_000
     private const val READ_TIMEOUT_MS = 90_000
 
@@ -285,44 +287,132 @@ object ModelDownloadManager {
         return sum
     }
 
+    private val queueLock = Any()
+    private val activeQueue = mutableListOf<DesertAntModel>()
+    private val pendingAutoEnable = mutableSetOf<DesertAntModel>()
+    private val completionCallbacks = mutableListOf<() -> Unit>()
+
+    /**
+     * Cancels a pending auto-enable request for [model] if the user turns the toggle back off
+     * before its download finishes.
+     */
+    fun cancelAutoEnable(model: DesertAntModel) {
+        val snapshotPending = synchronized(queueLock) {
+            pendingAutoEnable.remove(model)
+            pendingAutoEnable.toSet()
+        }
+        updateState {
+            copy(pendingAutoEnableModels = snapshotPending)
+        }
+    }
+
+    private fun autoEnableModelIfRequested(context: Context, model: DesertAntModel) {
+        val shouldEnable = synchronized(queueLock) {
+            pendingAutoEnable.remove(model)
+        }
+        if (shouldEnable && DesertAntModelStorage.isModelDownloaded(context, model)) {
+            val current = ModelSettings.load(context)
+            val updated = when (model) {
+                DesertAntModel.EAR -> current.copy(earEnabled = true)
+                DesertAntModel.CLEAR -> current.copy(clearEnabled = true)
+                DesertAntModel.UHM -> current.copy(uhmEnabled = true)
+                DesertAntModel.VOZ -> current
+            }
+            if (updated != current) {
+                ModelSettings.save(context, updated)
+            }
+        }
+        val remainingPending = synchronized(queueLock) { pendingAutoEnable.toSet() }
+        updateState {
+            copy(pendingAutoEnableModels = remainingPending)
+        }
+    }
+
     /**
      * Starts or resumes a background download queue for [models].
+     * If a download queue is already running, any newly requested models and completion callbacks
+     * are appended to the live queue without dropping existing callbacks or auto-enable states.
      */
     @Synchronized
     fun startQueue(
         context: Context,
         models: List<DesertAntModel>,
+        autoEnableOnComplete: Boolean = false,
         onAllCompleted: (() -> Unit)? = null
     ) {
         val appContext = context.applicationContext
-        if (_sessionState.value.isRunning) {
-            return
+        val requested = models.distinct()
+        if (requested.isEmpty()) return
+
+        synchronized(queueLock) {
+            if (autoEnableOnComplete) {
+                for (m in requested) {
+                    if (m != DesertAntModel.VOZ) {
+                        pendingAutoEnable.add(m)
+                    }
+                }
+            }
+            if (onAllCompleted != null) {
+                completionCallbacks.add(onAllCompleted)
+            }
+
+            if (_sessionState.value.isRunning && activeJob?.isActive == true) {
+                val currentStatuses = _sessionState.value.modelStatuses.toMutableMap()
+                for (m in requested) {
+                    if (m !in activeQueue) {
+                        activeQueue.add(m)
+                        currentStatuses[m] = if (DesertAntModelStorage.isModelVerified(appContext, m)) {
+                            ModelQueueStatus.DONE
+                        } else {
+                            ModelQueueStatus.QUEUED
+                        }
+                    }
+                }
+                val snapshotQueue = activeQueue.toList()
+                val snapshotPending = pendingAutoEnable.toSet()
+                val newTotalBytes = snapshotQueue.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L)
+                val newDoneBytes = computeQueueDownloadedBytes(appContext, snapshotQueue)
+                updateState {
+                    copy(
+                        totalModelsInQueue = snapshotQueue.size,
+                        overallDownloadedBytes = newDoneBytes,
+                        overallTotalBytes = newTotalBytes,
+                        modelStatuses = currentStatuses.toMap(),
+                        pendingAutoEnableModels = snapshotPending
+                    )
+                }
+                return
+            }
+
+            activeQueue.clear()
+            activeQueue.addAll(requested)
         }
 
-        val queue = models.distinct()
-        if (queue.isEmpty()) return
-
-        val initialStatuses = queue.associateWith { model ->
-            if (DesertAntModelStorage.isModelDownloaded(appContext, model)) {
+        val (initialQueueSnapshot, initialPendingSnapshot) = synchronized(queueLock) {
+            activeQueue.toList() to pendingAutoEnable.toSet()
+        }
+        val initialStatuses = initialQueueSnapshot.associateWith { model ->
+            if (DesertAntModelStorage.isModelVerified(appContext, model)) {
                 ModelQueueStatus.DONE
             } else {
                 ModelQueueStatus.QUEUED
             }
         }.toMutableMap()
 
-        val totalBytesAll = queue.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L)
-        val initialDoneBytes = queue.sumOf { getCachedOrPartialBytes(appContext, it) }
+        val totalBytesAll = initialQueueSnapshot.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L)
+        val initialDoneBytes = initialQueueSnapshot.sumOf { getCachedOrPartialBytes(appContext, it) }
 
         _sessionState.value = DownloadSessionState(
             isRunning = true,
             isPaused = false,
             isCompleted = false,
-            activeModel = queue.firstOrNull { initialStatuses[it] != ModelQueueStatus.DONE },
+            activeModel = initialQueueSnapshot.firstOrNull { initialStatuses[it] != ModelQueueStatus.DONE },
             currentModelIndex = 1,
-            totalModelsInQueue = queue.size,
+            totalModelsInQueue = initialQueueSnapshot.size,
             overallDownloadedBytes = initialDoneBytes,
             overallTotalBytes = totalBytesAll,
-            modelStatuses = initialStatuses.toMap()
+            modelStatuses = initialStatuses.toMap(),
+            pendingAutoEnableModels = initialPendingSnapshot
         )
 
         ModelDownloadService.start(appContext)
@@ -330,22 +420,30 @@ object ModelDownloadManager {
         activeJob = scope.launch {
             val speedTracker = RollingSpeedTracker()
             try {
-                for ((idx, model) in queue.withIndex()) {
+                var idx = 0
+                while (true) {
                     ensureActive()
+                    val currentQueue = synchronized(queueLock) { activeQueue.toList() }
+                    if (idx >= currentQueue.size) break
+                    val model = currentQueue[idx]
                     val mTotal = modelTotalBytes(model)
 
-                    if (DesertAntModelStorage.isModelDownloaded(appContext, model)) {
+                    if (DesertAntModelStorage.isModelVerified(appContext, model)) {
                         initialStatuses[model] = ModelQueueStatus.DONE
+                        autoEnableModelIfRequested(appContext, model)
                         updateState {
                             copy(
                                 activeModel = model,
                                 currentModelIndex = idx + 1,
+                                totalModelsInQueue = currentQueue.size,
                                 modelDownloadedBytes = mTotal,
                                 modelTotalBytes = mTotal,
-                                overallDownloadedBytes = computeQueueDownloadedBytes(appContext, queue),
+                                overallDownloadedBytes = computeQueueDownloadedBytes(appContext, currentQueue),
+                                overallTotalBytes = currentQueue.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L),
                                 modelStatuses = initialStatuses.toMap()
                             )
                         }
+                        idx++
                         continue
                     }
 
@@ -354,9 +452,11 @@ object ModelDownloadManager {
                         copy(
                             activeModel = model,
                             currentModelIndex = idx + 1,
+                            totalModelsInQueue = currentQueue.size,
                             modelDownloadedBytes = getCachedOrPartialBytes(appContext, model),
                             modelTotalBytes = mTotal,
-                            overallDownloadedBytes = computeQueueDownloadedBytes(appContext, queue),
+                            overallDownloadedBytes = computeQueueDownloadedBytes(appContext, currentQueue),
+                            overallTotalBytes = currentQueue.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L),
                             statusNote = null,
                             errorMessage = null,
                             modelStatuses = initialStatuses.toMap()
@@ -366,22 +466,26 @@ object ModelDownloadManager {
                     downloadSingleModelResumable(
                         context = appContext,
                         model = model,
-                        queue = queue,
                         modelIndex = idx + 1,
                         statuses = initialStatuses,
                         speedTracker = speedTracker
                     )
 
+                    autoEnableModelIfRequested(appContext, model)
+                    val updatedQueue = synchronized(queueLock) { activeQueue.toList() }
                     initialStatuses[model] = ModelQueueStatus.DONE
                     updateState {
                         copy(
+                            totalModelsInQueue = updatedQueue.size,
                             modelDownloadedBytes = mTotal,
                             modelTotalBytes = mTotal,
-                            overallDownloadedBytes = computeQueueDownloadedBytes(appContext, queue),
+                            overallDownloadedBytes = computeQueueDownloadedBytes(appContext, updatedQueue),
+                            overallTotalBytes = updatedQueue.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L),
                             statusNote = null,
                             modelStatuses = initialStatuses.toMap()
                         )
                     }
+                    idx++
                 }
 
                 // All models in queue downloaded & verified!
@@ -396,13 +500,24 @@ object ModelDownloadManager {
                         isCompleted = true,
                         speedBytesPerSec = 0L,
                         etaSeconds = 0L,
-                        statusNote = "All selected models downloaded and verified.",
+                        statusNote = "All selected models downloaded, verified, and loaded.",
                         errorMessage = null,
-                        modelStatuses = initialStatuses.toMap()
+                        modelStatuses = initialStatuses.toMap(),
+                        pendingAutoEnableModels = synchronized(queueLock) { pendingAutoEnable.toSet() }
                     )
                 }
+                val callbacksToRun = synchronized(queueLock) {
+                    val copy = completionCallbacks.toList()
+                    completionCallbacks.clear()
+                    copy
+                }
                 withContext(Dispatchers.Main) {
-                    onAllCompleted?.invoke()
+                    callbacksToRun.forEach { callback ->
+                        try {
+                            callback.invoke()
+                        } catch (_: Throwable) {
+                        }
+                    }
                 }
             } catch (ce: CancellationException) {
                 val pausedStatuses = initialStatuses.mapValues { (_, st) ->
@@ -451,10 +566,71 @@ object ModelDownloadManager {
         activeJob = null
     }
 
+    /**
+     * Direct single-model download helper used when `DesertAntModelStorage.downloadModel` is called.
+     */
+    suspend fun downloadSingleModelDirect(
+        context: Context,
+        model: DesertAntModel,
+        onProgress: (Float) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        val (revision, artifacts) = MODEL_SPECS[model]
+            ?: throw IOException("Missing catalog specification for ${model.id}")
+        val targetDir = File(DesertAntModelStorage.modelCacheRoot(context, model), revision)
+        if (!targetDir.exists() && !targetDir.mkdirs() && !targetDir.exists()) {
+            throw IOException("Cannot create model cache directory: ${targetDir.absolutePath}")
+        }
+        val mTotalBytes = artifacts.sumOf { it.sizeBytes }.coerceAtLeast(1L)
+        var completedArtifactBytes = 0L
+
+        for (artifact in artifacts) {
+            coroutineContext.ensureActive()
+            val finalFile = File(targetDir, artifact.relativePath)
+            val partFile = File(targetDir, "${artifact.relativePath}.part")
+
+            if (finalFile.exists() && finalFile.length() == artifact.sizeBytes) {
+                if (DesertAntModelStorage.isArtifactAlreadyVerified(targetDir, artifact) ||
+                    verifySha256Incremental(finalFile, artifact.sha256)
+                ) {
+                    DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
+                    completedArtifactBytes += artifact.sizeBytes
+                    onProgress((completedArtifactBytes.toFloat() / mTotalBytes.toFloat()).coerceIn(0f, 0.99f))
+                    continue
+                } else {
+                    finalFile.delete()
+                }
+            }
+
+            val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val completedBeforeFile = completedArtifactBytes
+            downloadFileWithAutoResume(
+                urlStr = urlStr,
+                partFile = partFile,
+                expectedSize = artifact.sizeBytes,
+                expectedSha256 = artifact.sha256,
+                onProgress = { fileBytes, _ ->
+                    val nowBytes = completedBeforeFile + fileBytes
+                    onProgress((nowBytes.toFloat() / mTotalBytes.toFloat()).coerceIn(0.01f, 0.99f))
+                },
+                onChunkReceived = {}
+            )
+
+            if (finalFile.exists()) finalFile.delete()
+            if (!partFile.renameTo(finalFile)) {
+                partFile.copyTo(finalFile, overwrite = true)
+                partFile.delete()
+            }
+            DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
+            completedArtifactBytes += artifact.sizeBytes
+        }
+
+        DesertAntModelStorage.writeModelManifestAndStamp(targetDir, artifacts)
+        onProgress(1.0f)
+    }
+
     private suspend fun downloadSingleModelResumable(
         context: Context,
         model: DesertAntModel,
-        queue: List<DesertAntModel>,
         modelIndex: Int,
         statuses: MutableMap<DesertAntModel, ModelQueueStatus>,
         speedTracker: RollingSpeedTracker
@@ -467,16 +643,35 @@ object ModelDownloadManager {
         }
 
         val mTotalBytes = artifacts.sumOf { it.sizeBytes }
-        val overallTotal = _sessionState.value.overallTotalBytes
+        var completedBytesInModel = 0L
 
         for (artifact in artifacts) {
             coroutineContext.ensureActive()
             val finalFile = File(targetDir, artifact.relativePath)
             val partFile = File(targetDir, "${artifact.relativePath}.part")
 
-            // If finalFile already exists with matching size and SHA-256, skip downloading it
+            // Fast path: if finalFile already exists with matching size and verified stamp, skip in 0ms
             if (finalFile.exists() && finalFile.length() == artifact.sizeBytes) {
-                if (verifySha256(finalFile, artifact.sha256)) {
+                if (DesertAntModelStorage.isArtifactAlreadyVerified(targetDir, artifact)) {
+                    completedBytesInModel += artifact.sizeBytes
+                    continue
+                }
+                val isValid = verifySha256Incremental(
+                    file = finalFile,
+                    expectedHex = artifact.sha256,
+                    onVerifyProgress = { pct ->
+                        updateState {
+                            copy(
+                                activeModel = model,
+                                currentFileName = artifact.relativePath,
+                                statusNote = "Verifying cached ${artifact.relativePath} ($pct%)..."
+                            )
+                        }
+                    }
+                )
+                if (isValid) {
+                    DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
+                    completedBytesInModel += artifact.sizeBytes
                     continue
                 } else {
                     finalFile.delete()
@@ -484,16 +679,25 @@ object ModelDownloadManager {
             }
 
             val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val completedBeforeThisFile = completedBytesInModel
 
+            val currentQueueSnapshot = synchronized(queueLock) { activeQueue.toList() }
+            val otherModelsCachedBytes = currentQueueSnapshot
+                .filter { it != model }
+                .sumOf { getCachedOrPartialBytes(context, it) }
+            val overallTotalSnapshot = currentQueueSnapshot.sumOf { modelTotalBytes(it) }.coerceAtLeast(1L)
+
+            // Streams file AND verifies SHA-256 on-the-fly in memory (0ms post-download delay)
             downloadFileWithAutoResume(
                 urlStr = urlStr,
                 partFile = partFile,
                 expectedSize = artifact.sizeBytes,
-                onProgress = { _, statusHint ->
-                    val modelNow = getCachedOrPartialBytes(context, model)
-                    val overallNow = computeQueueDownloadedBytes(context, queue)
+                expectedSha256 = artifact.sha256,
+                onProgress = { fileCurrentBytes, statusHint ->
+                    val modelNow = (completedBeforeThisFile + fileCurrentBytes).coerceAtMost(mTotalBytes)
+                    val overallNow = (otherModelsCachedBytes + modelNow).coerceAtMost(overallTotalSnapshot)
                     val speed = speedTracker.currentSpeedBytesPerSec()
-                    val remainingBytes = max(0L, overallTotal - overallNow)
+                    val remainingBytes = max(0L, overallTotalSnapshot - overallNow)
                     val eta = if (speed > 0L) remainingBytes / speed else null
 
                     updateState {
@@ -501,9 +705,11 @@ object ModelDownloadManager {
                             activeModel = model,
                             currentFileName = artifact.relativePath,
                             currentModelIndex = modelIndex,
+                            totalModelsInQueue = currentQueueSnapshot.size,
                             modelDownloadedBytes = modelNow,
                             modelTotalBytes = mTotalBytes,
                             overallDownloadedBytes = overallNow,
+                            overallTotalBytes = overallTotalSnapshot,
                             speedBytesPerSec = speed,
                             etaSeconds = eta,
                             statusNote = statusHint
@@ -515,21 +721,7 @@ object ModelDownloadManager {
                 }
             )
 
-            // Verify SHA-256 of completed .part file before atomic rename
-            statuses[model] = ModelQueueStatus.VERIFYING
-            updateState {
-                copy(
-                    currentFileName = "Verifying ${artifact.relativePath}...",
-                    statusNote = "Verifying SHA-256 integrity...",
-                    modelStatuses = statuses.toMap()
-                )
-            }
-
-            if (!verifySha256(partFile, artifact.sha256)) {
-                partFile.delete()
-                throw IOException("SHA-256 integrity mismatch for ${artifact.relativePath}")
-            }
-
+            // Atomic rename of verified .part file -> finalFile
             if (finalFile.exists()) {
                 finalFile.delete()
             }
@@ -537,47 +729,89 @@ object ModelDownloadManager {
                 partFile.copyTo(finalFile, overwrite = true)
                 partFile.delete()
             }
+            DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
+            completedBytesInModel += artifact.sizeBytes
             statuses[model] = ModelQueueStatus.DOWNLOADING
         }
 
-        // Write DAL1 manifest last so ModelStore.swift / isDownloaded() marks the model complete
-        val metaDir = File(targetDir, ".dal-meta")
-        metaDir.mkdirs()
-        val manifestFile = File(metaDir, "manifest")
-        val rLines = artifacts.joinToString("\n") { "R\t${it.relativePath}" }
-        val fLines = artifacts.joinToString("\n") { "F\t${it.relativePath}\t${it.sizeBytes}\t${it.sha256}" }
-        manifestFile.writeText("DAL1\n$rLines\n$fLines\n")
+        // Write DAL1 manifest and .openflow_verified stamp
+        DesertAntModelStorage.writeModelManifestAndStamp(targetDir, artifacts)
 
-        if (!DesertAntModelStorage.isModelDownloaded(context, model)) {
-            DesertAntModelStorage.downloadModel(context, model) {}
-        }
         if (!DesertAntModelStorage.isModelDownloaded(context, model)) {
             throw IOException("Post-download verification failed for ${model.displayName}")
         }
     }
 
+    private class IntegrityMismatchException(message: String) : IOException(message)
+
+    /**
+     * Downloads [urlStr] to [partFile] with HTTP Range resume and computes SHA-256 incrementally
+     * on the fly as bytes arrive over the network, eliminating any post-download hashing pause.
+     */
     private suspend fun downloadFileWithAutoResume(
         urlStr: String,
         partFile: File,
         expectedSize: Long,
+        expectedSha256: String,
         onProgress: (Long, String?) -> Unit,
         onChunkReceived: (Int) -> Unit
     ) = withContext(Dispatchers.IO) {
         var stallAttempt = 0
+        var integrityAttempt = 0
         var lastEmitMs = 0L
+        val digest = MessageDigest.getInstance("SHA-256")
+        var hashedOffset = 0L
 
         while (true) {
             coroutineContext.ensureActive()
             val existingBytes = if (partFile.exists()) partFile.length() else 0L
-            if (existingBytes == expectedSize && expectedSize > 0L) {
-                onProgress(expectedSize, null)
-                return@withContext
-            }
             if (existingBytes > expectedSize) {
                 partFile.delete()
+                digest.reset()
+                hashedOffset = 0L
             }
 
             val resumeOffset = if (partFile.exists()) partFile.length() else 0L
+
+            // If resuming from a .part file saved on disk that hasn't been fed into `digest` yet,
+            // catch `digest` up to `resumeOffset` with live percentage progress & cancellation support.
+            if (resumeOffset < hashedOffset) {
+                digest.reset()
+                hashedOffset = 0L
+            }
+            if (resumeOffset > hashedOffset) {
+                hashedOffset = catchUpDigestToOffset(
+                    file = partFile,
+                    digest = digest,
+                    fromOffset = hashedOffset,
+                    toOffset = resumeOffset,
+                    onVerifyProgress = { pct ->
+                        onProgress(resumeOffset, "Verifying saved progress ($pct%)...")
+                    }
+                )
+            }
+
+            if (resumeOffset == expectedSize && expectedSize > 0L) {
+                val actualHex = digest.digest().joinToString("") { "%02x".format(it) }
+                if (actualHex.equals(expectedSha256, ignoreCase = true)) {
+                    onProgress(expectedSize, null)
+                    return@withContext
+                } else {
+                    integrityAttempt++
+                    partFile.delete()
+                    digest.reset()
+                    hashedOffset = 0L
+                    if (integrityAttempt > MAX_INTEGRITY_RETRIES) {
+                        throw IntegrityMismatchException("SHA-256 integrity mismatch for ${partFile.name}")
+                    }
+                    Log.w(
+                        TAG,
+                        "Existing .part file failed SHA-256 check (attempt $integrityAttempt/$MAX_INTEGRITY_RETRIES); restarting download of ${partFile.name}"
+                    )
+                    continue
+                }
+            }
+
             var connection: HttpURLConnection? = null
             var bytesReadThisConnection = 0L
 
@@ -613,12 +847,14 @@ object ModelDownloadManager {
                 RandomAccessFile(partFile, "rw").use { raf ->
                     if (!isPartial && resumeOffset > 0L) {
                         raf.setLength(0L)
+                        digest.reset()
+                        hashedOffset = 0L
                     }
                     raf.seek(startOffset)
 
                     connection.inputStream.use { input ->
-                        // 16 KB buffer for responsive progress updates even on very slow internet
-                        val buffer = ByteArray(16 * 1024)
+                        // 128 KB streaming buffer for high throughput and instant L1-cached SHA-256 updates
+                        val buffer = ByteArray(128 * 1024)
                         var currentSize = startOffset
 
                         while (true) {
@@ -626,6 +862,10 @@ object ModelDownloadManager {
                             val read = input.read(buffer)
                             if (read == -1) break
                             raf.write(buffer, 0, read)
+                            if (hashedOffset == currentSize) {
+                                digest.update(buffer, 0, read)
+                                hashedOffset += read
+                            }
                             currentSize += read
                             bytesReadThisConnection += read
                             onChunkReceived(read)
@@ -636,7 +876,7 @@ object ModelDownloadManager {
                             }
 
                             val now = SystemClock.elapsedRealtime()
-                            if (now - lastEmitMs >= 150L || currentSize >= expectedSize) {
+                            if (now - lastEmitMs >= 120L || currentSize >= expectedSize) {
                                 lastEmitMs = now
                                 onProgress(currentSize, null)
                             }
@@ -646,6 +886,28 @@ object ModelDownloadManager {
 
                 val finalLength = partFile.length()
                 if (finalLength == expectedSize) {
+                    if (hashedOffset < finalLength) {
+                        hashedOffset = catchUpDigestToOffset(
+                            file = partFile,
+                            digest = digest,
+                            fromOffset = hashedOffset,
+                            toOffset = finalLength,
+                            onVerifyProgress = { pct ->
+                                onProgress(finalLength, "Finalizing SHA-256 check ($pct%)...")
+                            }
+                        )
+                    }
+                    val actualHex = digest.digest().joinToString("") { "%02x".format(it) }
+                    if (!actualHex.equals(expectedSha256, ignoreCase = true)) {
+                        integrityAttempt++
+                        partFile.delete()
+                        digest.reset()
+                        hashedOffset = 0L
+                        if (integrityAttempt > MAX_INTEGRITY_RETRIES) {
+                            throw IntegrityMismatchException("SHA-256 integrity mismatch for ${partFile.name}")
+                        }
+                        throw IOException("SHA-256 integrity mismatch for ${partFile.name} (retry $integrityAttempt/$MAX_INTEGRITY_RETRIES)")
+                    }
                     onProgress(finalLength, null)
                     return@withContext
                 } else {
@@ -653,6 +915,8 @@ object ModelDownloadManager {
                 }
             } catch (ce: CancellationException) {
                 throw ce
+            } catch (ie: IntegrityMismatchException) {
+                throw ie
             } catch (e: Exception) {
                 stallAttempt++
                 if (stallAttempt > MAX_STALL_RETRIES) {
@@ -675,27 +939,69 @@ object ModelDownloadManager {
         }
     }
 
-    private fun computeQueueDownloadedBytes(context: Context, queue: List<DesertAntModel>): Long {
-        return queue.sumOf { getCachedOrPartialBytes(context, it) }
-    }
-
-    private fun verifySha256(file: File, expectedHex: String): Boolean {
-        if (!file.exists()) return false
-        return try {
-            val digest = MessageDigest.getInstance("SHA-256")
-            file.inputStream().use { input ->
-                val buf = ByteArray(128 * 1024)
-                while (true) {
-                    val r = input.read(buf)
-                    if (r == -1) break
-                    digest.update(buf, 0, r)
+    private suspend fun catchUpDigestToOffset(
+        file: File,
+        digest: MessageDigest,
+        fromOffset: Long,
+        toOffset: Long,
+        onVerifyProgress: ((Int) -> Unit)? = null
+    ): Long = withContext(Dispatchers.IO) {
+        if (toOffset <= fromOffset || !file.exists()) return@withContext fromOffset
+        val totalToHash = (toOffset - fromOffset).coerceAtLeast(1L)
+        var current = fromOffset
+        var lastEmitMs = 0L
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(fromOffset)
+            val buf = ByteArray(256 * 1024)
+            while (current < toOffset) {
+                coroutineContext.ensureActive()
+                val toRead = min(buf.size.toLong(), toOffset - current).toInt()
+                val r = raf.read(buf, 0, toRead)
+                if (r <= 0) break
+                digest.update(buf, 0, r)
+                current += r
+                val now = System.nanoTime() / 1_000_000L
+                if (onVerifyProgress != null && (now - lastEmitMs >= 150L || current >= toOffset)) {
+                    lastEmitMs = now
+                    val pct = (((current - fromOffset) * 100L) / totalToHash).toInt().coerceIn(0, 100)
+                    onVerifyProgress(pct)
                 }
             }
+        }
+        current
+    }
+
+    /**
+     * Cancellable, progress-reporting SHA-256 verifier using a 256 KB buffer.
+     */
+    suspend fun verifySha256Incremental(
+        file: File,
+        expectedHex: String,
+        onVerifyProgress: ((Int) -> Unit)? = null
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!file.exists() || !file.isFile) return@withContext false
+        val totalLen = file.length()
+        if (totalLen <= 0L) return@withContext false
+        try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            catchUpDigestToOffset(
+                file = file,
+                digest = digest,
+                fromOffset = 0L,
+                toOffset = totalLen,
+                onVerifyProgress = onVerifyProgress
+            )
             val actual = digest.digest().joinToString("") { "%02x".format(it) }
             actual.equals(expectedHex, ignoreCase = true)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun computeQueueDownloadedBytes(context: Context, queue: List<DesertAntModel>): Long {
+        return queue.sumOf { getCachedOrPartialBytes(context, it) }
     }
 
     private inline fun updateState(transform: DownloadSessionState.() -> DownloadSessionState) {

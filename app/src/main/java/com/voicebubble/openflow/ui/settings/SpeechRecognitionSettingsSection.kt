@@ -17,8 +17,11 @@
 package com.voicebubble.openflow.ui.settings
 
 import ai.desertant.voz.Voz
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -30,17 +33,23 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -49,6 +58,8 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -63,19 +74,25 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.voicebubble.openflow.core.speech.ModelLoadState
+import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
+import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -86,14 +103,25 @@ fun SpeechRecognitionSettingsSection(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val smartPipeline = remember { SmartPipeline.getInstance(context) }
     val downloadState by ModelDownloadManager.sessionState.collectAsState()
+    val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
 
     var storageRefreshTick by remember { mutableIntStateOf(0) }
-    var pendingEnableModel by remember { mutableStateOf<DesertAntModel?>(null) }
     var newVocabInput by remember { mutableStateOf("") }
 
     val downloadedStatusMap = remember { mutableStateMapOf<DesertAntModel, Boolean>() }
-    LaunchedEffect(settings, storageRefreshTick, downloadState.isRunning, downloadState.isCompleted) {
+    LaunchedEffect(
+        settings,
+        storageRefreshTick,
+        downloadState.isRunning,
+        downloadState.isCompleted,
+        downloadState.pendingAutoEnableModels
+    ) {
+        val latestPersisted = ModelSettings.load(context)
+        if (latestPersisted != settings) {
+            onSettingsChanged(latestPersisted)
+        }
         val status = withContext(Dispatchers.IO) {
             DesertAntModel.entries.associateWith { model ->
                 DesertAntModelStorage.isModelDownloaded(context, model)
@@ -101,19 +129,19 @@ fun SpeechRecognitionSettingsSection(
         }
         downloadedStatusMap.clear()
         downloadedStatusMap.putAll(status)
+        smartPipeline.refreshStatusSnapshot()
     }
     val downloadedCount = downloadedStatusMap.values.count { it }
 
     val persistAndReload: (ModelSettings) -> Unit = { updated ->
         ModelSettings.save(context, updated)
         onSettingsChanged(updated)
-        scope.launch {
-            SmartPipeline.getInstance(context).reloadSettings(updated)
-        }
+        smartPipeline.reloadSettingsAsync(updated)
     }
 
     val handleOptionalToggle: (DesertAntModel, Boolean) -> Unit = { model, targetEnabled ->
         if (!targetEnabled) {
+            ModelDownloadManager.cancelAutoEnable(model)
             val updated = when (model) {
                 DesertAntModel.EAR -> settings.copy(earEnabled = false)
                 DesertAntModel.CLEAR -> settings.copy(clearEnabled = false)
@@ -135,22 +163,16 @@ fun SpeechRecognitionSettingsSection(
                     }
                     persistAndReload(updated)
                 } else {
-                    // Settings Toggle-On Background Resumable Download Flow
-                    pendingEnableModel = model
+                    // Settings Toggle-On Background Resumable Download Flow (supports queuing multiple models)
                     ModelDownloadManager.startQueue(
                         context = context,
                         models = listOf(model),
+                        autoEnableOnComplete = true,
                         onAllCompleted = {
                             storageRefreshTick++
                             val latest = ModelSettings.load(context)
-                            val updated = when (model) {
-                                DesertAntModel.EAR -> latest.copy(earEnabled = true)
-                                DesertAntModel.CLEAR -> latest.copy(clearEnabled = true)
-                                DesertAntModel.UHM -> latest.copy(uhmEnabled = true)
-                                DesertAntModel.VOZ -> latest
-                            }
-                            pendingEnableModel = null
-                            persistAndReload(updated)
+                            onSettingsChanged(latest)
+                            smartPipeline.reloadSettingsAsync(latest)
                         }
                     )
                 }
@@ -169,7 +191,7 @@ fun SpeechRecognitionSettingsSection(
             color = MaterialTheme.colorScheme.onBackground
         )
 
-        // 1. Resource Summary Card (Specification Section 5.2.1 & 5.4)
+        // 1. Resource Summary & Live Model Status Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -178,14 +200,96 @@ fun SpeechRecognitionSettingsSection(
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val isBusy = pipelineStatus.phase == PipelinePhase.LOADING ||
+                            pipelineStatus.phase == PipelinePhase.WARMING_UP ||
+                            pipelineStatus.phase == PipelinePhase.TRANSCRIBING
+                        if (isBusy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else {
+                            val dotColor = when {
+                                pipelineStatus.isReady -> Color(0xFF2E7D32)
+                                pipelineStatus.phase == PipelinePhase.ERROR -> MaterialTheme.colorScheme.error
+                                else -> MaterialTheme.colorScheme.outline
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(dotColor)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = pipelineStatus.phase.label,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                    Text(
+                        text = "${pipelineStatus.loadedCount}/${pipelineStatus.enabledCount} in RAM",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+
                 Text(
-                    text = "Resource Summary",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
+                    text = pipelineStatus.statusMessage,
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
+
+                // Per-model live status pills
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    DesertAntModel.entries.forEach { model ->
+                        val state = pipelineStatus.modelStates[model] ?: ModelLoadState.STANDBY
+                        ModelStatusChip(model = model, state = state)
+                    }
+                }
+
+                // Last inference latency & speed telemetry
+                val lastInferenceMs = pipelineStatus.lastInferenceMs
+                val lastAudioMs = pipelineStatus.lastAudioDurationMs
+                if (lastInferenceMs != null && lastAudioMs != null && lastAudioMs > 0L) {
+                    val speedup = lastAudioMs.toDouble() / lastInferenceMs.coerceAtLeast(1L).toDouble()
+                    val speedupFormatted = String.format(Locale.US, "%.1f×", speedup)
+                    val audioSecFormatted = String.format(Locale.US, "%.1fs", lastAudioMs / 1000.0)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Speed,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Last dictation: ${lastInferenceMs} ms for $audioSecFormatted audio ($speedupFormatted real-time)",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.15f))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
@@ -194,13 +298,13 @@ fun SpeechRecognitionSettingsSection(
                         Icon(
                             imageVector = Icons.Default.Storage,
                             contentDescription = null,
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB",
-                            style = MaterialTheme.typography.bodyMedium,
+                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/4)",
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }
@@ -208,27 +312,120 @@ fun SpeechRecognitionSettingsSection(
                         Icon(
                             imageVector = Icons.Default.Memory,
                             contentDescription = null,
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(16.dp),
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = "Peak RAM: ~${settings.estimatedPeakRamMb} MB",
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }
                 }
-                Text(
-                    text = "$downloadedCount / 4 Models Downloaded",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                )
+
+                val isWorking = pipelineStatus.phase == PipelinePhase.LOADING ||
+                    pipelineStatus.phase == PipelinePhase.WARMING_UP ||
+                    pipelineStatus.phase == PipelinePhase.TRANSCRIBING
+                OutlinedButton(
+                    onClick = { smartPipeline.initializeAsync(warmUp = true) },
+                    enabled = !isWorking && !downloadState.isRunning,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        imageVector = if (pipelineStatus.isReady) Icons.Default.CheckCircle else Icons.Default.Bolt,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        when {
+                            isWorking -> "Loading & Warming Up Models..."
+                            pipelineStatus.loadedCount == pipelineStatus.enabledCount && pipelineStatus.isReady ->
+                                "All Enabled Models Loaded in RAM (Tap to Re-Warm)"
+                            else -> "Load & Warm Up Models in RAM Now"
+                        }
+                    )
+                }
             }
         }
 
-        // 2. Model Toggle Rows (Specification Section 5.2.2)
+        // 2. Hardware Acceleration Selector (Auto / NPU / GPU / CPU)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Hardware Acceleration (NPU / GPU / CPU)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Active delegate: ${pipelineStatus.activeAcceleratorLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Default.Bolt,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                HardwareAccelerator.entries.forEach { accelerator ->
+                    val selected = settings.hardwareAccelerator == accelerator
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(hardwareAccelerator = accelerator))
+                                }
+                            }
+                            .padding(vertical = 4.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = selected,
+                            onClick = {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(hardwareAccelerator = accelerator))
+                                }
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = accelerator.displayName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                            )
+                            Text(
+                                text = accelerator.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Model Toggle Rows (Specification Section 5.2.2)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -249,6 +446,7 @@ fun SpeechRecognitionSettingsSection(
                 ModelToggleItem(
                     title = "Voz — Speech Recognition (337 MB)",
                     subtitle = "Required • Core transcription across 25 European languages",
+                    loadState = pipelineStatus.modelStates[DesertAntModel.VOZ],
                     checked = true,
                     enabled = false,
                     isLocked = true,
@@ -264,7 +462,8 @@ fun SpeechRecognitionSettingsSection(
                 ModelToggleItem(
                     title = "Ear — Auto Language Detection (22 MB)",
                     subtitle = DesertAntModel.EAR.roleSummary,
-                    checked = settings.earEnabled,
+                    loadState = pipelineStatus.modelStates[DesertAntModel.EAR],
+                    checked = settings.earEnabled || DesertAntModel.EAR in downloadState.pendingAutoEnableModels,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.EAR),
                     isLocked = false,
                     activeDownloadState = if (downloadState.activeModel == DesertAntModel.EAR && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
@@ -279,7 +478,8 @@ fun SpeechRecognitionSettingsSection(
                 ModelToggleItem(
                     title = "Clear — Noise Suppression (24 MB)",
                     subtitle = DesertAntModel.CLEAR.roleSummary,
-                    checked = settings.clearEnabled,
+                    loadState = pipelineStatus.modelStates[DesertAntModel.CLEAR],
+                    checked = settings.clearEnabled || DesertAntModel.CLEAR in downloadState.pendingAutoEnableModels,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.CLEAR),
                     isLocked = false,
                     activeDownloadState = if (downloadState.activeModel == DesertAntModel.CLEAR && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
@@ -294,7 +494,8 @@ fun SpeechRecognitionSettingsSection(
                 ModelToggleItem(
                     title = "Uhm — Filler Word Removal (24 MB)",
                     subtitle = DesertAntModel.UHM.roleSummary,
-                    checked = settings.uhmEnabled,
+                    loadState = pipelineStatus.modelStates[DesertAntModel.UHM],
+                    checked = settings.uhmEnabled || DesertAntModel.UHM in downloadState.pendingAutoEnableModels,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.UHM),
                     isLocked = false,
                     activeDownloadState = if (downloadState.activeModel == DesertAntModel.UHM && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
@@ -309,10 +510,22 @@ fun SpeechRecognitionSettingsSection(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
-                    val targetModel = pendingEnableModel ?: downloadState.activeModel
-                    if (targetModel != null) {
+                    val targetModels = (downloadState.pendingAutoEnableModels + listOfNotNull(downloadState.activeModel)).distinct()
+                    if (targetModels.isNotEmpty()) {
                         Button(
-                            onClick = { handleOptionalToggle(targetModel, true) },
+                            onClick = {
+                                ModelDownloadManager.startQueue(
+                                    context = context,
+                                    models = targetModels,
+                                    autoEnableOnComplete = downloadState.pendingAutoEnableModels.isNotEmpty(),
+                                    onAllCompleted = {
+                                        storageRefreshTick++
+                                        val latest = ModelSettings.load(context)
+                                        onSettingsChanged(latest)
+                                        smartPipeline.reloadSettingsAsync(latest)
+                                    }
+                                )
+                            },
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Icon(
@@ -328,7 +541,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3. Manual / Fallback Language Selector (Always Visible, Specification Section 5.2.3)
+        // 4. Manual / Fallback Language Selector (Always Visible, Specification Section 5.2.3)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -378,7 +591,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 4. Custom Vocabulary Editor (Specification Section 5.3)
+        // 5. Custom Vocabulary Editor (Specification Section 5.3)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -457,7 +670,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 5. Storage Management Section (Specification Section 5.5)
+        // 6. Storage Management Section (Specification Section 5.5)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -492,9 +705,11 @@ fun SpeechRecognitionSettingsSection(
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium
                             )
+                            val loadState = pipelineStatus.modelStates[model]
+                            val ramTag = if (loadState == ModelLoadState.LOADED) " • Loaded in RAM" else ""
                             val statusText = when {
-                                model.isRequired && isDownloaded -> "Downloaded • ${model.sizeMb} MB (Required)"
-                                isDownloaded && isEnabled -> "Downloaded • ${model.sizeMb} MB (Active)"
+                                model.isRequired && isDownloaded -> "Downloaded • ${model.sizeMb} MB (Required$ramTag)"
+                                isDownloaded && isEnabled -> "Downloaded • ${model.sizeMb} MB (Active$ramTag)"
                                 isDownloaded && !isEnabled -> "Downloaded • ${model.sizeMb} MB (Inactive)"
                                 else -> "Not downloaded (${model.sizeMb} MB)"
                             }
@@ -564,9 +779,73 @@ fun SpeechRecognitionSettingsSection(
 }
 
 @Composable
+private fun ModelStatusChip(
+    model: DesertAntModel,
+    state: ModelLoadState
+) {
+    val (bgColor, textColor, dotColor) = when (state) {
+        ModelLoadState.LOADED -> Triple(
+            Color(0xFF1B5E20).copy(alpha = 0.16f),
+            Color(0xFF2E7D32),
+            Color(0xFF2E7D32)
+        )
+        ModelLoadState.ACTIVE -> Triple(
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
+            MaterialTheme.colorScheme.primary,
+            MaterialTheme.colorScheme.primary
+        )
+        ModelLoadState.LOADING -> Triple(
+            Color(0xFFE65100).copy(alpha = 0.16f),
+            Color(0xFFEF6C00),
+            Color(0xFFEF6C00)
+        )
+        ModelLoadState.STANDBY -> Triple(
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.70f),
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            MaterialTheme.colorScheme.outline
+        )
+        ModelLoadState.ERROR -> Triple(
+            MaterialTheme.colorScheme.errorContainer,
+            MaterialTheme.colorScheme.onErrorContainer,
+            MaterialTheme.colorScheme.error
+        )
+        ModelLoadState.DISABLED, ModelLoadState.NOT_DOWNLOADED -> Triple(
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.45f),
+            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+        )
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = bgColor
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(dotColor)
+            )
+            Spacer(modifier = Modifier.width(5.dp))
+            Text(
+                text = "${model.id.replaceFirstChar { it.uppercase() }}: ${state.label}",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Medium,
+                color = textColor
+            )
+        }
+    }
+}
+
+@Composable
 private fun ModelToggleItem(
     title: String,
     subtitle: String,
+    loadState: ModelLoadState?,
     checked: Boolean,
     enabled: Boolean,
     isLocked: Boolean,
@@ -606,6 +885,21 @@ private fun ModelToggleItem(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (loadState != null) {
+                    val statusColor = when (loadState) {
+                        ModelLoadState.LOADED -> Color(0xFF2E7D32)
+                        ModelLoadState.ACTIVE -> MaterialTheme.colorScheme.primary
+                        ModelLoadState.LOADING -> Color(0xFFEF6C00)
+                        ModelLoadState.ERROR -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Text(
+                        text = "Status: ${loadState.label}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = statusColor
+                    )
+                }
             }
             Switch(
                 checked = checked,

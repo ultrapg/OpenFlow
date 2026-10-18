@@ -2,6 +2,33 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.2.0] - 2026-10-18
+
+### Added
+- **Hardware Acceleration Selector (`Auto`, `NPU`, `GPU`, `CPU`):**
+  - Added `HardwareAccelerator` configuration in Settings allowing users to choose between `Auto (NPU / GPU / CPU)`, `NPU / AI Accelerator`, `GPU (OpenCL)`, and `CPU (Multi-Thread XNNPACK)` with automatic `DAL_LITERT_THREADS` thread-pool tuning and live active-delegate reporting.
+- **Live Model Load Status & Performance Telemetry:**
+  - Exposed real-time `PipelineStatus` (`StateFlow`) tracking overall pipeline phase (`Models Loaded & Ready`, `Loading Models...`, `Warming Up Accelerator...`, `Transcribing...`) and per-model RAM states (`Loaded in RAM`, `Loading...`, `Running Inference`, `Standby (On Disk)`, `Not Downloaded`, `Disabled`) across Settings, the Floating Bubble badge, and the Foreground Service notification.
+  - Added transcription latency and real-time speedup telemetry (`Last dictation: X ms for Ys audio (Z× real-time)`) and a manual **Load & Warm Up Models in RAM** action button.
+- **Streaming 1 MB SHA-256 Verification & `.openflow_verified` Stamps:**
+  - `ModelDownloadManager` now streams SHA-256 verification on `Dispatchers.IO` with a 1 MB buffer, live percentage progress (`Verifying 0%..100%`), dynamic queue appending when enabling multiple optional models, and bounded integrity retries (`MAX_INTEGRITY_RETRIES = 3`).
+  - Persisted `.openflow_verified` stamps (`size:mtime:sha256`) allow already-verified artifacts to be skipped in O(1) time without re-hashing the 1.2 GB `encoder.tflite` on subsequent checks or resumed sessions.
+
+### Fixed
+- **Multi-Model Loading & Native Memory Crashes (`Clear` + `Ear` + `Uhm` + `Voz`):**
+  - Eliminated native 1.2 GB `POSIXFileSystem.read` + pure-Swift `SoftwareSHA256` memory spikes and UI freezes by passing explicit verified revision directories (`DesertAntModelStorage.modelRevisionDir`) directly to `Voz(context, directory)`, `Ear(context, directory)`, `Clear(context, directory)`, and `Uhm(context, directory)`, routing through `ModelDistribution.load(from: directory)` instead of `ModelStore`.
+  - Replaced JNI `Voz(context).isDownloaded()` calls in `DesertAntModelStorage.isModelDownloaded()` with an O(1) non-JNI file size, `.part` absence, and `.openflow_verified` stamp check.
+  - Changed `SmartPipeline.transcribe()` to execute all 4 native LiteRT stages (`Clear` $\rightarrow$ `Ear` $\rightarrow$ `Uhm` $\rightarrow$ `Voz`) strictly sequentially under `pipelineMutex` and keep `Clear` warm in RAM across dictations (avoiding mid-pipeline `eglTerminate` on the shared `EGLDisplay`), preventing concurrent OpenCL / `libLiteRt.so` driver race crashes.
+  - Enabled `android:largeHeap="true"` and extended warm model retention in RAM to 30 minutes.
+- **Inference Latency Optimization:**
+  - Added background LiteRT session pre-warming (`initializeAsync(warmUp = true)`) on app launch and service start so the first dictation runs without lazy graph compilation lag.
+  - Added `trimLeadingAndTrailingSilence()` to strip dead air before running `Clear`, `Ear`, `Uhm`, and `Voz`, and bounded `Ear` language identification to a 5.5-second window (`windows = 2`).
+- **Floating Bubble & Background Service Stability:**
+  - Configured `FloatingBubbleService` with `microphone|specialUse` foreground service types and immediate `startForeground()` in `onCreate()` with Android 14+ `SecurityException` fallback so the service starts reliably even when launched before microphone focus is active.
+  - Fixed the `stopService()` + `startForegroundService()` race condition in `MainActivity` by refreshing the running service in-place via `ACTION_REFRESH_SETTINGS`, and removed `smartPipeline.shutdown()` from `FloatingBubbleService.onDestroy()`.
+  - Changed the default of "Only show bubble when a text field is focused" (`show_only_on_inputs_v2`) to `false`, ensured the bubble never hides when `TextInjectionAccessibilityService` is disconnected, and added a 2-second focus grace period plus multi-window `TYPE_APPLICATION` focus search so tapping the overlay never hides the bubble or loses the target input field.
+  - Added screen-bounds clamping (`coerceIn(0, maxX/maxY)`) and `NaN` drag guards so the bubble can never be dragged off-screen, and acquired a partial `WakeLock` during recording and transcription.
+
 ## [2.1.0] - 2026-10-18
 
 ### Added

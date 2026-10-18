@@ -38,6 +38,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.permissions.*
+import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
+import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.overlay.FloatingBubbleService
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.ModelSettings
@@ -58,25 +60,44 @@ class MainActivity : ComponentActivity() {
             var isCheckingModels by remember { mutableStateOf(true) }
             var requiresOnboarding by remember { mutableStateOf(false) }
 
+            val isBubbleServiceRunning by FloatingBubbleService.isRunning.collectAsState()
+            val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
+
             LaunchedEffect(Unit) {
                 val allReady = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     DesertAntModelStorage.areAllEnabledModelsDownloaded(context, modelSettings)
                 }
                 requiresOnboarding = !allReady
                 isCheckingModels = false
+                if (allReady) {
+                    SmartPipeline.getInstance(context).initializeAsync(warmUp = true)
+                }
             }
 
-            var showOnlyOnInputs by remember { mutableStateOf(prefs.getBoolean("show_only_on_inputs", true)) }
+            var showOnlyOnInputs by remember {
+                mutableStateOf(prefs.getBoolean(FloatingBubbleService.KEY_SHOW_ONLY_ON_INPUTS, false))
+            }
             var hapticFeedback by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
             var bubbleSize by remember { mutableFloatStateOf(prefs.getFloat("bubble_size", 52f)) }
 
-            val restartService = {
-                val intent = Intent(context, FloatingBubbleService::class.java)
-                context.stopService(intent)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
+            val startOrRefreshBubbleService = {
+                val intent = Intent(context, FloatingBubbleService::class.java).apply {
+                    if (isBubbleServiceRunning) {
+                        action = FloatingBubbleService.ACTION_REFRESH_SETTINGS
+                    }
+                }
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(intent)
+                    } else {
+                        context.startService(intent)
+                    }
+                } catch (e: Throwable) {
+                    android.widget.Toast.makeText(
+                        context,
+                        "Could not start bubble service: ${e.localizedMessage ?: "check permissions"}",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
                 }
             }
 
@@ -108,6 +129,7 @@ class MainActivity : ComponentActivity() {
                         onOnboardingComplete = { completedSettings ->
                             modelSettings = completedSettings
                             requiresOnboarding = false
+                            SmartPipeline.getInstance(context).reloadSettingsAsync(completedSettings)
                         }
                     )
                 } else {
@@ -141,6 +163,7 @@ class MainActivity : ComponentActivity() {
                                             pm.isIgnoringBatteryOptimizations(context.packageName)
                                         canDrawOverlaysState = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                                             Settings.canDrawOverlays(context)
+                                        SmartPipeline.getInstance(context).refreshStatusSnapshot()
                                     }
                                 }
                                 lifecycleOwner.lifecycle.addObserver(observer)
@@ -212,7 +235,15 @@ class MainActivity : ComponentActivity() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            Button(
+                            if (isAccessibilityConnected) {
+                                Text(
+                                    "✓ Accessibility Service Active (Direct Text Injection Ready)",
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
+
+                            OutlinedButton(
                                 onClick = {
                                     val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                                     try {
@@ -227,7 +258,13 @@ class MainActivity : ComponentActivity() {
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("Accessibility Service (System Settings)")
+                                Text(
+                                    if (isAccessibilityConnected) {
+                                        "Manage Accessibility Service (Connected)"
+                                    } else {
+                                        "Enable Accessibility Service (For Auto-Paste)"
+                                    }
+                                )
                             }
 
                             Spacer(modifier = Modifier.height(24.dp))
@@ -246,6 +283,20 @@ class MainActivity : ComponentActivity() {
                                 style = MaterialTheme.typography.titleLarge,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = if (isBubbleServiceRunning) {
+                                    "● Floating Bubble Service is active in background"
+                                } else {
+                                    "○ Floating Bubble Service is stopped"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isBubbleServiceRunning) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
                             Spacer(modifier = Modifier.height(8.dp))
 
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -253,12 +304,26 @@ class MainActivity : ComponentActivity() {
                                     checked = showOnlyOnInputs,
                                     onCheckedChange = {
                                         showOnlyOnInputs = it
-                                        prefs.edit().putBoolean("show_only_on_inputs", it).apply()
+                                        prefs.edit()
+                                            .putBoolean(FloatingBubbleService.KEY_SHOW_ONLY_ON_INPUTS, it)
+                                            .putBoolean(FloatingBubbleService.LEGACY_KEY_SHOW_ONLY_ON_INPUTS, it)
+                                            .apply()
+                                        if (isBubbleServiceRunning) {
+                                            startOrRefreshBubbleService()
+                                        }
                                     }
                                 )
                                 Text(
                                     "Only show bubble when a text field is focused",
                                     color = MaterialTheme.colorScheme.onBackground
+                                )
+                            }
+                            if (showOnlyOnInputs && !isAccessibilityConnected) {
+                                Text(
+                                    text = "Note: Accessibility Service is not enabled yet, so the bubble remains visible everywhere until connected.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(start = 12.dp, bottom = 4.dp)
                                 )
                             }
 
@@ -268,6 +333,9 @@ class MainActivity : ComponentActivity() {
                                     onCheckedChange = {
                                         hapticFeedback = it
                                         prefs.edit().putBoolean("haptic_feedback", it).apply()
+                                        if (isBubbleServiceRunning) {
+                                            startOrRefreshBubbleService()
+                                        }
                                     }
                                 )
                                 Text(
@@ -291,6 +359,9 @@ class MainActivity : ComponentActivity() {
                                     onValueChange = { bubbleSize = it },
                                     onValueChangeFinished = {
                                         prefs.edit().putFloat("bubble_size", bubbleSize).apply()
+                                        if (isBubbleServiceRunning) {
+                                            startOrRefreshBubbleService()
+                                        }
                                     },
                                     valueRange = 36f..80f,
                                     steps = 10,
@@ -326,12 +397,13 @@ class MainActivity : ComponentActivity() {
                                         val intent = Intent(context, FloatingBubbleService::class.java)
                                         context.stopService(intent)
                                     },
+                                    enabled = isBubbleServiceRunning,
                                     modifier = Modifier.weight(1f),
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = MaterialTheme.colorScheme.error
                                     )
                                 ) {
-                                    Text("Stop Service")
+                                    Text("Stop Bubble")
                                 }
 
                                 Button(
@@ -354,11 +426,11 @@ class MainActivity : ComponentActivity() {
                                             ).show()
                                             return@Button
                                         }
-                                        restartService()
+                                        startOrRefreshBubbleService()
                                     },
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Text("Start / Restart Service")
+                                    Text(if (isBubbleServiceRunning) "Refresh Bubble" else "Start Bubble")
                                 }
                             }
                             Spacer(modifier = Modifier.height(16.dp))

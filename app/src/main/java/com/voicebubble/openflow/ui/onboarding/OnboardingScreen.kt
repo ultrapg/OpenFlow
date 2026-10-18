@@ -101,12 +101,10 @@ fun OnboardingScreen(
         )
     }
 
-    val configuredSettings = ModelSettings(
+    val configuredSettings = initialSettings.copy(
         earEnabled = earSelected,
         clearEnabled = clearSelected,
-        uhmEnabled = uhmSelected,
-        preferredLanguage = initialSettings.preferredLanguage,
-        customVocabulary = initialSettings.customVocabulary
+        uhmEnabled = uhmSelected
     )
 
     val selectedModels = configuredSettings.enabledModels()
@@ -125,8 +123,9 @@ fun OnboardingScreen(
                 DesertAntModelStorage.areAllEnabledModelsDownloaded(context, configuredSettings)
             }
             if (allReady) {
+                ModelSettings.save(context, configuredSettings)
                 ModelSettings.setOnboardingCompleted(context, true)
-                SmartPipeline.getInstance(context).reloadSettings(configuredSettings)
+                SmartPipeline.getInstance(context).reloadSettingsAsync(configuredSettings)
                 onOnboardingComplete(configuredSettings)
             }
         }
@@ -142,6 +141,9 @@ fun OnboardingScreen(
             context = context,
             models = configuredSettings.enabledModels(),
             onAllCompleted = {
+                ModelSettings.save(context, configuredSettings)
+                ModelSettings.setOnboardingCompleted(context, true)
+                SmartPipeline.getInstance(context).reloadSettingsAsync(configuredSettings)
                 onOnboardingComplete(configuredSettings)
             }
         )

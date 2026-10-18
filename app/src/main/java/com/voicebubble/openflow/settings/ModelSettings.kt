@@ -92,6 +92,47 @@ enum class DesertAntModel(
 }
 
 /**
+ * Hardware acceleration preference for LiteRT on-device audio inference.
+ */
+enum class HardwareAccelerator(
+    val id: String,
+    val displayName: String,
+    val shortLabel: String,
+    val description: String
+) {
+    AUTO(
+        id = "auto",
+        displayName = "Auto (NPU / GPU / CPU)",
+        shortLabel = "Auto",
+        description = "Automatically selects NPU or GPU (OpenCL) with multi-threaded CPU XNNPACK fallback"
+    ),
+    NPU(
+        id = "npu",
+        displayName = "NPU / AI Accelerator",
+        shortLabel = "NPU",
+        description = "Prioritizes dedicated NPU / AI hardware (QNN / NeuroPilot / Tensor) with GPU & CPU fallback"
+    ),
+    GPU(
+        id = "gpu",
+        displayName = "GPU (OpenCL)",
+        shortLabel = "GPU",
+        description = "Accelerates neural audio models on mobile GPU via LiteRT OpenCL with CPU fallback"
+    ),
+    CPU(
+        id = "cpu",
+        displayName = "CPU (XNNPACK)",
+        shortLabel = "CPU",
+        description = "Multi-threaded ARM NEON / XNNPACK execution; lowest VRAM footprint and maximum stability with all 4 models"
+    );
+
+    companion object {
+        fun fromId(id: String?): HardwareAccelerator {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: AUTO
+        }
+    }
+}
+
+/**
  * Immutable snapshot of user-configurable Desert Ant model settings persisted in SharedPreferences.
  */
 data class ModelSettings(
@@ -99,7 +140,8 @@ data class ModelSettings(
     val clearEnabled: Boolean = true,
     val uhmEnabled: Boolean = true,
     val preferredLanguage: String = defaultPreferredLanguage(),
-    val customVocabulary: List<String> = emptyList()
+    val customVocabulary: List<String> = emptyList(),
+    val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
 ) {
     /**
      * `Voz` is the core STT engine and cannot be disabled.
@@ -151,6 +193,7 @@ data class ModelSettings(
         const val KEY_UHM_ENABLED = "uhm_enabled"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
+        const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
         const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
 
         fun defaultPreferredLanguage(): String {
@@ -170,13 +213,17 @@ data class ModelSettings(
 
             val vocabJson = prefs.getString(KEY_CUSTOM_VOCABULARY, null)
             val vocabList = parseVocabularyJson(vocabJson)
+            val accel = HardwareAccelerator.fromId(
+                prefs.getString(KEY_HARDWARE_ACCELERATOR, HardwareAccelerator.AUTO.id)
+            )
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 clearEnabled = prefs.getBoolean(KEY_CLEAR_ENABLED, true),
                 uhmEnabled = prefs.getBoolean(KEY_UHM_ENABLED, true),
                 preferredLanguage = sanitizedLang,
-                customVocabulary = vocabList
+                customVocabulary = vocabList,
+                hardwareAccelerator = accel
             )
         }
 
@@ -201,6 +248,7 @@ data class ModelSettings(
                 .putBoolean(KEY_UHM_ENABLED, settings.uhmEnabled)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
+                .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
                 .apply()
         }
 
@@ -245,10 +293,12 @@ data class ModelSettings(
 }
 
 /**
- * Helper object for checking on-disk model cache status, running verified downloads with progress,
- * and deleting inactive model files on disk.
+ * Helper object for checking on-disk model cache status in O(1) time without spawning native
+ * JNI handles, managing verified artifact stamps, and deleting inactive model files on disk.
  */
 object DesertAntModelStorage {
+
+    private const val VERIFIED_STAMP_FILE = ".openflow_verified"
 
     private val MODEL_REVISIONS = mapOf(
         DesertAntModel.VOZ to "v0.4.0",
@@ -260,8 +310,16 @@ object DesertAntModelStorage {
     @Volatile
     private var bundledExtractionChecked = false
 
+    fun modelRevision(model: DesertAntModel): String {
+        return MODEL_REVISIONS.getValue(model)
+    }
+
     fun modelCacheRoot(context: Context, model: DesertAntModel): File {
         return File(context.applicationContext.cacheDir, "desert-ant-models/${model.id}")
+    }
+
+    fun modelRevisionDir(context: Context, model: DesertAntModel): File {
+        return File(modelCacheRoot(context, model), modelRevision(model))
     }
 
     /**
@@ -320,27 +378,162 @@ object DesertAntModelStorage {
                         }
                     }
                 }
+                val specArtifacts = ModelDownloadManager.MODEL_SPECS[model]?.second
+                if (specArtifacts != null) {
+                    writeModelManifestAndStamp(targetDir, specArtifacts)
+                }
             }
             bundledExtractionChecked = true
         } catch (_: Throwable) {
-            // No bundled assets present in On-Demand APK variant
             bundledExtractionChecked = true
         }
     }
 
+    /**
+     * Fast, non-blocking O(1) check that verifies whether all required model artifacts exist
+     * on disk with their exact expected byte sizes and no incomplete `.part` files.
+     *
+     * Critically, this does NOT instantiate native `Voz`/`Ear`/`Clear` JNI objects, avoiding
+     * `ModelStore`'s 1.2 GB pure-Swift `SoftwareSHA256` memory spike on UI/background threads.
+     */
     fun isModelDownloaded(context: Context, model: DesertAntModel): Boolean {
         val appContext = context.applicationContext
         ensureBundledModelsExtracted(appContext)
         return try {
-            when (model) {
-                DesertAntModel.VOZ -> Voz(appContext).use { it.isDownloaded() }
-                DesertAntModel.EAR -> Ear(appContext).use { it.isDownloaded() }
-                DesertAntModel.CLEAR -> Clear(appContext).use { it.isDownloaded() }
-                DesertAntModel.UHM -> Uhm(appContext).use { it.isDownloaded() }
-            }
+            val (revision, artifacts) = ModelDownloadManager.MODEL_SPECS[model] ?: return false
+            val targetDir = File(modelCacheRoot(appContext, model), revision)
+            isModelDirectoryComplete(targetDir, artifacts)
         } catch (_: Throwable) {
             false
         }
+    }
+
+    /**
+     * Checks whether all required model artifacts exist on disk AND have valid SHA-256 verification
+     * stamps in `.openflow_verified`.
+     */
+    fun isModelVerified(context: Context, model: DesertAntModel): Boolean {
+        val appContext = context.applicationContext
+        ensureBundledModelsExtracted(appContext)
+        return try {
+            val (revision, artifacts) = ModelDownloadManager.MODEL_SPECS[model] ?: return false
+            val targetDir = File(modelCacheRoot(appContext, model), revision)
+            areAllArtifactsVerified(targetDir, artifacts)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Pure directory completeness check testable without Android Context.
+     * Ensures `.dal-meta/manifest` is present for native `ModelDistribution.load(from:)`,
+     * but intentionally does NOT forge `.openflow_verified` stamps for unverified files.
+     */
+    fun isModelDirectoryComplete(targetDir: File, artifacts: List<ModelFileArtifact>): Boolean {
+        if (!targetDir.exists() || !targetDir.isDirectory || artifacts.isEmpty()) return false
+        for (artifact in artifacts) {
+            val finalFile = File(targetDir, artifact.relativePath)
+            val partFile = File(targetDir, "${artifact.relativePath}.part")
+            if (partFile.exists()) return false
+            if (!finalFile.exists() || !finalFile.isFile || finalFile.length() != artifact.sizeBytes) {
+                return false
+            }
+        }
+        val manifestFile = File(File(targetDir, ".dal-meta"), "manifest")
+        if (!manifestFile.exists()) {
+            try {
+                writeModelManifest(targetDir, artifacts)
+            } catch (_: Throwable) {
+            }
+        }
+        return true
+    }
+
+    /**
+     * Checks whether all [artifacts] in [targetDir] exist and have valid `.openflow_verified` stamps.
+     */
+    fun areAllArtifactsVerified(targetDir: File, artifacts: List<ModelFileArtifact>): Boolean {
+        if (!isModelDirectoryComplete(targetDir, artifacts)) return false
+        return artifacts.all { isArtifactAlreadyVerified(targetDir, it) }
+    }
+
+    /**
+     * Checks if a single [artifact] in [targetDir] has already been SHA-256 verified and recorded
+     * in `.openflow_verified` with matching file size and lastModified timestamp.
+     */
+    fun isArtifactAlreadyVerified(targetDir: File, artifact: ModelFileArtifact): Boolean {
+        val finalFile = File(targetDir, artifact.relativePath)
+        val partFile = File(targetDir, "${artifact.relativePath}.part")
+        if (partFile.exists()) return false
+        if (!finalFile.exists() || !finalFile.isFile || finalFile.length() != artifact.sizeBytes) {
+            return false
+        }
+        val stampFile = File(targetDir, VERIFIED_STAMP_FILE)
+        if (!stampFile.exists()) return false
+        return try {
+            val expectedLine = artifactStampLine(finalFile, artifact)
+            stampFile.readLines().any { it.trim() == expectedLine }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Appends or updates the verified stamp entry for [artifact] in [targetDir].
+     */
+    @Synchronized
+    fun markArtifactVerified(targetDir: File, artifact: ModelFileArtifact) {
+        val finalFile = File(targetDir, artifact.relativePath)
+        if (!finalFile.exists()) return
+        try {
+            val stampFile = File(targetDir, VERIFIED_STAMP_FILE)
+            val prefix = "${artifact.relativePath}\t"
+            val existing = if (stampFile.exists()) {
+                stampFile.readLines().filter { it.isNotBlank() && !it.startsWith(prefix) }
+            } else {
+                emptyList()
+            }
+            val updated = existing + artifactStampLine(finalFile, artifact)
+            stampFile.writeText(updated.joinToString("\n") + "\n")
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Writes `.dal-meta/manifest` for [artifacts] in [targetDir] without touching `.openflow_verified`.
+     */
+    @Synchronized
+    fun writeModelManifest(targetDir: File, artifacts: List<ModelFileArtifact>) {
+        if (!targetDir.exists()) targetDir.mkdirs()
+        val metaDir = File(targetDir, ".dal-meta")
+        metaDir.mkdirs()
+        val manifestFile = File(metaDir, "manifest")
+        val rLines = artifacts.joinToString("\n") { "R\t${it.relativePath}" }
+        val fLines = artifacts.joinToString("\n") { "F\t${it.relativePath}\t${it.sizeBytes}\t${it.sha256}" }
+        manifestFile.writeText("DAL1\n$rLines\n$fLines\n")
+    }
+
+    /**
+     * Writes both `.dal-meta/manifest` and `.openflow_verified` for all [artifacts] in [targetDir].
+     */
+    @Synchronized
+    fun writeModelManifestAndStamp(targetDir: File, artifacts: List<ModelFileArtifact>) {
+        writeModelManifest(targetDir, artifacts)
+        val stampLines = artifacts.mapNotNull { artifact ->
+            val f = File(targetDir, artifact.relativePath)
+            if (f.exists() && f.length() == artifact.sizeBytes) {
+                artifactStampLine(f, artifact)
+            } else {
+                null
+            }
+        }
+        if (stampLines.size == artifacts.size) {
+            File(targetDir, VERIFIED_STAMP_FILE).writeText(stampLines.joinToString("\n") + "\n")
+        }
+    }
+
+    private fun artifactStampLine(file: File, artifact: ModelFileArtifact): String {
+        return "${artifact.relativePath}\t${artifact.sizeBytes}\t${file.lastModified()}\t${artifact.sha256.lowercase(Locale.ROOT)}"
     }
 
     fun areAllEnabledModelsDownloaded(context: Context, settings: ModelSettings = ModelSettings.load(context)): Boolean {
@@ -352,8 +545,7 @@ object DesertAntModelStorage {
     }
 
     /**
-     * Downloads [model] on [Dispatchers.IO] while emitting progress in `0.0f..1.0f` and verifying
-     * post-download integrity via `isDownloaded()`.
+     * Downloads [model] on [Dispatchers.IO] while emitting progress in `0.0f..1.0f`.
      */
     suspend fun downloadModel(
         context: Context,
@@ -365,90 +557,7 @@ object DesertAntModelStorage {
             onProgress(1.0f)
             return@withContext
         }
-
-        val dirToWatch = modelCacheRoot(appContext, model)
-        onProgress(0.01f)
-
-        when (model) {
-            DesertAntModel.UHM -> {
-                Uhm(appContext).use { uhm ->
-                    uhm.download { ratio ->
-                        onProgress(ratio.coerceIn(0.01f, 0.99f))
-                    }
-                    if (!uhm.isDownloaded()) {
-                        throw IllegalStateException("Integrity check failed after downloading ${model.displayName}")
-                    }
-                }
-            }
-            DesertAntModel.VOZ -> {
-                coroutineScope {
-                    val watcher = launch {
-                        while (isActive) {
-                            val bytes = directoryBytes(dirToWatch)
-                            val ratio = (bytes.toFloat() / model.expectedBytes.toFloat()).coerceIn(0.01f, 0.98f)
-                            onProgress(ratio)
-                            delay(120L)
-                        }
-                    }
-                    try {
-                        Voz(appContext).use { voz ->
-                            voz.download()
-                            if (!voz.isDownloaded()) {
-                                throw IllegalStateException("Integrity check failed after downloading ${model.displayName}")
-                            }
-                        }
-                    } finally {
-                        watcher.cancel()
-                    }
-                }
-            }
-            DesertAntModel.EAR -> {
-                coroutineScope {
-                    val watcher = launch {
-                        while (isActive) {
-                            val bytes = directoryBytes(dirToWatch)
-                            val ratio = (bytes.toFloat() / model.expectedBytes.toFloat()).coerceIn(0.01f, 0.98f)
-                            onProgress(ratio)
-                            delay(100L)
-                        }
-                    }
-                    try {
-                        Ear(appContext).use { ear ->
-                            ear.download()
-                            if (!ear.isDownloaded()) {
-                                throw IllegalStateException("Integrity check failed after downloading ${model.displayName}")
-                            }
-                        }
-                    } finally {
-                        watcher.cancel()
-                    }
-                }
-            }
-            DesertAntModel.CLEAR -> {
-                coroutineScope {
-                    val watcher = launch {
-                        while (isActive) {
-                            val bytes = directoryBytes(dirToWatch)
-                            val ratio = (bytes.toFloat() / model.expectedBytes.toFloat()).coerceIn(0.01f, 0.98f)
-                            onProgress(ratio)
-                            delay(100L)
-                        }
-                    }
-                    try {
-                        Clear(appContext).use { clear ->
-                            clear.download()
-                            if (!clear.isDownloaded()) {
-                                throw IllegalStateException("Integrity check failed after downloading ${model.displayName}")
-                            }
-                        }
-                    } finally {
-                        watcher.cancel()
-                    }
-                }
-            }
-        }
-
-        onProgress(1.0f)
+        ModelDownloadManager.downloadSingleModelDirect(appContext, model, onProgress)
     }
 
     /**
@@ -478,12 +587,5 @@ object DesertAntModelStorage {
             }
         }
         return deletedCount
-    }
-
-    private fun directoryBytes(dir: File): Long {
-        if (!dir.exists()) return 0L
-        return dir.walkTopDown()
-            .filter { it.isFile }
-            .sumOf { it.length() }
     }
 }
