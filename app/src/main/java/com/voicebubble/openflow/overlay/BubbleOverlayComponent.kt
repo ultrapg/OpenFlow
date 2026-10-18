@@ -17,18 +17,12 @@
 package com.voicebubble.openflow.overlay
 
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -36,7 +30,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -71,17 +64,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.speech.PipelinePhase
-import kotlin.math.sin
 
 @Composable
 fun BubbleOverlayComponent(
@@ -101,7 +90,7 @@ fun BubbleOverlayComponent(
         targetValue = if (isVisible) 1f else 0f,
         animationSpec = if (isVisible) {
             spring(
-                dampingRatio = Spring.DampingRatioMediumBouncy,
+                dampingRatio = 0.78f,
                 stiffness = Spring.StiffnessMedium
             )
         } else {
@@ -118,20 +107,25 @@ fun BubbleOverlayComponent(
     val isPressed by interactionSource.collectIsPressedAsState()
     var isDragging by remember { mutableStateOf(false) }
 
-    // Material Design 3 Expressive width/height & corner-radius spring physics
+    // Clean Material Design 3 width morphing: expands smoothly to fit full stage text or recording controls
     val targetWidth = when (bubbleState) {
-        OverlayBubbleState.RECORDING -> (bubbleSize + 48f).dp
+        OverlayBubbleState.RECORDING -> (bubbleSize + 36f).dp
         OverlayBubbleState.PROCESSING -> {
-            if (processingProgress.isNotEmpty()) (bubbleSize + 82f).dp else (bubbleSize + 8f).dp
+            if (processingProgress.isNotEmpty()) {
+                val estimatedTextWidth = (processingProgress.length * 7.2f).coerceAtLeast(64f)
+                (bubbleSize + 20f + estimatedTextWidth).dp
+            } else {
+                bubbleSize.dp
+            }
         }
-        OverlayBubbleState.SUCCESS -> (bubbleSize + 6f).dp
+        OverlayBubbleState.SUCCESS -> bubbleSize.dp
         OverlayBubbleState.IDLE -> bubbleSize.dp
     }
 
     val width by animateDpAsState(
         targetValue = targetWidth,
         animationSpec = spring(
-            dampingRatio = 0.62f,
+            dampingRatio = 0.78f,
             stiffness = Spring.StiffnessMediumLow
         ),
         label = "m3BubbleWidth"
@@ -140,41 +134,35 @@ fun BubbleOverlayComponent(
     val height by animateDpAsState(
         targetValue = bubbleSize.dp,
         animationSpec = spring(
-            dampingRatio = 0.68f,
+            dampingRatio = 0.82f,
             stiffness = Spring.StiffnessMediumLow
         ),
         label = "m3BubbleHeight"
     )
 
-    // M3 FAB squircle (32% radius) in IDLE morphing into a full M3 Stadium Pill (50% radius) when active
+    // Minimalist M3 corner radius (rounded FAB in IDLE, full pill when expanded)
     val cornerRadius by animateDpAsState(
         targetValue = when (bubbleState) {
             OverlayBubbleState.IDLE -> (bubbleSize * 0.32f).dp
             else -> (bubbleSize * 0.50f).dp
         },
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioLowBouncy,
+            dampingRatio = 0.80f,
             stiffness = Spring.StiffnessMediumLow
         ),
         label = "m3CornerRadius"
     )
 
-    // Interactive spring scale physics (press squish, drag lift, and subtle voice amplitude pulse)
-    val voicePulse = if (bubbleState == OverlayBubbleState.RECORDING) {
-        (rms.coerceIn(0f, 1f) * 0.045f)
-    } else {
-        0f
-    }
+    // Steady scale during recording (no pulsing); subtle tactile feedback only on press/drag
     val targetScale = when {
-        isDragging -> 1.08f
-        isPressed -> 0.90f
-        bubbleState == OverlayBubbleState.SUCCESS -> 1.04f
-        else -> 1.0f + voicePulse
+        isDragging -> 1.04f
+        isPressed -> 0.94f
+        else -> 1.0f
     }
     val scale by animateFloatAsState(
         targetValue = targetScale,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
+            dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessMedium
         ),
         label = "m3BubbleScale"
@@ -183,16 +171,15 @@ fun BubbleOverlayComponent(
     val shadowElevation by animateDpAsState(
         targetValue = when {
             !isVisible -> 0.dp
-            isDragging -> 12.dp
-            bubbleState == OverlayBubbleState.RECORDING -> 9.dp
-            isPressed -> 3.dp
-            else -> 6.dp
+            isDragging -> 8.dp
+            isPressed -> 2.dp
+            else -> 4.dp
         },
         animationSpec = spring(stiffness = Spring.StiffnessMedium),
         label = "m3BubbleElevation"
     )
 
-    // Material Design 3 semantic tonal color scheme transitions
+    // Clean Material Design 3 tonal color scheme (no outlines, no glossy gradients)
     val containerColor by animateColorAsState(
         targetValue = when (bubbleState) {
             OverlayBubbleState.IDLE -> colorScheme.primaryContainer
@@ -215,25 +202,13 @@ fun BubbleOverlayComponent(
         label = "m3ContentColor"
     )
 
-    val borderColor by animateColorAsState(
-        targetValue = when (bubbleState) {
-            OverlayBubbleState.IDLE -> colorScheme.primary.copy(alpha = 0.28f)
-            OverlayBubbleState.RECORDING -> colorScheme.error.copy(alpha = 0.55f)
-            OverlayBubbleState.PROCESSING -> colorScheme.secondary.copy(alpha = 0.35f)
-            OverlayBubbleState.SUCCESS -> colorScheme.tertiary.copy(alpha = 0.45f)
-        },
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-        label = "m3BorderColor"
-    )
-
     val bubbleShape = RoundedCornerShape(cornerRadius)
-    val effectiveScale = (scale * (0.35f + 0.65f * visibilityProgress)).coerceAtLeast(0.01f)
+    val effectiveScale = (scale * (0.4f + 0.6f * visibilityProgress)).coerceAtLeast(0.01f)
     val effectiveAlpha = visibilityProgress.coerceIn(0f, 1f)
 
-    // Outer padding gives room for bouncy spring overshoot and M3 elevation shadow inside the overlay window
     Box(
         modifier = Modifier
-            .padding(6.dp)
+            .padding(4.dp)
             .graphicsLayer {
                 scaleX = effectiveScale
                 scaleY = effectiveScale
@@ -271,38 +246,28 @@ fun BubbleOverlayComponent(
             shape = bubbleShape,
             color = containerColor,
             contentColor = contentColor,
-            tonalElevation = 6.dp,
-            shadowElevation = shadowElevation,
-            border = BorderStroke(1.2.dp, borderColor)
+            tonalElevation = 3.dp,
+            shadowElevation = shadowElevation
         ) {
             Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = 0.10f),
-                                Color.Transparent
-                            )
-                        )
-                    ),
+                modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 AnimatedContent(
                     targetState = bubbleState,
                     transitionSpec = {
                         (scaleIn(
-                            initialScale = 0.72f,
+                            initialScale = 0.85f,
                             animationSpec = spring(
-                                dampingRatio = Spring.DampingRatioMediumBouncy,
+                                dampingRatio = Spring.DampingRatioNoBouncy,
                                 stiffness = Spring.StiffnessMedium
                             )
-                        ) + fadeIn(animationSpec = tween(140)))
+                        ) + fadeIn(animationSpec = tween(120)))
                             .togetherWith(
                                 scaleOut(
-                                    targetScale = 0.78f,
-                                    animationSpec = tween(110, easing = FastOutSlowInEasing)
-                                ) + fadeOut(animationSpec = tween(110))
+                                    targetScale = 0.85f,
+                                    animationSpec = tween(100, easing = FastOutSlowInEasing)
+                                ) + fadeOut(animationSpec = tween(100))
                             )
                             .using(SizeTransform(clip = false))
                     },
@@ -316,9 +281,9 @@ fun BubbleOverlayComponent(
                             ) {
                                 if (isLoadingModels) {
                                     CircularProgressIndicator(
-                                        color = colorScheme.primary,
-                                        strokeWidth = 2.2.dp,
-                                        modifier = Modifier.size((bubbleSize * 0.72f).dp)
+                                        color = contentColor.copy(alpha = 0.55f),
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size((bubbleSize * 0.68f).dp)
                                     )
                                 }
                                 Icon(
@@ -327,31 +292,6 @@ fun BubbleOverlayComponent(
                                     tint = contentColor,
                                     modifier = Modifier.size((bubbleSize * 0.46f).dp)
                                 )
-
-                                // M3 Readiness status badge in bottom-right corner
-                                val dotColor by animateColorAsState(
-                                    targetValue = when {
-                                        isLoadingModels -> colorScheme.tertiary
-                                        isModelLoaded -> Color(0xFF00C853)
-                                        else -> colorScheme.outline
-                                    },
-                                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-                                    label = "m3StatusDotColor"
-                                )
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomEnd)
-                                        .padding(
-                                            end = (bubbleSize * 0.12f).dp,
-                                            bottom = (bubbleSize * 0.12f).dp
-                                        )
-                                        .size(10.dp)
-                                        .clip(CircleShape)
-                                        .background(containerColor)
-                                        .padding(1.8.dp)
-                                        .clip(CircleShape)
-                                        .background(dotColor)
-                                )
                             }
                         }
 
@@ -359,9 +299,7 @@ fun BubbleOverlayComponent(
                             RecordingBarsComponent(
                                 rms = rms,
                                 bubbleSize = bubbleSize,
-                                barColor = colorScheme.error,
-                                stopContainerColor = colorScheme.error,
-                                stopIconColor = colorScheme.onError
+                                contentColor = contentColor
                             )
                         }
 
@@ -369,15 +307,15 @@ fun BubbleOverlayComponent(
                             Row(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(horizontal = 12.dp),
+                                    .padding(horizontal = 14.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.Center
                             ) {
                                 CircularProgressIndicator(
-                                    color = colorScheme.primary,
-                                    strokeWidth = 2.4.dp,
+                                    color = contentColor,
+                                    strokeWidth = 2.2.dp,
                                     modifier = Modifier.size(
-                                        if (processingProgress.isNotEmpty()) 18.dp else (bubbleSize * 0.48f).dp
+                                        if (processingProgress.isNotEmpty()) 16.dp else (bubbleSize * 0.44f).dp
                                     )
                                 )
                                 if (processingProgress.isNotEmpty()) {
@@ -386,34 +324,24 @@ fun BubbleOverlayComponent(
                                         text = processingProgress,
                                         color = contentColor,
                                         style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.SemiBold,
+                                        fontWeight = FontWeight.Medium,
                                         maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                        softWrap = false
                                     )
                                 }
                             }
                         }
 
                         OverlayBubbleState.SUCCESS -> {
-                            val checkScale by animateFloatAsState(
-                                targetValue = 1.0f,
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioLowBouncy,
-                                    stiffness = Spring.StiffnessMedium
-                                ),
-                                label = "m3SuccessCheckScale"
-                            )
                             Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .scale(checkScale),
+                                modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Check,
                                     contentDescription = "Transcription complete",
                                     tint = contentColor,
-                                    modifier = Modifier.size((bubbleSize * 0.48f).dp)
+                                    modifier = Modifier.size((bubbleSize * 0.46f).dp)
                                 )
                             }
                         }
@@ -428,48 +356,37 @@ fun BubbleOverlayComponent(
 fun RecordingBarsComponent(
     rms: Float,
     bubbleSize: Float,
-    barColor: Color,
-    stopContainerColor: Color,
-    stopIconColor: Color
+    contentColor: Color
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "m3WaveformWave")
-    val wavePhase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2f * Math.PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "m3WavePhase"
-    )
-
     val clampedRms = rms.coerceIn(0f, 1f)
-    val maxBarHeight = (bubbleSize * 0.54f).coerceAtLeast(18f)
-    val minBarHeight = (bubbleSize * 0.18f).coerceAtLeast(7f)
+    val maxBarHeight = (bubbleSize * 0.48f).coerceAtLeast(16f)
+    val minBarHeight = (bubbleSize * 0.16f).coerceAtLeast(6f)
 
-    // 4-bar M3 spring-driven equalizer with organic phase offsets + live microphone amplitude
-    val bar1Target = minBarHeight + (maxBarHeight - minBarHeight) *
-        (0.22f + 0.14f * ((sin(wavePhase.toDouble()) + 1.0).toFloat() * 0.5f) + clampedRms * 0.64f)
-    val bar2Target = minBarHeight + (maxBarHeight - minBarHeight) *
-        (0.32f + 0.18f * ((sin(wavePhase.toDouble() + 1.3) + 1.0).toFloat() * 0.5f) + clampedRms * 0.85f)
-    val bar3Target = minBarHeight + (maxBarHeight - minBarHeight) *
-        (0.28f + 0.18f * ((sin(wavePhase.toDouble() + 2.6) + 1.0).toFloat() * 0.5f) + clampedRms * 0.78f)
-    val bar4Target = minBarHeight + (maxBarHeight - minBarHeight) *
-        (0.20f + 0.14f * ((sin(wavePhase.toDouble() + 3.9) + 1.0).toFloat() * 0.5f) + clampedRms * 0.58f)
-
+    // Minimalist 3-bar voice equalizer responding strictly to real microphone voice level
     val barSpring = spring<androidx.compose.ui.unit.Dp>(
-        dampingRatio = 0.52f,
+        dampingRatio = Spring.DampingRatioNoBouncy,
         stiffness = Spring.StiffnessMedium
     )
 
-    val bar1 by animateDpAsState(targetValue = bar1Target.coerceAtMost(maxBarHeight).dp, animationSpec = barSpring, label = "bar1")
-    val bar2 by animateDpAsState(targetValue = bar2Target.coerceAtMost(maxBarHeight).dp, animationSpec = barSpring, label = "bar2")
-    val bar3 by animateDpAsState(targetValue = bar3Target.coerceAtMost(maxBarHeight).dp, animationSpec = barSpring, label = "bar3")
-    val bar4 by animateDpAsState(targetValue = bar4Target.coerceAtMost(maxBarHeight).dp, animationSpec = barSpring, label = "bar4")
+    val bar1 by animateDpAsState(
+        targetValue = (minBarHeight + (maxBarHeight - minBarHeight) * (clampedRms * 0.65f)).dp,
+        animationSpec = barSpring,
+        label = "bar1"
+    )
+    val bar2 by animateDpAsState(
+        targetValue = (minBarHeight + 3f + (maxBarHeight - minBarHeight - 3f) * clampedRms).dp,
+        animationSpec = barSpring,
+        label = "bar2"
+    )
+    val bar3 by animateDpAsState(
+        targetValue = (minBarHeight + (maxBarHeight - minBarHeight) * (clampedRms * 0.70f)).dp,
+        animationSpec = barSpring,
+        label = "bar3"
+    )
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.Center,
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 12.dp)
@@ -480,48 +397,34 @@ fun RecordingBarsComponent(
         ) {
             Box(
                 modifier = Modifier
-                    .width(3.5.dp)
+                    .width(3.2.dp)
                     .height(bar1)
                     .clip(CircleShape)
-                    .background(barColor.copy(alpha = 0.82f))
+                    .background(contentColor.copy(alpha = 0.85f))
             )
             Box(
                 modifier = Modifier
-                    .width(3.8.dp)
+                    .width(3.2.dp)
                     .height(bar2)
                     .clip(CircleShape)
-                    .background(barColor)
+                    .background(contentColor)
             )
             Box(
                 modifier = Modifier
-                    .width(3.8.dp)
+                    .width(3.2.dp)
                     .height(bar3)
                     .clip(CircleShape)
-                    .background(barColor)
-            )
-            Box(
-                modifier = Modifier
-                    .width(3.5.dp)
-                    .height(bar4)
-                    .clip(CircleShape)
-                    .background(barColor.copy(alpha = 0.82f))
+                    .background(contentColor.copy(alpha = 0.85f))
             )
         }
 
-        // M3 Expressive filled stop icon badge inside the recording pill
-        Box(
-            modifier = Modifier
-                .size((bubbleSize * 0.56f).coerceIn(24f, 36f).dp)
-                .clip(CircleShape)
-                .background(stopContainerColor),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Stop,
-                contentDescription = "Stop recording",
-                tint = stopIconColor,
-                modifier = Modifier.size((bubbleSize * 0.34f).coerceIn(15f, 22f).dp)
-            )
-        }
+        Spacer(modifier = Modifier.width(10.dp))
+
+        Icon(
+            imageVector = Icons.Rounded.Stop,
+            contentDescription = "Stop recording",
+            tint = contentColor,
+            modifier = Modifier.size((bubbleSize * 0.38f).coerceIn(16f, 22f).dp)
+        )
     }
 }

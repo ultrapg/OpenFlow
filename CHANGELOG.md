@@ -2,6 +2,14 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.2] - 2026-10-18
+
+### Changed
+- **Minimalistic Google Material Design 3 Floating Bubble (`BubbleOverlayComponent`):**
+  - Removed outlines/borders, glossy inner gradients, corner dots, and container pulsing during dictation for a clean, flat Google Material 3 aesthetic.
+  - Kept the tonal Material 3 color palette (`primaryContainer`, `errorContainer`, `secondaryContainer`, `tertiaryContainer`) and dynamic spring-expanding pill that adapts its width to display the full active pipeline stage text (`Denoising...`, `Detecting Lang...`, `Filtering Fillers...`, `Transcribing...`) without truncation.
+  - Simplified the recording equalizer to a steady 3-bar voice indicator that reacts strictly to real microphone voice amplitude (`rms`) alongside a clean `Stop` icon.
+
 ## [2.3.1] - 2026-10-18
 
 ### Added

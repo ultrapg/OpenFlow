@@ -17,8 +17,8 @@ Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) 
   - **Lightweight APK (~73 MB for `arm64-v8a`):** Speech models are downloaded in-app on first launch (or when toggled on in Settings) with full local storage management.
   - **Zero-Wait Streaming SHA-256 Verification:** SHA-256 digests are computed incrementally in L1 cache while chunks stream over HTTP and persisted in `.openflow_verified`, eliminating post-download freezes and native `ModelStore` memory spikes.
   - **Background Execution & HTTP Range Resume:** Runs in a foreground service with a live status-bar progress notification and `Range: bytes=<offset>-` support so downloads continue when switching apps, survive slow/unstable internet connections with automatic exponential-backoff retries, and can be paused and resumed anytime without losing progress.
-- **Dictate Everywhere:** Automatically injects transcribed text into any focused input field via Android's Accessibility Service (with multi-window focus recovery and a 2-second focus grace period), plus non-destructive clipboard fallback.
-- **Reliable Floating Bubble UI:** Always-accessible, screen-bounds-clamped draggable overlay bubble with real-time RMS audio visualization, model readiness badge, and background `WakeLock` protection during dictation.
+- **Dictate Everywhere:** Automatically injects transcribed text into any focused input field via Android's Accessibility Service (with multi-window focus recovery), plus non-destructive clipboard fallback.
+- **Minimalistic Material Design 3 Floating Bubble:** Clean, borderless Google Material 3 tonal bubble that automatically appears when the on-screen keyboard (`TYPE_INPUT_METHOD` / `WindowInsets.Type.ime()`) is open, smoothly spring-expands into a pill to display the full text of the active pipeline stage (`Denoising...`, `Detecting Lang...`, `Filtering Fillers...`, `Transcribing...`), and hides after a configurable disappear delay (`0.0s` – `5.0s`).
 
 ## 📦 Building & Installation
 
@@ -32,7 +32,7 @@ Clone the repository and build directly with Gradle or Android Studio—no manua
 ./gradlew assembleRelease
 ```
 
-On first launch, OpenFlow's onboarding flow lets you customize which optional models (`Ear`, `Clear`, `Uhm`) to download alongside `Voz`.
+On first launch, OpenFlow enables `Voz` (required speech recognition) and `Ear` (auto language detection) by default (`359 MB`), and lets you optionally enable `Clear` (noise suppression) and `Uhm` (filler word removal).
 
 ## 🛠️ Built With
 - **Powered by [Desert Ant Labs](https://desertant.com)** (`Voz`, `Ear`, `Clear`, `Uhm` v4.0.0 on LiteRT)
