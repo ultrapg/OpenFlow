@@ -1,44 +1,52 @@
 # OpenFlow
 
-Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) dictation app for Android with a system-wide floating bubble and accessibility text injection.
+Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) dictation app for Android with a system-wide floating bubble and automatic accessibility text injection.
 
 ## 🚀 Features
-- **On-Device Audio AI Pipeline:** All audio inference runs locally on your smartphone via **LiteRT** with selectable **Hardware Acceleration (`Auto`, `NPU`, `GPU (OpenCL)`, or `CPU (XNNPACK)`)**. Your voice recordings never leave your device.
+
+- **100% On-Device Audio AI Pipeline:** All audio inference runs locally on your smartphone via **LiteRT** with selectable **Hardware Acceleration (`Auto`, `NPU`, `GPU (OpenCL)`, or `CPU (XNNPACK)`)**. Your voice recordings never leave your device.
 - **4-Stage Desert Ant Labs Audio Ecosystem:**
-  - **`Clear` (`clear-studio`, 24 MB):** Neural speech enhancement and denoising in noisy environments.
-  - **`Ear` (22 MB):** Spoken language identification (107 languages) that automatically routes dictation across supported European languages or falls back to your preferred language.
-  - **`Voz` (337 MB):** High-accuracy multilingual transcription across 25 European languages with automatic punctuation, capitalization, word-level timestamps ($80\text{ ms}$ resolution), and custom vocabulary biasing.
-  - **`Uhm` (24 MB):** Temporal acoustic filler detector ($20\text{ ms}$ frame resolution) that strips hesitations (`uh`, `um`, `hmm`) by cross-referencing `Voz` word timestamps without deleting legitimate words.
+  - **`Voz` (337 MB — Enabled by Default):** High-accuracy multilingual transcription across 25 European languages with automatic punctuation, capitalization, word-level timestamps (`80 ms` resolution), and custom vocabulary biasing.
+  - **`Ear` (22 MB — Enabled by Default):** Spoken language identification (107 languages) that automatically routes dictation across supported European languages or falls back to your preferred language.
+  - **`Clear` (`clear-studio`, 24 MB — Optional):** Neural speech enhancement and denoising for noisy environments.
+  - **`Uhm` (24 MB — Optional):** Temporal acoustic filler detector (`20 ms` frame resolution) that strips hesitations (`uh`, `um`, `hmm`) by cross-referencing `Voz` word timestamps without deleting legitimate words.
 - **Fast Inference & Live Model Load Telemetry:**
   - **Pre-Warmed LiteRT Sessions:** Models are loaded and pre-warmed in background RAM on launch so dictation begins with zero compilation delay.
-  - **Real-Time Model Status:** Live indicators in Settings, on the Floating Bubble, and in the status bar notification show whether each model (`Voz`, `Ear`, `Clear`, `Uhm`) is **Loaded in RAM**, **Loading**, **Running Inference**, or on **Standby**, along with last dictation latency and real-time speedup (`× real-time`).
+  - **Real-Time Model Status:** Live indicators in Settings, on the Floating Bubble, and in the status-bar notification show whether each model (`Voz`, `Ear`, `Clear`, `Uhm`) is **Loaded in RAM**, **Loading**, **Running Inference**, or on **Standby**, along with last dictation latency and real-time speedup (`× real-time`).
   - **Smart Audio Pre-Processing:** Leading/trailing silence trimming and bounded 5.5-second language identification windows minimize inference latency.
 - **Resumable Background Model Downloads & Instant Streaming SHA-256:**
   - **Lightweight APK (~73 MB for `arm64-v8a`):** Speech models are downloaded in-app on first launch (or when toggled on in Settings) with full local storage management.
-  - **Zero-Wait Streaming SHA-256 Verification:** SHA-256 digests are computed incrementally in L1 cache while chunks stream over HTTP and persisted in `.openflow_verified`, eliminating post-download freezes and native `ModelStore` memory spikes.
-  - **Background Execution & HTTP Range Resume:** Runs in a foreground service with a live status-bar progress notification and `Range: bytes=<offset>-` support so downloads continue when switching apps, survive slow/unstable internet connections with automatic exponential-backoff retries, and can be paused and resumed anytime without losing progress.
-- **Dictate Everywhere:** Automatically injects transcribed text into any focused input field via Android's Accessibility Service (with multi-window focus recovery), plus non-destructive clipboard fallback.
-- **Minimalistic Material Design 3 Floating Bubble:** Clean, borderless Google Material 3 tonal bubble that automatically appears when the on-screen keyboard (`TYPE_INPUT_METHOD` / `WindowInsets.Type.ime()`) is open, smoothly spring-expands into a pill to display the full text of the active pipeline stage (`Denoising...`, `Detecting Lang...`, `Filtering Fillers...`, `Transcribing...`), and hides after a configurable disappear delay (`0.0s` – `5.0s`).
+  - **Zero-Wait Streaming SHA-256 Verification:** SHA-256 digests are computed incrementally while chunks stream over HTTP and persisted in `.openflow_verified`, eliminating post-download freezes and native memory spikes.
+  - **Background Execution & HTTP Range Resume:** Runs in a foreground service with a live status-bar progress notification, real-time speed/ETA telemetry, and `Range: bytes=<offset>-` support so downloads continue when switching apps and survive unstable connections.
+- **Dictate Everywhere:** Automatically injects transcribed text into any focused input field via Android's Accessibility Service (with multi-window focus recovery), plus automatic clipboard fallback.
+- **Minimalistic Material Design 3 Floating Bubble:** Clean, borderless Google Material 3 tonal bubble that automatically appears only when the on-screen keyboard is open, smoothly spring-expands into an exact-fit pill showing the active pipeline stage (`Clear`, `Ear`, `Uhm`, `Voz`), confirms completion with a centered green checkmark, and hides after a configurable disappear delay (`0.0s` – `5.0s`).
 
-## 📦 Building & Installation
+## 📦 Installation
 
+### Download APK (Recommended)
+Download the latest signed `openflow-release.apk` directly from [**GitHub Releases**](https://github.com/ultrapg/OpenFlow/releases/latest) (or from [`release/openflow-release.apk`](release/openflow-release.apk)) and install it on your Android device (`arm64-v8a`, Android 8.0+).
+
+On first launch, OpenFlow enables **`Voz`** (speech recognition) and **`Ear`** (auto language detection) by default (`359 MB` total), and lets you optionally enable **`Clear`** (noise suppression) and **`Uhm`** (filler word removal) anytime in Settings.
+
+### Build from Source
 Clone the repository and build directly with Gradle or Android Studio—no manual model download scripts required:
 
 ```bash
 # Build debug APK
 ./gradlew assembleDebug
 
-# Build signed arm64-v8a release APK (~73 MB)
+# Build signed arm64-v8a release APK
 ./gradlew assembleRelease
 ```
 
-On first launch, OpenFlow enables `Voz` (required speech recognition) and `Ear` (auto language detection) by default (`359 MB`), and lets you optionally enable `Clear` (noise suppression) and `Uhm` (filler word removal).
-
 ## 🛠️ Built With
 - **Powered by [Desert Ant Labs](https://desertant.com)** (`Voz`, `Ear`, `Clear`, `Uhm` v4.0.0 on LiteRT)
-- Android Jetpack Compose & Material 3
-- Kotlin Coroutines
+- Android Jetpack Compose & Material Design 3
+- Kotlin Coroutines & Room
 
 ## 📜 License & Attribution
 - **OpenFlow Source Code:** Licensed under the **Apache License, Version 2.0** (`Apache-2.0`). See [`LICENSE`](LICENSE) for full terms.
 - **Desert Ant Labs SDKs & Model Weights:** Provided under the [Desert Ant Labs Source-Available License v1.0](https://license.desertant.com/1.0). Free for personal, academic, and commercial products up to **100,000 Monthly Active Users / Devices (MAU/MAD)** per model, per platform (`Voz`, `Ear`, `Clear`, `Uhm`). Commercial deployments exceeding 100K MAU/MAD require a commercial license from Desert Ant Labs.
+
+---
+Developed by [@ultrapg](https://github.com/ultrapg)

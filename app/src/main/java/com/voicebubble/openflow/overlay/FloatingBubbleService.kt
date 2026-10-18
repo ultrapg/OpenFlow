@@ -670,9 +670,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     }
                 }
 
-                processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.SUCCESS
                 delay(1200)
+                processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.IDLE
             } catch (t: Throwable) {
                 t.printStackTrace()

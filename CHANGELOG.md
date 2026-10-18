@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.4] - 2026-10-18
+
+### Fixed
+- **Centered Checkmark Fade-In & Content Alignment During Bubble Morphing (`BubbleOverlayComponent`, `FloatingBubbleService`):**
+  - Removed the nested `SizeTransform` on `AnimatedContent` and set `contentAlignment = Alignment.Center` + `Modifier.fillMaxSize()` so `AnimatedContent` no longer lags behind the outer `Surface` width animation and pulls the completion checkmark (`Icons.Rounded.Check`) to the left while shrinking into a circle.
+  - Replaced scale/size transitions inside `AnimatedContent` with a centered crossfade (`fadeIn` / `fadeOut` with `SizeTransform = null`) and preserved `processingProgress` until returning to `IDLE` so the green checkmark fades in directly in the center of the bubble.
+- **GitHub `README.md` Formatting & Installation Guide:**
+  - Cleaned up `README.md` formatting for GitHub (removed raw LaTeX math tags, added direct APK installation instructions linking to GitHub Releases alongside source build instructions, and updated floating bubble documentation).
+
 ## [2.3.3] - 2026-10-18
 
 ### Changed

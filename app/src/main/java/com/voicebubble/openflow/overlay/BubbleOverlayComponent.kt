@@ -17,7 +17,6 @@
 package com.voicebubble.openflow.overlay
 
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
@@ -27,8 +26,6 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -274,21 +271,14 @@ fun BubbleOverlayComponent(
             ) {
                 AnimatedContent(
                     targetState = bubbleState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
                     transitionSpec = {
-                        (scaleIn(
-                            initialScale = 0.85f,
-                            animationSpec = spring(
-                                dampingRatio = Spring.DampingRatioNoBouncy,
-                                stiffness = Spring.StiffnessMedium
-                            )
-                        ) + fadeIn(animationSpec = tween(120)))
+                        fadeIn(animationSpec = tween(durationMillis = 160, easing = FastOutSlowInEasing))
                             .togetherWith(
-                                scaleOut(
-                                    targetScale = 0.85f,
-                                    animationSpec = tween(100, easing = FastOutSlowInEasing)
-                                ) + fadeOut(animationSpec = tween(100))
+                                fadeOut(animationSpec = tween(durationMillis = 100, easing = FastOutSlowInEasing))
                             )
-                            .using(SizeTransform(clip = false))
+                            .using(null)
                     },
                     label = "m3BubbleStateContent"
                 ) { state ->
@@ -324,9 +314,7 @@ fun BubbleOverlayComponent(
 
                         OverlayBubbleState.PROCESSING -> {
                             Row(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(horizontal = 12.dp),
+                                modifier = Modifier.fillMaxSize(),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.Center
                             ) {
@@ -405,9 +393,7 @@ fun RecordingBarsComponent(
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 12.dp)
+        modifier = Modifier.fillMaxSize()
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
