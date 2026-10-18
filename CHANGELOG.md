@@ -2,6 +2,13 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.3] - 2026-10-18
+
+### Changed
+- **Green Success Confirmation & Exact-Fit Stage Pill Width (`BubbleOverlayComponent`):**
+  - Restored the dedicated Material Green (`#00C853`) bubble surface with a crisp white checkmark icon for `OverlayBubbleState.SUCCESS` instead of Material You `tertiaryContainer` (which could render pink depending on wallpaper palette).
+  - Replaced estimated character-count width calculation with exact `rememberTextMeasurer()` pixel measurement (`measuredTextWidthDp + 45.dp`) so the expanding pill during `Ear`, `Clear`, `Uhm`, and `Voz` stages is only as wide as the spinner and text require with snug `12.dp` horizontal padding.
+
 ## [2.3.2] - 2026-10-18
 
 ### Changed

@@ -67,7 +67,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.coerceAtLeast
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.speech.PipelinePhase
@@ -107,13 +110,29 @@ fun BubbleOverlayComponent(
     val isPressed by interactionSource.collectIsPressedAsState()
     var isDragging by remember { mutableStateOf(false) }
 
-    // Clean Material Design 3 width morphing: expands smoothly to fit full stage text or recording controls
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val labelStyle = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium)
+    val measuredTextWidthDp = remember(processingProgress, labelStyle, density) {
+        if (processingProgress.isEmpty()) {
+            0.dp
+        } else {
+            val widthPx = textMeasurer.measure(
+                text = processingProgress,
+                style = labelStyle,
+                maxLines = 1,
+                softWrap = false
+            ).size.width
+            with(density) { widthPx.toDp() }
+        }
+    }
+
+    // Exact width morphing: only as wide as needed for the spinner + stage text with 12.dp side padding
     val targetWidth = when (bubbleState) {
-        OverlayBubbleState.RECORDING -> (bubbleSize + 36f).dp
+        OverlayBubbleState.RECORDING -> (bubbleSize + 32f).dp
         OverlayBubbleState.PROCESSING -> {
             if (processingProgress.isNotEmpty()) {
-                val estimatedTextWidth = (processingProgress.length * 7.2f).coerceAtLeast(64f)
-                (bubbleSize + 20f + estimatedTextWidth).dp
+                (measuredTextWidthDp + 45.dp).coerceAtLeast(bubbleSize.dp)
             } else {
                 bubbleSize.dp
             }
@@ -179,13 +198,13 @@ fun BubbleOverlayComponent(
         label = "m3BubbleElevation"
     )
 
-    // Clean Material Design 3 tonal color scheme (no outlines, no glossy gradients)
+    // Clean Material Design 3 tonal color scheme with dedicated green confirmation for SUCCESS
     val containerColor by animateColorAsState(
         targetValue = when (bubbleState) {
             OverlayBubbleState.IDLE -> colorScheme.primaryContainer
             OverlayBubbleState.RECORDING -> colorScheme.errorContainer
             OverlayBubbleState.PROCESSING -> colorScheme.secondaryContainer
-            OverlayBubbleState.SUCCESS -> colorScheme.tertiaryContainer
+            OverlayBubbleState.SUCCESS -> Color(0xFF00C853)
         },
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "m3ContainerColor"
@@ -196,7 +215,7 @@ fun BubbleOverlayComponent(
             OverlayBubbleState.IDLE -> colorScheme.onPrimaryContainer
             OverlayBubbleState.RECORDING -> colorScheme.onErrorContainer
             OverlayBubbleState.PROCESSING -> colorScheme.onSecondaryContainer
-            OverlayBubbleState.SUCCESS -> colorScheme.onTertiaryContainer
+            OverlayBubbleState.SUCCESS -> Color.White
         },
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "m3ContentColor"
@@ -307,7 +326,7 @@ fun BubbleOverlayComponent(
                             Row(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(horizontal = 14.dp),
+                                    .padding(horizontal = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.Center
                             ) {
@@ -315,16 +334,15 @@ fun BubbleOverlayComponent(
                                     color = contentColor,
                                     strokeWidth = 2.2.dp,
                                     modifier = Modifier.size(
-                                        if (processingProgress.isNotEmpty()) 16.dp else (bubbleSize * 0.44f).dp
+                                        if (processingProgress.isNotEmpty()) 15.dp else (bubbleSize * 0.44f).dp
                                     )
                                 )
                                 if (processingProgress.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
                                     Text(
                                         text = processingProgress,
                                         color = contentColor,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Medium,
+                                        style = labelStyle,
                                         maxLines = 1,
                                         softWrap = false
                                     )
