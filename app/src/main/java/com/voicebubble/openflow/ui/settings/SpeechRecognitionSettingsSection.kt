@@ -444,7 +444,7 @@ fun SpeechRecognitionSettingsSection(
 
                 // Voz (Locked ON)
                 ModelToggleItem(
-                    title = "Voz — Speech Recognition (337 MB)",
+                    title = "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB)",
                     subtitle = "Required • Core transcription across 25 European languages",
                     loadState = pipelineStatus.modelStates[DesertAntModel.VOZ],
                     checked = true,
@@ -460,7 +460,7 @@ fun SpeechRecognitionSettingsSection(
 
                 // Ear
                 ModelToggleItem(
-                    title = "Ear — Auto Language Detection (22 MB)",
+                    title = "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)",
                     subtitle = DesertAntModel.EAR.roleSummary,
                     loadState = pipelineStatus.modelStates[DesertAntModel.EAR],
                     checked = settings.earEnabled || DesertAntModel.EAR in downloadState.pendingAutoEnableModels,
@@ -476,7 +476,7 @@ fun SpeechRecognitionSettingsSection(
 
                 // Clear
                 ModelToggleItem(
-                    title = "Clear — Noise Suppression (24 MB)",
+                    title = "Clear — Noise Suppression (${DesertAntModel.CLEAR.sizeMb} MB)",
                     subtitle = DesertAntModel.CLEAR.roleSummary,
                     loadState = pipelineStatus.modelStates[DesertAntModel.CLEAR],
                     checked = settings.clearEnabled || DesertAntModel.CLEAR in downloadState.pendingAutoEnableModels,
@@ -492,7 +492,7 @@ fun SpeechRecognitionSettingsSection(
 
                 // Uhm
                 ModelToggleItem(
-                    title = "Uhm — Filler Word Removal (24 MB)",
+                    title = "Uhm — Filler Word Removal (${DesertAntModel.UHM.sizeMb} MB)",
                     subtitle = DesertAntModel.UHM.roleSummary,
                     loadState = pipelineStatus.modelStates[DesertAntModel.UHM],
                     checked = settings.uhmEnabled || DesertAntModel.UHM in downloadState.pendingAutoEnableModels,

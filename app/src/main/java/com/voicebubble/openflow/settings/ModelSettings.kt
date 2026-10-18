@@ -61,32 +61,32 @@ enum class DesertAntModel(
         id = "voz",
         displayName = "Voz — Speech Recognition",
         roleSummary = "Required • Core transcription across 25 European languages",
-        sizeMb = 337,
-        expectedBytes = 337L * 1024L * 1024L,
+        sizeMb = 1187,
+        expectedBytes = 1_244_258_225L,
         isRequired = true
     ),
     EAR(
         id = "ear",
         displayName = "Ear — Auto Language Detection",
         roleSummary = "Automatically detects spoken language before transcription",
-        sizeMb = 22,
-        expectedBytes = 22L * 1024L * 1024L,
+        sizeMb = 10,
+        expectedBytes = 10_738_698L,
         isRequired = false
     ),
     CLEAR(
         id = "clear",
         displayName = "Clear — Noise Suppression (clear-studio)",
         roleSummary = "Removes background noise and room reverb before transcription",
-        sizeMb = 24,
-        expectedBytes = 24L * 1024L * 1024L,
+        sizeMb = 47,
+        expectedBytes = 49_285_108L,
         isRequired = false
     ),
     UHM(
         id = "uhm",
         displayName = "Uhm — Filler Word Removal",
         roleSummary = "Trained primarily on English hesitations ('uh', 'um', 'hmm'); transfers acoustically to German, Dutch, French, and Spanish",
-        sizeMb = 24,
-        expectedBytes = 23_919_472L,
+        sizeMb = 23,
+        expectedBytes = 23_919_709L,
         isRequired = false
     );
 }
@@ -149,7 +149,7 @@ data class ModelSettings(
     val vozEnabled: Boolean = true
 
     /**
-     * Active disk footprint in MB based on currently enabled models (Section 5.4).
+     * Active disk footprint in MB based on currently enabled models.
      */
     val activeDiskFootprintMb: Int
         get() = DesertAntModel.VOZ.sizeMb +
@@ -158,18 +158,22 @@ data class ModelSettings(
             (if (uhmEnabled) DesertAntModel.UHM.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB matching the 8-state Toggle State Matrix (Section 5.4).
+     * Estimated peak RAM in MB based on actual loaded LiteRT model weights + runtime buffers:
+     * - Base (`Voz` 1,187 MB weights + ~213 MB app & LiteRT runtime): 1,400 MB
+     * - `Ear` (10 MB weights + runtime buffers): +50 MB
+     * - `Clear` (47 MB weights + streaming conformer/FFT state buffers): +150 MB
+     * - `Uhm` (23 MB weights + frame buffers): +80 MB
      */
     val estimatedPeakRamMb: Int
         get() = when {
-            earEnabled && clearEnabled && uhmEnabled -> 850
-            earEnabled && !clearEnabled && uhmEnabled -> 750
-            earEnabled && clearEnabled && !uhmEnabled -> 730
-            earEnabled && !clearEnabled && !uhmEnabled -> 650
-            !earEnabled && clearEnabled && uhmEnabled -> 770
-            !earEnabled && !clearEnabled && uhmEnabled -> 670
-            !earEnabled && clearEnabled && !uhmEnabled -> 650
-            else -> 550
+            earEnabled && clearEnabled && uhmEnabled -> 1680
+            earEnabled && !clearEnabled && uhmEnabled -> 1530
+            earEnabled && clearEnabled && !uhmEnabled -> 1600
+            earEnabled && !clearEnabled && !uhmEnabled -> 1450
+            !earEnabled && clearEnabled && uhmEnabled -> 1630
+            !earEnabled && !clearEnabled && uhmEnabled -> 1480
+            !earEnabled && clearEnabled && !uhmEnabled -> 1550
+            else -> 1400
         }
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {

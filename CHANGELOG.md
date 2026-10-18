@@ -2,6 +2,13 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.5] - 2026-10-18
+
+### Fixed
+- **Accurate Storage & RAM Consumption Figures (`ModelSettings`, `OnboardingScreen`, `SpeechRecognitionSettingsSection`, `README.md`):**
+  - Updated `DesertAntModel` storage sizes (`sizeMb` and `expectedBytes`) to match the exact on-disk LiteRT v4.0.0 model artifacts: **`Voz` (`1,187 MB` / `1,244,258,225 B`)**, **`Ear` (`10 MB` / `10,738,698 B`)**, **`Clear` (`47 MB` / `49,285,108 B`)**, and **`Uhm` (`23 MB` / `23,919,709 B`)** — yielding `1,197 MB` for the default `Voz + Ear` configuration and `1,267 MB` with all 4 models enabled.
+  - Updated `estimatedPeakRamMb` across all 8 model combinations (`1,400 MB` for `Voz` only, `1,450 MB` for default `Voz + Ear`, up to `1,680 MB` with all 4 models enabled) to reflect actual loaded LiteRT model weights and runtime buffers.
+
 ## [2.3.4] - 2026-10-18
 
 ### Fixed

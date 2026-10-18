@@ -211,7 +211,7 @@ fun OnboardingScreen(
 
                         // Voz (Locked ON)
                         OnboardingModelRow(
-                            title = "Voz — Speech Recognition (337 MB, Required)",
+                            title = "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB, Required)",
                             subtitle = DesertAntModel.VOZ.roleSummary,
                             checked = true,
                             enabled = false,
@@ -223,7 +223,7 @@ fun OnboardingScreen(
 
                         // Ear
                         OnboardingModelRow(
-                            title = "Ear — Auto Language Detection (22 MB)",
+                            title = "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)",
                             subtitle = DesertAntModel.EAR.roleSummary,
                             checked = earSelected,
                             enabled = true,
@@ -235,7 +235,7 @@ fun OnboardingScreen(
 
                         // Clear
                         OnboardingModelRow(
-                            title = "Clear — Noise Suppression (24 MB)",
+                            title = "Clear — Noise Suppression (${DesertAntModel.CLEAR.sizeMb} MB)",
                             subtitle = DesertAntModel.CLEAR.roleSummary,
                             checked = clearSelected,
                             enabled = true,
@@ -247,7 +247,7 @@ fun OnboardingScreen(
 
                         // Uhm
                         OnboardingModelRow(
-                            title = "Uhm — Filler Word Removal (24 MB)",
+                            title = "Uhm — Filler Word Removal (${DesertAntModel.UHM.sizeMb} MB)",
                             subtitle = DesertAntModel.UHM.roleSummary,
                             checked = uhmSelected,
                             enabled = true,

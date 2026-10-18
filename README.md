@@ -6,10 +6,10 @@ Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) 
 
 - **100% On-Device Audio AI Pipeline:** All audio inference runs locally on your smartphone via **LiteRT** with selectable **Hardware Acceleration (`Auto`, `NPU`, `GPU (OpenCL)`, or `CPU (XNNPACK)`)**. Your voice recordings never leave your device.
 - **4-Stage Desert Ant Labs Audio Ecosystem:**
-  - **`Voz` (337 MB — Enabled by Default):** High-accuracy multilingual transcription across 25 European languages with automatic punctuation, capitalization, word-level timestamps (`80 ms` resolution), and custom vocabulary biasing.
-  - **`Ear` (22 MB — Enabled by Default):** Spoken language identification (107 languages) that automatically routes dictation across supported European languages or falls back to your preferred language.
-  - **`Clear` (`clear-studio`, 24 MB — Optional):** Neural speech enhancement and denoising for noisy environments.
-  - **`Uhm` (24 MB — Optional):** Temporal acoustic filler detector (`20 ms` frame resolution) that strips hesitations (`uh`, `um`, `hmm`) by cross-referencing `Voz` word timestamps without deleting legitimate words.
+  - **`Voz` (1,187 MB — Enabled by Default):** High-accuracy multilingual transcription across 25 European languages with automatic punctuation, capitalization, word-level timestamps (`80 ms` resolution), and custom vocabulary biasing.
+  - **`Ear` (10 MB — Enabled by Default):** Spoken language identification (107 languages) that automatically routes dictation across supported European languages or falls back to your preferred language.
+  - **`Clear` (`clear-studio`, 47 MB — Optional):** Neural speech enhancement and denoising for noisy environments.
+  - **`Uhm` (23 MB — Optional):** Temporal acoustic filler detector (`20 ms` frame resolution) that strips hesitations (`uh`, `um`, `hmm`) by cross-referencing `Voz` word timestamps without deleting legitimate words.
 - **Fast Inference & Live Model Load Telemetry:**
   - **Pre-Warmed LiteRT Sessions:** Models are loaded and pre-warmed in background RAM on launch so dictation begins with zero compilation delay.
   - **Real-Time Model Status:** Live indicators in Settings, on the Floating Bubble, and in the status-bar notification show whether each model (`Voz`, `Ear`, `Clear`, `Uhm`) is **Loaded in RAM**, **Loading**, **Running Inference**, or on **Standby**, along with last dictation latency and real-time speedup (`× real-time`).
@@ -26,7 +26,7 @@ Welcome to **OpenFlow**, an offline-capable, high-accuracy Speech-to-Text (STT) 
 ### Download APK (Recommended)
 Download the latest signed `openflow-release.apk` directly from [**GitHub Releases**](https://github.com/ultrapg/OpenFlow/releases/latest) (or from [`release/openflow-release.apk`](release/openflow-release.apk)) and install it on your Android device (`arm64-v8a`, Android 8.0+).
 
-On first launch, OpenFlow enables **`Voz`** (speech recognition) and **`Ear`** (auto language detection) by default (`359 MB` total), and lets you optionally enable **`Clear`** (noise suppression) and **`Uhm`** (filler word removal) anytime in Settings.
+On first launch, OpenFlow enables **`Voz`** (speech recognition) and **`Ear`** (auto language detection) by default (`1,197 MB` total), and lets you optionally enable **`Clear`** (noise suppression) and **`Uhm`** (filler word removal) anytime in Settings.
 
 ### Build from Source
 Clone the repository and build directly with Gradle or Android Studio—no manual model download scripts required:

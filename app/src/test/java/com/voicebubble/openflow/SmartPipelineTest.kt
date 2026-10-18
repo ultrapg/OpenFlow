@@ -142,37 +142,45 @@ class SmartPipelineTest {
 
     @Test
     fun `ModelSettings toggle state matrix matches Specification Section 5_4`() {
-        assertEquals(850, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = true).estimatedPeakRamMb)
-        assertEquals(407, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = true).activeDiskFootprintMb)
+        assertEquals(1680, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = true).estimatedPeakRamMb)
+        assertEquals(1267, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = true).activeDiskFootprintMb)
 
-        assertEquals(750, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = true).estimatedPeakRamMb)
-        assertEquals(383, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = true).activeDiskFootprintMb)
+        assertEquals(1530, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = true).estimatedPeakRamMb)
+        assertEquals(1220, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = true).activeDiskFootprintMb)
 
-        assertEquals(730, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = false).estimatedPeakRamMb)
-        assertEquals(383, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = false).activeDiskFootprintMb)
+        assertEquals(1600, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = false).estimatedPeakRamMb)
+        assertEquals(1244, ModelSettings(earEnabled = true, clearEnabled = true, uhmEnabled = false).activeDiskFootprintMb)
 
-        assertEquals(650, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = false).estimatedPeakRamMb)
-        assertEquals(359, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = false).activeDiskFootprintMb)
+        assertEquals(1450, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = false).estimatedPeakRamMb)
+        assertEquals(1197, ModelSettings(earEnabled = true, clearEnabled = false, uhmEnabled = false).activeDiskFootprintMb)
 
-        assertEquals(770, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = true).estimatedPeakRamMb)
-        assertEquals(385, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = true).activeDiskFootprintMb)
+        assertEquals(1630, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = true).estimatedPeakRamMb)
+        assertEquals(1257, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = true).activeDiskFootprintMb)
 
-        assertEquals(670, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = true).estimatedPeakRamMb)
-        assertEquals(361, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = true).activeDiskFootprintMb)
+        assertEquals(1480, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = true).estimatedPeakRamMb)
+        assertEquals(1210, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = true).activeDiskFootprintMb)
 
-        assertEquals(650, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = false).estimatedPeakRamMb)
-        assertEquals(361, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = false).activeDiskFootprintMb)
+        assertEquals(1550, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = false).estimatedPeakRamMb)
+        assertEquals(1234, ModelSettings(earEnabled = false, clearEnabled = true, uhmEnabled = false).activeDiskFootprintMb)
 
-        assertEquals(550, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).estimatedPeakRamMb)
-        assertEquals(337, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).activeDiskFootprintMb)
+        assertEquals(1400, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).estimatedPeakRamMb)
+        assertEquals(1187, ModelSettings(earEnabled = false, clearEnabled = false, uhmEnabled = false).activeDiskFootprintMb)
 
         val defaultSettings = ModelSettings()
         assertTrue(defaultSettings.vozEnabled)
         assertTrue(defaultSettings.earEnabled)
         assertFalse(defaultSettings.clearEnabled)
         assertFalse(defaultSettings.uhmEnabled)
-        assertEquals(650, defaultSettings.estimatedPeakRamMb)
-        assertEquals(359, defaultSettings.activeDiskFootprintMb)
+        assertEquals(1450, defaultSettings.estimatedPeakRamMb)
+        assertEquals(1197, defaultSettings.activeDiskFootprintMb)
+
+        for (model in com.voicebubble.openflow.settings.DesertAntModel.entries) {
+            assertEquals(
+                "expectedBytes mismatch for $model",
+                com.voicebubble.openflow.settings.ModelDownloadManager.modelTotalBytes(model),
+                model.expectedBytes
+            )
+        }
 
         assertEquals(25, Voz.supportedLanguages.size)
         assertTrue("de" in Voz.supportedLanguages && "en" in Voz.supportedLanguages)
