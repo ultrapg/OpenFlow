@@ -5,11 +5,27 @@ All notable changes to the **OpenFlow** project are documented in this file.
 ## [2.3.8] - 2026-10-19
 
 ### Added
+- **Qualcomm Hexagon & Universal Mobile NPU Hardware Support (`NpuHardwareManager`, `SmartPipeline`, `SpeechRecognitionSettingsSection`):**
+  - Added SoC and vendor NPU detection and native runtime dispatch configuration (`LITERT_DISPATCH_LIBRARY_DIR`, `ADSP_LIBRARY_PATH`, `CDSP_LIBRARY_PATH`, `QNN_HTP_PERF_MODE`, `DAL_LITERT_THREADS`, `NNAPI_ALLOW_FP16`, etc.) across:
+    - **Qualcomm Hexagon NPU** (QNN HTP / FastRPC CDSP across Hexagon V79 / Snapdragon 8 Elite, V75 / 8 Gen 3, V73 / 8 Gen 2, V69 / 8+ Gen 1, V68 / 888, V66 / 865, and Snapdragon 7-series)
+    - **MediaTek NeuroPilot APU** (Dimensity 9400 / 9300 / 9200 / 9000 / 8300 / 8200, `libneuron_adapter.so`, `libapusys.so`)
+    - **Google Tensor TPU** (Tensor G1–G5, DarwiNN / EdgeTPU runtime)
+    - **Samsung Exynos NPU** (Exynos 2500 / 2400 / 2200 / 2100, ENN / EDEN runtime)
+    - **HiSilicon Kirin NPU** (`libhiai.so`), **Rockchip RKNN** (`librknnrt.so`), and **Android NNAPI** (`libneuralnetworks.so`)
+  - Exposed live detected NPU hardware profile telemetry (`NPU Hardware`) in the Speech Recognition Settings summary card.
 - **Secret Developer Mode & Persistent OOM / Crash / Debug Logger (`DebugLogManager`, `DeveloperModeSection`, `MainActivity`, `OpenFlowApp`, `SmartPipeline`):**
   - Added a version subtitle (`Version 2.3.8`) directly under the **OpenFlow Settings** title. Tapping the version number **5 times fast** secretly unlocks **Developer Mode** (with countdown toast hints on taps 3 and 4).
   - **OOM & Native Crash Detection (`ApplicationExitInfo` + `UncaughtExceptionHandler`):** Inspects Android 11+ `ActivityManager.getHistoricalProcessExitReasons` on startup to capture silent OS Out-Of-Memory kills (`REASON_LOW_MEMORY` / LMKD), native `libLiteRt.so` / OpenCL crashes (`REASON_CRASH_NATIVE` SIGSEGV/SIGABRT), and ANRs alongside last recorded PSS/RSS memory usage, plus uncaught JVM exceptions and `OutOfMemoryError` traces with live heap snapshots.
   - **Persistent Rolling Debug & Memory Telemetry (`debug_log.txt` & `crash_log.txt`):** Logs JVM heap, native heap (`Debug.getNativeHeapAllocatedSize()`), and system available RAM (`ActivityManager.MemoryInfo`) before/after model loads, inference stages (`Clear`, `Ear`, `Uhm`, `Voz`), and `onTrimMemory` callbacks directly to disk so logs survive sudden OOM process termination.
   - **Developer Mode Panel (`DeveloperModeSection`):** Provides live auto-refreshing heap/RAM telemetry, a toggle to enable/pause disk debug logging, filter chips (`All Logs`, `Crash & OOM Only`, `Debug & Memory Only`), an in-app scrollable monospace log viewer, **Copy Logs**, **Share**, **Log RAM Now**, **Clear Logs**, and **Hide Dev Mode** controls.
+
+### Fixed
+- **Core Speech Engine Anti-OOM Stability & Dynamic Model Staging (`SmartPipeline`, `AudioRecordingController`, `Uhm`):**
+  - **Prevented 3× Audio Upsampling in `Clear`:** Explicitly configured `ai.desertant.clear.Options(sampleRate = 16000.0, mastering = Mastering.BYPASS)` so `Clear` never defaults to `48000.0 Hz` and triples downstream JNI/FFI and Conformer tensor allocations.
+  - **JVM + Native + System RAM Pressure Tracking (`MemoryPressureReport`):** Monitors ART JVM heap headroom (`jvmFreeHeadroomMb`), native heap (`Debug.getNativeHeapAllocatedSize()`), and OS `ActivityManager.MemoryInfo` simultaneously, preventing `java.lang.OutOfMemoryError` during `FfiWriter.floats()` serialization even on devices with 8–16 GB of physical RAM.
+  - **Silence-Aware Smart Audio Chunking (`splitAudioIntoSmartChunks`):** Automatically segments long dictations at natural 80 ms speech pauses (`<= 20s` normal, `<= 14s` under tight memory) so Conformer attention tensors and JNI buffers stay bounded regardless of dictation length.
+  - **Dynamic On-Demand Stage Loading & Automatic Low-Memory Retry:** Dynamically loads and releases auxiliary models (`Ear`, `Clear`) between pipeline stages when multiple models are active or memory is tight, and automatically sheds auxiliary sessions, switches to low-memory runtime flags, and splits >10s chunks on retry if `Voz` encounters a native driver error.
+  - **Zero-Fragmentation Audio Recording Buffer (`AudioRecordingController`):** Replaced `MutableList<FloatArray>` chunk lists with a single contiguous primitive `FloatArray` accumulator.
 
 ## [2.3.7] - 2026-10-19
 
