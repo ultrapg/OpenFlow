@@ -444,5 +444,47 @@ class SmartPipelineTest {
         assertTrue(jvmTightOnHighRamPhone.isJvmHeapCritical)
         assertTrue(jvmTightOnHighRamPhone.isAnyMemoryTight)
         assertTrue(jvmTightOnHighRamPhone.isCriticalPressure)
+
+        // Samsung Galaxy S25 (SM-S931B) telemetry: 4647 MB native virtual GPU mapping, 496 MB JVM free, 2161 MB SysRAM free
+        val s25OpenClVirtualMapping = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 2_161L,
+            systemTotalMb = 11_113L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 16L,
+            jvmMaxMb = 512L,
+            jvmFreeHeadroomMb = 496L,
+            nativeAllocatedMb = 4_647L
+        )
+        assertTrue(s25OpenClVirtualMapping.isNativeHeapHigh)
+        assertFalse(s25OpenClVirtualMapping.isJvmHeapTight)
+        assertFalse(s25OpenClVirtualMapping.isSystemRamTight)
+        assertFalse(s25OpenClVirtualMapping.isAnyMemoryTight)
+        assertFalse(s25OpenClVirtualMapping.isCriticalPressure)
+    }
+
+    @Test
+    fun `enhanceAudioInSingleWindowSlices guarantees every slice stays within Clear single-window limit`() {
+        // User's exact crash-log audio length: 64,960 samples (4.06s @ 16 kHz)
+        val input = FloatArray(64_960) { idx -> kotlin.math.sin(idx * 0.02).toFloat() * 0.5f }
+        val observedSliceSizes = mutableListOf<Int>()
+
+        val enhanced = com.voicebubble.openflow.core.speech.enhanceAudioInSingleWindowSlices(
+            samples = input,
+            maxWindowSamples = com.voicebubble.openflow.core.speech.SmartPipeline.MAX_CLEAR_SINGLE_WINDOW_SAMPLES,
+            crossfadeSamples = com.voicebubble.openflow.core.speech.SmartPipeline.CLEAR_WINDOW_CROSSFADE_SAMPLES
+        ) { slice ->
+            observedSliceSizes.add(slice.size)
+            FloatArray(slice.size) { i -> slice[i] * 0.8f }
+        }
+
+        assertEquals(input.size, enhanced.size)
+        assertTrue(observedSliceSizes.size >= 3)
+        assertTrue(
+            "Every slice must be <= 30,400 samples so Clear ParallelRuns.run always sees count == 1",
+            observedSliceSizes.all { it <= com.voicebubble.openflow.core.speech.SmartPipeline.MAX_CLEAR_SINGLE_WINDOW_SAMPLES }
+        )
+        for (i in input.indices) {
+            assertEquals(input[i] * 0.8f, enhanced[i], 1e-5f)
+        }
     }
 }

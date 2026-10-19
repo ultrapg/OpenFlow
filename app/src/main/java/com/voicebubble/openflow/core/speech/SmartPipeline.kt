@@ -108,16 +108,22 @@ data class MemoryPressureReport(
         get() = jvmFreeHeadroomMb < 36L || jvmUsedRatio >= 0.88
 
     val isSystemRamTight: Boolean
-        get() = systemLowMemoryFlag || systemAvailMb < 900L
+        get() = systemLowMemoryFlag || systemAvailMb < 750L
 
     val isSystemRamCritical: Boolean
-        get() = systemLowMemoryFlag || systemAvailMb < 480L
+        get() = systemLowMemoryFlag || systemAvailMb < 450L
 
+    /**
+     * Informational telemetry flag. Note: On 64-bit Qualcomm Snapdragon (Adreno OpenCL / QNN HTP),
+     * `Debug.getNativeHeapAllocatedSize()` includes ~4.6 GB of virtual GPU/DSP address space mappings
+     * even when actual RSS is ~1.8 GB and >2 GB of physical RAM is free, so this must not trigger
+     * mid-pipeline native session teardowns.
+     */
     val isNativeHeapHigh: Boolean
         get() = nativeAllocatedMb > 1_350L
 
     val isAnyMemoryTight: Boolean
-        get() = isJvmHeapTight || isSystemRamTight || isNativeHeapHigh
+        get() = isJvmHeapTight || isSystemRamTight
 
     val isCriticalPressure: Boolean
         get() = isJvmHeapCritical || isSystemRamCritical
@@ -160,15 +166,16 @@ data class PipelineStatus(
  * 4. Temporal Filler Subtraction & Text Normalization
  *
  * Stability, OOM Prevention & NPU Hardware Acceleration Guarantees:
- * - **JVM + Native + System RAM Awareness**: Monitors ART JVM heap headroom (`jvmFreeHeadroomMb`)
- *   alongside `ActivityManager.MemoryInfo` and `Debug.getNativeHeapAllocatedSize()`, preventing
- *   `java.lang.OutOfMemoryError` during JNI/FFI array serialization even on 8–16 GB RAM devices.
+ * - **JVM + System RAM Awareness**: Monitors ART JVM heap headroom (`jvmFreeHeadroomMb`)
+ *   alongside `ActivityManager.MemoryInfo`, preventing `java.lang.OutOfMemoryError` during
+ *   JNI/FFI array serialization even on 8–16 GB RAM devices.
+ * - **Single-Window Sequential `Clear` Execution**: Feeds `Clear` in bounded `<= 1.90s` (`30,400`
+ *   sample) windows with 20 ms crossfades so `libClearAndroid.so` (`200`-frame STFT window) always
+ *   executes with `count = 1` on a single session instead of spawning 2 concurrent OpenCL `TaskGroup`
+ *   threads that collide on Adreno/LiteRT GPU contexts.
  * - **Silence-Aware Smart Audio Chunking**: Automatically splits long dictations (> 20s normal /
  *   > 14s tight memory) at natural speech pauses so Conformer encoder attention tensors and FFI
  *   buffers stay strictly bounded regardless of dictation length.
- * - **Dynamic On-Demand Stage Loading**: Keeps `Voz` hot for instant response while dynamically
- *   loading/unloading auxiliary models (`Clear`, `Ear`, `Uhm`) between stages when multiple models
- *   are active or memory pressure rises, eliminating OpenCL/QNN context collisions.
  * - **Qualcomm Hexagon & Universal Mobile NPU Support**: Configures QNN HTP / FastRPC CDSP,
  *   MediaTek NeuroPilot APU, Google Tensor TPU, Samsung Exynos ENN, HiSilicon Kirin HiAI, and NNAPI
  *   via [NpuHardwareManager].
@@ -195,6 +202,12 @@ class SmartPipeline(
         const val LOW_MEM_MIN_CHUNK_SAMPLES: Int = 8 * 16_000  // 8.0s @ 16 kHz
         private const val MAX_EAR_WINDOW_SAMPLES: Int = 88_000 // 5.5s @ 16 kHz
 
+        // Native libClearAndroid.so uses a 200-frame (2.00s) STFT window and spawns 2 concurrent
+        // OpenCL threads when numFrames > 200. Slicing at 30,400 samples (1.90s = 192 STFT frames)
+        // guarantees count == 1 inside ParallelRuns.run, eliminating multi-threaded OpenCL SIGSEGVs.
+        const val MAX_CLEAR_SINGLE_WINDOW_SAMPLES: Int = 30_400 // 1.90s @ 16 kHz
+        const val CLEAR_WINDOW_CROSSFADE_SAMPLES: Int = 320     // 20 ms @ 16 kHz
+
         @Volatile
         private var sharedInstance: SmartPipeline? = null
 
@@ -217,6 +230,7 @@ class SmartPipeline(
         private set
 
     private var appliedAccelerator: HardwareAccelerator? = null
+    private var appliedSettingsSnapshot: ModelSettings? = null
     private var activeAcceleratorDescription: String =
         NpuHardwareManager.configureNativeRuntime(appContext, initialSettings.hardwareAccelerator, false)
 
@@ -299,6 +313,7 @@ class SmartPipeline(
 
             val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
             ensureAuxiliaryModelsLocked(currentSettings, warmUp = warmUp && !memReport.isAnyMemoryTight)
+            appliedSettingsSnapshot = currentSettings
             resetIdleEvictionTimerLocked()
 
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
@@ -363,6 +378,22 @@ class SmartPipeline(
         pipelineMutex.withLock {
             val snapshot = settings
             val accelChanged = appliedAccelerator != null && appliedAccelerator != snapshot.hardwareAccelerator
+            if (!accelChanged &&
+                appliedSettingsSnapshot == snapshot &&
+                voz != null &&
+                areEnabledModelsReadyOrStandbyLocked(snapshot)
+            ) {
+                val count = countLoadedModelsLocked(snapshot)
+                val msg = "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                updateStatusSnapshot(
+                    activeSettings = snapshot,
+                    phaseOverride = PipelinePhase.READY,
+                    messageOverride = msg
+                )
+                resetIdleEvictionTimerLocked()
+                return@withLock
+            }
+
             val memReport = evaluateMemoryPressure()
             applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
 
@@ -392,6 +423,7 @@ class SmartPipeline(
 
             val vozOk = ensureVozLocked(snapshot, warmUp = true)
             ensureAuxiliaryModelsLocked(snapshot, warmUp = !memReport.isAnyMemoryTight)
+            appliedSettingsSnapshot = snapshot
             resetIdleEvictionTimerLocked()
 
             val phase = if (vozOk) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
@@ -416,8 +448,9 @@ class SmartPipeline(
      * Key Stability & Anti-OOM Mechanisms:
      * 1. Trims leading/trailing dead air before touching any native buffers.
      * 2. Runs `Ear` language identification once on a short `<= 5.5s` speech slice.
-     * 3. Dynamically stages auxiliary models (`Ear`, `Clear`) so they do not hold overlapping
-     *    OpenCL/QNN/native buffers while `Voz`'s 1.2 GB Conformer runs under tight memory.
+     * 3. Runs `Clear` in single-window (`<= 1.90s` / `30,400` sample) sequential slices with
+     *    20 ms crossfades so `libClearAndroid.so` never spawns 2 concurrent OpenCL `TaskGroup`
+     *    threads on the same GPU.
      * 4. Splits long recordings at natural silence valleys into bounded chunks (`<= 20s` normal,
      *    `<= 14s` low memory) so `Clear`, `Uhm`, and `Voz` never exceed JVM or native RAM limits.
      */
@@ -467,7 +500,7 @@ class SmartPipeline(
                 DebugLogManager.logInfo(
                     TAG,
                     "transcribe() start • raw=${samples.size}, trimmed=${trimmedSamples.size} (${audioDurationMs}ms), " +
-                        "chunks=${audioChunks.size}, dynamicStaging=$dynamicStageRelease, " +
+                        "chunks=${audioChunks.size}, criticalStaging=$dynamicStageRelease, " +
                         "jvmFree=${initialMem.jvmFreeHeadroomMb}MB, sysAvail=${initialMem.systemAvailMb}MB",
                     includeMemory = true
                 )
@@ -485,7 +518,7 @@ class SmartPipeline(
                     onStageProgress = onStageProgress
                 )
                 if (dynamicStageRelease && ear != null) {
-                    DebugLogManager.logInfo(TAG, "Dynamic staging: releasing Ear session before heavy stages")
+                    DebugLogManager.logInfo(TAG, "Critical memory staging: releasing Ear session before heavy stages")
                     closeEarLocked()
                 }
 
@@ -508,7 +541,7 @@ class SmartPipeline(
                     )
 
                     if (dynamicStageRelease && clear != null) {
-                        DebugLogManager.logInfo(TAG, "Dynamic staging: releasing Clear session before Voz$chunkSuffix")
+                        DebugLogManager.logInfo(TAG, "Critical memory staging: releasing Clear session before Voz$chunkSuffix")
                         closeClearLocked()
                     }
 
@@ -554,9 +587,9 @@ class SmartPipeline(
                     capitalizeLeadingWord = false
                 )
 
-                // Re-attach auxiliary models in ready state if memory is plentiful
+                // Re-attach auxiliary models in ready state if memory is healthy
                 val postMem = evaluateMemoryPressure()
-                if (!postMem.isAnyMemoryTight) {
+                if (!postMem.isCriticalPressure) {
                     ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
                 }
 
@@ -698,17 +731,12 @@ class SmartPipeline(
     }
 
     private fun shouldStageAuxiliaryModelsDynamically(
-        activeSettings: ModelSettings,
+        @Suppress("UNUSED_PARAMETER") activeSettings: ModelSettings,
         mem: MemoryPressureReport
     ): Boolean {
-        // Stage auxiliary models (Clear / Ear) on-demand whenever:
-        // 1. Both Clear and Ear are enabled alongside Voz (3 native LiteRT models), OR
-        // 2. Clear is enabled on GPU/NPU (avoids shared OpenCL/QNN buffer contention with Voz), OR
-        // 3. JVM heap, Native heap, or System RAM shows any tightness.
-        if (mem.isAnyMemoryTight) return true
-        if (activeSettings.clearEnabled && activeSettings.earEnabled) return true
-        if (activeSettings.clearEnabled && activeSettings.hardwareAccelerator != HardwareAccelerator.CPU) return true
-        return false
+        // Never destroy/recreate LiteRT/EGL environments mid-pipeline during normal operation;
+        // only release auxiliary sessions mid-transcription if the OS or JVM heap is in critical distress.
+        return mem.isCriticalPressure
     }
 
     /**
@@ -726,6 +754,21 @@ class SmartPipeline(
 
     private fun areEnabledModelsReadyOrStandbyLocked(activeSettings: ModelSettings): Boolean {
         if (voz == null) return false
+        val critical = evaluateMemoryPressure().isCriticalPressure
+        if (!critical) {
+            if (activeSettings.earEnabled &&
+                DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR) &&
+                ear == null
+            ) {
+                return false
+            }
+            if (activeSettings.clearEnabled &&
+                DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR) &&
+                clear == null
+            ) {
+                return false
+            }
+        }
         if (activeSettings.uhmEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM) &&
             uhm == null
@@ -771,20 +814,32 @@ class SmartPipeline(
         return try {
             setModelActiveStatusLocked(activeSettings, DesertAntModel.CLEAR, "Enhancing audio with Clear$stageSuffix...")
             onStageProgress?.invoke("Clear$stageSuffix")
-            // Explicitly set sampleRate = 16000.0 and Mastering.BYPASS so Clear never upsamples output to 48 kHz
+            DebugLogManager.logMemorySnapshot("Before Clear.enhance$stageSuffix (${rawSamples.size} samples)")
+
+            // Explicitly set sampleRate = 16000.0 and Mastering.BYPASS so Clear never upsamples output to 48 kHz.
+            // Feed Clear in sequential <= 1.90s (30,400 sample) windows with 20ms crossfade so native
+            // libClearAndroid.so (which uses 200-frame / 2.00s STFT windows) always sees count == 1
+            // and never spawns 2 concurrent Swift TaskGroup OpenCL threads on the same GPU.
             val options = ai.desertant.clear.Options(
                 strength = 1.0,
                 mastering = Mastering.BYPASS,
                 sampleRate = SAMPLE_RATE_HZ,
                 channelMode = ChannelMode.MONO
             )
-            val result = clearInstance.enhance(
+            val enhanced = enhanceAudioInSingleWindowSlices(
                 samples = rawSamples,
-                sampleRate = SAMPLE_RATE_HZ,
-                options = options
-            )
+                maxWindowSamples = MAX_CLEAR_SINGLE_WINDOW_SAMPLES,
+                crossfadeSamples = CLEAR_WINDOW_CROSSFADE_SAMPLES
+            ) { slice ->
+                ensureMemoryHeadroomForFfiLocked(slice.size)
+                clearInstance.enhance(
+                    samples = slice,
+                    sampleRate = SAMPLE_RATE_HZ,
+                    options = options
+                ).samples
+            }
             clearWarmedUp = true
-            val enhanced = result.samples
+            DebugLogManager.logMemorySnapshot("After Clear.enhance$stageSuffix (${enhanced.size} samples)")
             if (enhanced.isNotEmpty()) enhanced else rawSamples
         } catch (t: Throwable) {
             Log.w(TAG, "Clear enhancement failed, falling back to raw PCM audio: ${t.message}")
@@ -1027,12 +1082,11 @@ class SmartPipeline(
 
     private suspend fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings, warmUp: Boolean) {
         val mem = evaluateMemoryPressure()
-        val dynamicStaging = shouldStageAuxiliaryModelsDynamically(activeSettings, mem)
 
-        if (mem.isAnyMemoryTight) {
+        if (mem.isCriticalPressure) {
             DebugLogManager.logInfo(
                 TAG,
-                "Memory-aware dynamic loading active (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB, native=${mem.nativeAllocatedMb}MB); auxiliary models will stage on-demand"
+                "Critical memory pressure detected (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB); auxiliary models will stage on-demand"
             )
         }
 
@@ -1057,7 +1111,7 @@ class SmartPipeline(
                 }
             }
             val currentEar = ear
-            if (warmUp && currentEar != null && !earWarmedUp && !mem.isAnyMemoryTight) {
+            if (warmUp && currentEar != null && !earWarmedUp && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -1081,9 +1135,10 @@ class SmartPipeline(
             closeEarLocked()
         }
 
-        // 2. Clear — only keep co-resident in idle RAM if not under dynamic staging / tight memory
+        // 2. Clear — pre-load and warm up alongside Voz so OpenCL/LiteRT contexts are compiled once
+        // on the background thread rather than mid-dictation
         if (activeSettings.clearEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
-            if (clear == null && !mem.isAnyMemoryTight) {
+            if (clear == null && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -1102,7 +1157,7 @@ class SmartPipeline(
                 }
             }
             val currentClear = clear
-            if (warmUp && currentClear != null && !clearWarmedUp && !dynamicStaging) {
+            if (warmUp && currentClear != null && !clearWarmedUp && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -1122,6 +1177,7 @@ class SmartPipeline(
                         )
                     )
                     clearWarmedUp = true
+                    DebugLogManager.logInfo(TAG, "Clear accelerator warm-up complete", includeMemory = true)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Clear warm-up deferred: ${t.message}")
                     DebugLogManager.logWarn(TAG, "Clear warm-up deferred", t)
@@ -1311,6 +1367,83 @@ class SmartPipeline(
             }
         }
     }
+}
+
+/**
+ * Feeds `Clear` audio enhancement in sequential single-window slices of at most [maxWindowSamples]
+ * (`30,400` samples = `1.90s` @ 16 kHz = `192` STFT frames `<= 200`) with a smooth linear crossfade
+ * of [crossfadeSamples] (`320` samples = `20 ms`).
+ *
+ * Root-cause rationale (verified from `libClearAndroid.so` at `0x499790` & `0x4a04ec..0x4a06ac`):
+ * `Clear.enhance` internally divides input audio into `200`-frame (`2.00s`) STFT windows and calls
+ * `Inference.ParallelRuns.run(count: numWindows, sessions: [session0, session1])`. Whenever
+ * `numWindows >= 2` (audio `> 1.97s`), `ParallelRuns.run` spawns 2 concurrent Swift `TaskGroup`
+ * threads that call `eglMakeCurrent` + `LiteRtRunCompiledModel` simultaneously on the Adreno OpenCL
+ * driver, causing `SIGSEGV (status=11)` when `Voz` also holds an OpenCL context.
+ * Slicing at `<= 30,400` samples guarantees `numWindows == 1` on every native call so `Clear`
+ * executes strictly sequentially on a single thread (`session0`) with tiny FFI buffers.
+ */
+inline fun enhanceAudioInSingleWindowSlices(
+    samples: FloatArray,
+    maxWindowSamples: Int = SmartPipeline.MAX_CLEAR_SINGLE_WINDOW_SAMPLES,
+    crossfadeSamples: Int = SmartPipeline.CLEAR_WINDOW_CROSSFADE_SAMPLES,
+    enhanceSlice: (FloatArray) -> FloatArray
+): FloatArray {
+    if (samples.isEmpty()) return samples
+    val safeMaxWindow = max(1_600, maxWindowSamples)
+    if (samples.size <= safeMaxWindow) {
+        val single = enhanceSlice(samples)
+        return if (single.size == samples.size) {
+            single
+        } else if (single.isNotEmpty()) {
+            FloatArray(samples.size) { idx -> single[idx.coerceAtMost(single.lastIndex)] }
+        } else {
+            samples
+        }
+    }
+
+    val safeFade = crossfadeSamples.coerceIn(0, safeMaxWindow / 4)
+    val step = max(1_600, safeMaxWindow - safeFade)
+    val output = FloatArray(samples.size)
+
+    var start = 0
+    var isFirstSlice = true
+    while (start < samples.size) {
+        val end = min(samples.size, start + safeMaxWindow)
+        val rawSlice = samples.copyOfRange(start, end)
+        val enhancedSlice = enhanceSlice(rawSlice)
+        val sliceLen = rawSlice.size
+
+        if (enhancedSlice.isEmpty()) {
+            // Fallback to raw slice for this window if native returned empty
+            for (i in 0 until sliceLen) {
+                val outIdx = start + i
+                if (isFirstSlice || i >= safeFade) {
+                    output[outIdx] = rawSlice[i]
+                } else {
+                    val alpha = i.toFloat() / safeFade.toFloat()
+                    output[outIdx] = output[outIdx] * (1.0f - alpha) + rawSlice[i] * alpha
+                }
+            }
+        } else {
+            for (i in 0 until sliceLen) {
+                val outIdx = start + i
+                val sampleVal = enhancedSlice[i.coerceAtMost(enhancedSlice.lastIndex)]
+                if (isFirstSlice || i >= safeFade) {
+                    output[outIdx] = sampleVal
+                } else {
+                    val alpha = i.toFloat() / safeFade.toFloat()
+                    output[outIdx] = output[outIdx] * (1.0f - alpha) + sampleVal * alpha
+                }
+            }
+        }
+
+        if (end >= samples.size) break
+        start += step
+        isFirstSlice = false
+    }
+
+    return output
 }
 
 /**

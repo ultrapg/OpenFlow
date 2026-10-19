@@ -412,7 +412,9 @@ object NpuHardwareManager {
 
         try {
             // Native DAL LiteRT thread count (verified in dal_lrt_model_create -> getenv("DAL_LITERT_THREADS"))
+            // and DAL_RUN_DEPTH=1 (verified in ParallelRuns.depth -> getenv("DAL_RUN_DEPTH"))
             Os.setenv("DAL_LITERT_THREADS", threads.toString(), true)
+            Os.setenv("DAL_RUN_DEPTH", "1", true)
             Os.setenv("LITERT_NUM_THREADS", threads.toString(), true)
             Os.setenv("LITERT_NPU_CACHE_DIR", npuCacheDir.absolutePath, true)
 

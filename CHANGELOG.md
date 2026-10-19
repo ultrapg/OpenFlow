@@ -2,6 +2,14 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.4.0] - 2026-10-19
+
+### Fixed
+- **`Clear` Noise Suppression Native Crash (`SIGSEGV` / `libLiteRt.so` / OpenCL) on Snapdragon 8 Elite & Adreno GPUs (`SmartPipeline`, `NpuHardwareManager`):**
+  - **Single-Window Sequential `Clear.enhance` Execution (`enhanceAudioInSingleWindowSlices`):** Native `libClearAndroid.so` (`clear-studio.tflite`) uses a `200`-frame (`2.00s`) STFT window and spawns 2 concurrent Swift `TaskGroup` threads (`ParallelRuns.run` across `session0` and `session1`) whenever audio exceeds `200` frames (`> 1.97s`), triggering concurrent `eglMakeCurrent` + `LiteRtRunCompiledModel` OpenCL calls that crash with `SIGSEGV (status=11)` when `Voz` also holds an OpenCL context. Feeding `Clear.enhance` in sequential `<= 1.90s` (`30,400` sample) windows with a smooth `20 ms` (`320` sample) linear crossfade guarantees `numWindows == 1` on every native invocation so `Clear` runs strictly sequentially on a single worker thread (`DAL_RUN_DEPTH=1`).
+  - **Fixed False-Positive `isNativeHeapHigh` Memory Pressure on 64-Bit OpenCL/QNN Virtual Address Mappings (`MemoryPressureReport`):** On Qualcomm Snapdragon 8 Elite (`SM8750` / Samsung Galaxy S25 `SM-S931B`), OpenCL/QNN maps ~4.6 GB of virtual GPU/DSP address space into `Debug.getNativeHeapAllocatedSize()` even when actual RSS is ~1.8 GB and >2 GB of physical RAM is free. Excluded `isNativeHeapHigh` from `isAnyMemoryTight` so `Clear` is pre-loaded and warmed up in RAM (`4/4 models ready`) instead of tearing down `Ear`/`Clear` `LiteRtEnvironment` / `EGLContext` sessions mid-pipeline.
+  - **Deduplicated `reloadSettings` Calls (`SmartPipeline`):** Prevented redundant back-to-back `reloadSettings` runs when `SharedPreferences` listeners and UI toggles fire simultaneously.
+
 ## [2.3.9] - 2026-10-19
 
 ### Added
