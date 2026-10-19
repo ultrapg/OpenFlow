@@ -2,6 +2,12 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.6] - 2026-10-19
+
+### Fixed
+- **System Inset & Safe Drawing Padding (`MainActivity`, `OnboardingScreen`):**
+  - Applied `Modifier.safeDrawingPadding()` (`WindowInsets.safeDrawing`) to the UI containers in `MainActivity` and `OnboardingScreen` so content respects status bar, navigation bar, display cutout, and IME insets on Android edge-to-edge displays.
+
 ## [2.3.5] - 2026-10-18
 
 ### Fixed
