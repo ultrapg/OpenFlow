@@ -351,11 +351,98 @@ class SmartPipelineTest {
             com.voicebubble.openflow.settings.HardwareAccelerator.fromId(null)
         )
     }
+
+    @Test
+    fun `splitAudioIntoSmartChunks splits long recordings at silence valleys without losing samples`() {
+        // 1. Short clip <= maxChunkSamples stays a single chunk
+        val shortClip = FloatArray(16_000 * 8) { 0.1f }
+        val singleChunk = com.voicebubble.openflow.core.speech.splitAudioIntoSmartChunks(
+            samples = shortClip,
+            maxChunkSamples = 16_000 * 20,
+            minChunkSamples = 16_000 * 10
+        )
+        assertEquals(1, singleChunk.size)
+        assertEquals(shortClip.size, singleChunk[0].size)
+
+        // 2. 45-second clip with a clear silence valley at 15.0s..15.3s and 31.0s..31.3s
+        val totalSamples = 45 * 16_000
+        val pause1Start = 15 * 16_000
+        val pause1End = pause1Start + (16_000 / 3)
+        val pause2Start = 31 * 16_000
+        val pause2End = pause2Start + (16_000 / 3)
+
+        val longClip = FloatArray(totalSamples) { idx ->
+            when (idx) {
+                in pause1Start until pause1End -> 0.0001f
+                in pause2Start until pause2End -> 0.0001f
+                else -> 0.25f
+            }
+        }
+
+        val chunks = com.voicebubble.openflow.core.speech.splitAudioIntoSmartChunks(
+            samples = longClip,
+            maxChunkSamples = 20 * 16_000,
+            minChunkSamples = 11 * 16_000
+        )
+
+        assertEquals(3, chunks.size)
+        // Total samples across all chunks must equal original sample count
+        assertEquals(totalSamples, chunks.sumOf { it.size })
+        // First split should occur inside the first silence valley [pause1Start..pause1End]
+        assertTrue(
+            "Expected first chunk split (${chunks[0].size}) inside [$pause1Start..$pause1End]",
+            chunks[0].size in pause1Start..pause1End
+        )
+        // Every chunk must respect maxChunkSamples
+        assertTrue(chunks.all { it.size <= 20 * 16_000 })
+    }
+
+    @Test
+    fun `NpuHardwareManager detects Qualcomm Hexagon and common mobile NPUs accurately`() {
+        val qcomElite = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("Qualcomm SM8750 Sun")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.QUALCOMM_HEXAGON, qcomElite.first)
+        assertEquals("Hexagon V79 HTP", qcomElite.second)
+
+        val qcomGen3 = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("QCOM SM8650 Pineapple")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.QUALCOMM_HEXAGON, qcomGen3.first)
+        assertEquals("Hexagon V75 HTP", qcomGen3.second)
+
+        val qcomGen2 = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("Snapdragon SM8550 Kalama")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.QUALCOMM_HEXAGON, qcomGen2.first)
+        assertEquals("Hexagon V73 HTP", qcomGen2.second)
+
+        val mtk9400 = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("MediaTek MT6991 Dimensity 9400")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.MEDIATEK_NEUROPILOT, mtk9400.first)
+        assertEquals("APU 890 (Gen 8)", mtk9400.second)
+
+        val tensorG4 = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("Google Tensor G4 zumapro")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.GOOGLE_TENSOR, tensorG4.first)
+        assertEquals("Tensor G4 Rio TPU", tensorG4.second)
+
+        val exynos2400 = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("Samsung s5e9945 Exynos 2400")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.SAMSUNG_EXYNOS, exynos2400.first)
+        assertEquals("Exynos 2400 Dual-NPU", exynos2400.second)
+
+        val kirin = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("HiSilicon Kirin 9000s")
+        assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.HISILICON_KIRIN, kirin.first)
+    }
+
+    @Test
+    fun `MemoryPressureReport detects JVM heap exhaustion even when system RAM is plentiful`() {
+        // Device has 8 GB of free system RAM, but JVM ART heap has only 24 MB free out of 256 MB
+        val jvmTightOnHighRamPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 8_192L,
+            systemTotalMb = 12_288L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 232L,
+            jvmMaxMb = 256L,
+            jvmFreeHeadroomMb = 24L,
+            nativeAllocatedMb = 600L
+        )
+        assertFalse(jvmTightOnHighRamPhone.isSystemRamTight)
+        assertTrue(jvmTightOnHighRamPhone.isJvmHeapTight)
+        assertTrue(jvmTightOnHighRamPhone.isJvmHeapCritical)
+        assertTrue(jvmTightOnHighRamPhone.isAnyMemoryTight)
+        assertTrue(jvmTightOnHighRamPhone.isCriticalPressure)
+    }
 }
-
-
-
-
-
-
-

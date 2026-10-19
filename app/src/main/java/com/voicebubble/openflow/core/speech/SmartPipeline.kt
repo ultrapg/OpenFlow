@@ -18,6 +18,7 @@ package com.voicebubble.openflow.core.speech
 
 import ai.desertant.clear.ChannelMode
 import ai.desertant.clear.Clear
+import ai.desertant.clear.Mastering
 import ai.desertant.ear.Ear
 import ai.desertant.uhm.FillerSpan
 import ai.desertant.uhm.FrameClassification
@@ -29,9 +30,8 @@ import ai.desertant.voz.Word
 import android.app.ActivityManager
 import android.content.ComponentCallbacks2
 import android.content.Context
-import android.os.Build
+import android.os.Debug
 import android.os.SystemClock
-import android.system.Os
 import android.util.Log
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.settings.DesertAntModel
@@ -64,7 +64,7 @@ import kotlin.math.roundToLong
 enum class ModelLoadState(val label: String) {
     DISABLED("Disabled"),
     NOT_DOWNLOADED("Not Downloaded"),
-    STANDBY("Standby (On Disk)"),
+    STANDBY("Standby (Dynamic)"),
     LOADING("Loading..."),
     LOADED("Loaded in RAM"),
     ACTIVE("Running Inference"),
@@ -85,13 +85,54 @@ enum class PipelinePhase(val label: String) {
 }
 
 /**
+ * Snapshot of JVM Heap, Native Heap, and OS System RAM headroom.
+ * Prevents OOM crashes that occur when JVM Dalvik/ART heap is nearly full even though the
+ * device has many gigabytes of free physical system RAM.
+ */
+data class MemoryPressureReport(
+    val systemAvailMb: Long,
+    val systemTotalMb: Long,
+    val systemLowMemoryFlag: Boolean,
+    val jvmUsedMb: Long,
+    val jvmMaxMb: Long,
+    val jvmFreeHeadroomMb: Long,
+    val nativeAllocatedMb: Long
+) {
+    val jvmUsedRatio: Double
+        get() = if (jvmMaxMb > 0L) jvmUsedMb.toDouble() / jvmMaxMb.toDouble() else 0.0
+
+    val isJvmHeapTight: Boolean
+        get() = jvmFreeHeadroomMb < 64L || jvmUsedRatio >= 0.80
+
+    val isJvmHeapCritical: Boolean
+        get() = jvmFreeHeadroomMb < 36L || jvmUsedRatio >= 0.88
+
+    val isSystemRamTight: Boolean
+        get() = systemLowMemoryFlag || systemAvailMb < 900L
+
+    val isSystemRamCritical: Boolean
+        get() = systemLowMemoryFlag || systemAvailMb < 480L
+
+    val isNativeHeapHigh: Boolean
+        get() = nativeAllocatedMb > 1_350L
+
+    val isAnyMemoryTight: Boolean
+        get() = isJvmHeapTight || isSystemRamTight || isNativeHeapHigh
+
+    val isCriticalPressure: Boolean
+        get() = isJvmHeapCritical || isSystemRamCritical
+}
+
+/**
  * Observable snapshot of the speech pipeline's loaded models, active hardware accelerator,
- * and most recent inference performance.
+ * detected NPU profile, and most recent inference performance.
  */
 data class PipelineStatus(
     val phase: PipelinePhase = PipelinePhase.UNINITIALIZED,
     val configuredAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
-    val activeAcceleratorLabel: String = "Auto (GPU / CPU)",
+    val activeAcceleratorLabel: String = "Auto (NPU / GPU / CPU)",
+    val detectedNpuSummary: String = NpuHardwareManager.detectHardwareProfile().summaryLabel,
+    val dynamicLoadingMode: String = "Adaptive Stage Management",
     val modelStates: Map<DesertAntModel, ModelLoadState> = mapOf(
         DesertAntModel.VOZ to ModelLoadState.STANDBY,
         DesertAntModel.EAR to ModelLoadState.STANDBY,
@@ -118,14 +159,19 @@ data class PipelineStatus(
  * 3. `Voz` — Multilingual speech-to-text with word-level timestamps (80 ms resolution)
  * 4. Temporal Filler Subtraction & Text Normalization
  *
- * Concurrency, Speed & Memory Guarantees:
- * - Passes explicit verified revision directories to `Voz`, `Ear`, `Clear`, and `Uhm`, bypassing
- *   `ModelStore`'s 1.2 GB pure-Swift `SoftwareSHA256` memory spike on load and inference.
- * - Executes all native LiteRT stages strictly sequentially under [pipelineMutex] to prevent
- *   concurrent OpenCL / `libLiteRt.so` driver race crashes when all 4 models are enabled.
- * - Pre-warms `Voz` during [initialize] so the first dictation starts with zero compilation delay.
- * - Trims leading/trailing dead silence before inference and bounds `Ear` language identification
- *   to a 5.5-second speech window for faster turnaround.
+ * Stability, OOM Prevention & NPU Hardware Acceleration Guarantees:
+ * - **JVM + Native + System RAM Awareness**: Monitors ART JVM heap headroom (`jvmFreeHeadroomMb`)
+ *   alongside `ActivityManager.MemoryInfo` and `Debug.getNativeHeapAllocatedSize()`, preventing
+ *   `java.lang.OutOfMemoryError` during JNI/FFI array serialization even on 8–16 GB RAM devices.
+ * - **Silence-Aware Smart Audio Chunking**: Automatically splits long dictations (> 20s normal /
+ *   > 14s tight memory) at natural speech pauses so Conformer encoder attention tensors and FFI
+ *   buffers stay strictly bounded regardless of dictation length.
+ * - **Dynamic On-Demand Stage Loading**: Keeps `Voz` hot for instant response while dynamically
+ *   loading/unloading auxiliary models (`Clear`, `Ear`, `Uhm`) between stages when multiple models
+ *   are active or memory pressure rises, eliminating OpenCL/QNN context collisions.
+ * - **Qualcomm Hexagon & Universal Mobile NPU Support**: Configures QNN HTP / FastRPC CDSP,
+ *   MediaTek NeuroPilot APU, Google Tensor TPU, Samsung Exynos ENN, HiSilicon Kirin HiAI, and NNAPI
+ *   via [NpuHardwareManager].
  */
 class SmartPipeline(
     context: Context,
@@ -135,13 +181,18 @@ class SmartPipeline(
     companion object {
         private const val TAG = "SmartPipeline"
         const val SAMPLE_RATE_HZ: Double = 16_000.0
-        const val IDLE_TIMEOUT_MS: Long = 30 * 60_000L // 30 minutes warm retention
+        const val IDLE_TIMEOUT_MS: Long = 20 * 60_000L // 20 minutes warm retention
         const val FILLER_MERGE_MAX_GAP_MS: Long = 40L
         const val FILLER_BOUNDARY_TOLERANCE_MS: Long = 80L
         const val FILLER_OVERLAP_THRESHOLD: Double = 0.50
         private const val SILENCE_THRESHOLD: Float = 0.0035f
         private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
-        private const val MAX_CLEAR_DURATION_SAMPLES: Int = 25 * 16_000 // 25s cap for 48kHz STFT
+
+        // Chunking bounds to guarantee bounded Conformer & STFT memory on arbitrarily long dictations
+        const val DEFAULT_MAX_CHUNK_SAMPLES: Int = 20 * 16_000 // 20.0s @ 16 kHz
+        const val DEFAULT_MIN_CHUNK_SAMPLES: Int = 11 * 16_000 // 11.0s @ 16 kHz
+        const val LOW_MEM_MAX_CHUNK_SAMPLES: Int = 14 * 16_000 // 14.0s @ 16 kHz
+        const val LOW_MEM_MIN_CHUNK_SAMPLES: Int = 8 * 16_000  // 8.0s @ 16 kHz
         private const val MAX_EAR_WINDOW_SAMPLES: Int = 88_000 // 5.5s @ 16 kHz
 
         @Volatile
@@ -166,6 +217,8 @@ class SmartPipeline(
         private set
 
     private var appliedAccelerator: HardwareAccelerator? = null
+    private var activeAcceleratorDescription: String =
+        NpuHardwareManager.configureNativeRuntime(appContext, initialSettings.hardwareAccelerator, false)
 
     private var voz: Voz? = null
     private var ear: Ear? = null
@@ -182,7 +235,8 @@ class SmartPipeline(
     private val _pipelineStatus = MutableStateFlow(
         PipelineStatus(
             configuredAccelerator = initialSettings.hardwareAccelerator,
-            activeAcceleratorLabel = resolveAcceleratorLabel(initialSettings.hardwareAccelerator),
+            activeAcceleratorLabel = activeAcceleratorDescription,
+            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             enabledCount = initialSettings.enabledModels().size
         )
     )
@@ -201,28 +255,50 @@ class SmartPipeline(
     }
 
     /**
-     * Initializes `Voz` and any currently enabled & downloaded auxiliary models inside [pipelineMutex],
-     * pre-warming LiteRT sessions so the first dictation has zero compilation lag.
+     * Initializes `Voz` and currently enabled auxiliary models inside [pipelineMutex].
+     * Deduplicates redundant calls if all enabled models are already loaded and warmed up.
      */
-    suspend fun initialize(warmUp: Boolean = true): Boolean = withContext(Dispatchers.Default) {
+    suspend fun initialize(warmUp: Boolean = true, forceReload: Boolean = false): Boolean = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
-            val startMs = SystemClock.elapsedRealtime()
             val currentSettings = settings
-            applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator)
+            val accelUnchanged = appliedAccelerator == currentSettings.hardwareAccelerator
+            val alreadyReady = !forceReload &&
+                accelUnchanged &&
+                voz != null &&
+                (!warmUp || vozWarmedUp) &&
+                areEnabledModelsReadyOrStandbyLocked(currentSettings)
+
+            if (alreadyReady) {
+                val count = countLoadedModelsLocked(currentSettings)
+                val msg = "$count/${currentSettings.enabledModels().size} models ready in RAM ($activeAcceleratorDescription)"
+                updateStatusSnapshot(
+                    activeSettings = currentSettings,
+                    phaseOverride = PipelinePhase.READY,
+                    messageOverride = msg
+                )
+                resetIdleEvictionTimerLocked()
+                return@withLock true
+            }
+
+            val startMs = SystemClock.elapsedRealtime()
+            val memReport = evaluateMemoryPressure()
+            applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator, memReport.isAnyMemoryTight)
+
             DebugLogManager.logInfo(
                 TAG,
-                "initialize(warmUp=$warmUp) start • enabled=${currentSettings.enabledModels().map { it.id }} • accel=${currentSettings.hardwareAccelerator.displayName}",
+                "initialize(warmUp=$warmUp) start • enabled=${currentSettings.enabledModels().map { it.id }} • " +
+                    "accel=$activeAcceleratorDescription • npu=${NpuHardwareManager.detectHardwareProfile().summaryLabel}",
                 includeMemory = true
             )
 
             updateStatusSnapshot(
                 activeSettings = currentSettings,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Loading enabled models on ${resolveAcceleratorLabel(currentSettings.hardwareAccelerator)}..."
+                messageOverride = "Loading enabled models on $activeAcceleratorDescription..."
             )
 
             val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
-            ensureAuxiliaryModelsLocked(currentSettings, warmUp = warmUp)
+            ensureAuxiliaryModelsLocked(currentSettings, warmUp = warmUp && !memReport.isAnyMemoryTight)
             resetIdleEvictionTimerLocked()
 
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
@@ -236,7 +312,7 @@ class SmartPipeline(
             val finalMsg = when (finalPhase) {
                 PipelinePhase.READY -> {
                     val count = countLoadedModelsLocked(currentSettings)
-                    "$count/${currentSettings.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(currentSettings.hardwareAccelerator)})"
+                    "$count/${currentSettings.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 }
                 PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
                 else -> "Failed to load Voz speech model"
@@ -263,9 +339,9 @@ class SmartPipeline(
      * Launches [initialize] on the singleton's background scope so model loading and LiteRT
      * warm-up complete even if the calling Activity or Composable leaves the screen.
      */
-    fun initializeAsync(warmUp: Boolean = true) {
+    fun initializeAsync(warmUp: Boolean = true, forceReload: Boolean = false) {
         idleScope.launch {
-            initialize(warmUp = warmUp)
+            initialize(warmUp = warmUp, forceReload = forceReload)
         }
     }
 
@@ -287,15 +363,21 @@ class SmartPipeline(
         pipelineMutex.withLock {
             val snapshot = settings
             val accelChanged = appliedAccelerator != null && appliedAccelerator != snapshot.hardwareAccelerator
-            applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator)
+            val memReport = evaluateMemoryPressure()
+            applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
 
             if (accelChanged) {
                 Log.i(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; reloading sessions.")
-                DebugLogManager.logInfo(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; closing active sessions", includeMemory = true)
+                DebugLogManager.logInfo(
+                    TAG,
+                    "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; closing active sessions",
+                    includeMemory = true
+                )
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
                 closeVozLocked()
+                System.gc()
             } else {
                 if (!snapshot.clearEnabled) closeClearLocked()
                 if (!snapshot.earEnabled) closeEarLocked()
@@ -305,17 +387,17 @@ class SmartPipeline(
             updateStatusSnapshot(
                 activeSettings = snapshot,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Updating model pipeline (${resolveAcceleratorLabel(snapshot.hardwareAccelerator)})..."
+                messageOverride = "Updating model pipeline ($activeAcceleratorDescription)..."
             )
 
             val vozOk = ensureVozLocked(snapshot, warmUp = true)
-            ensureAuxiliaryModelsLocked(snapshot, warmUp = true)
+            ensureAuxiliaryModelsLocked(snapshot, warmUp = !memReport.isAnyMemoryTight)
             resetIdleEvictionTimerLocked()
 
             val phase = if (vozOk) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
             val count = countLoadedModelsLocked(snapshot)
             val msg = if (vozOk) {
-                "$count/${snapshot.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(snapshot.hardwareAccelerator)})"
+                "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
             } else {
                 "Waiting for model download"
             }
@@ -330,7 +412,14 @@ class SmartPipeline(
 
     /**
      * Executes the 4-stage Desert Ant audio pipeline on 16 kHz mono PCM [samples] in-memory.
-     * All stages execute strictly sequentially to prevent concurrent OpenCL / LiteRT native crashes.
+     *
+     * Key Stability & Anti-OOM Mechanisms:
+     * 1. Trims leading/trailing dead air before touching any native buffers.
+     * 2. Runs `Ear` language identification once on a short `<= 5.5s` speech slice.
+     * 3. Dynamically stages auxiliary models (`Ear`, `Clear`) so they do not hold overlapping
+     *    OpenCL/QNN/native buffers while `Voz`'s 1.2 GB Conformer runs under tight memory.
+     * 4. Splits long recordings at natural silence valleys into bounded chunks (`<= 20s` normal,
+     *    `<= 14s` low memory) so `Clear`, `Uhm`, and `Voz` never exceed JVM or native RAM limits.
      */
     suspend fun transcribe(
         samples: FloatArray,
@@ -351,64 +440,125 @@ class SmartPipeline(
             val inferenceStartMs = SystemClock.elapsedRealtime()
             try {
                 val activeSettings = settings
-                applyHardwareAcceleratorSettingsLocked(activeSettings.hardwareAccelerator)
+                val initialMem = evaluateMemoryPressure()
+                applyHardwareAcceleratorSettingsLocked(
+                    activeSettings.hardwareAccelerator,
+                    initialMem.isAnyMemoryTight
+                )
+
+                val dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, initialMem)
+                val maxChunkSamples = if (initialMem.isAnyMemoryTight) {
+                    LOW_MEM_MAX_CHUNK_SAMPLES
+                } else {
+                    DEFAULT_MAX_CHUNK_SAMPLES
+                }
+                val minChunkSamples = if (initialMem.isAnyMemoryTight) {
+                    LOW_MEM_MIN_CHUNK_SAMPLES
+                } else {
+                    DEFAULT_MIN_CHUNK_SAMPLES
+                }
+
+                val audioChunks = splitAudioIntoSmartChunks(
+                    samples = trimmedSamples,
+                    maxChunkSamples = maxChunkSamples,
+                    minChunkSamples = minChunkSamples
+                )
+
                 DebugLogManager.logInfo(
                     TAG,
-                    "transcribe() start • rawSamples=${samples.size}, trimmedSamples=${trimmedSamples.size} (${audioDurationMs}ms) • models=${activeSettings.enabledModels().map { it.id }}",
+                    "transcribe() start • raw=${samples.size}, trimmed=${trimmedSamples.size} (${audioDurationMs}ms), " +
+                        "chunks=${audioChunks.size}, dynamicStaging=$dynamicStageRelease, " +
+                        "jvmFree=${initialMem.jvmFreeHeadroomMb}MB, sysAvail=${initialMem.systemAvailMb}MB",
                     includeMemory = true
                 )
 
-                // Ensure models are ready
-                if (!ensureVozLocked(activeSettings, warmUp = false)) {
+                if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
                     throw IllegalStateException("Voz speech recognition model is not downloaded.")
                 }
-                ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
 
                 // =========================================================================
-                // Stage 1: Audio Enhancement (`Clear` with `clear-studio` profile)
+                // Stage 1: Spoken Language Identification (`Ear`) on a bounded 5.5s slice
                 // =========================================================================
-                val enhancedSamples = runClearStageLocked(trimmedSamples, activeSettings, onStageProgress)
-
-                // Only release Clear's native session between stages if the OS reports critical memory pressure.
-                // Keeping Clear warmed up avoids calling eglTerminate on the shared process EGLDisplay
-                // and prevents re-compiling clear-studio.tflite on every dictation.
-                if (activeSettings.clearEnabled && isSystemMemoryLow()) {
-                    DebugLogManager.logWarn(TAG, "Low system memory detected after Clear stage; releasing Clear buffers before Voz")
-                    releaseClearNativeBuffersBetweenStagesLocked()
+                val resolvedLanguage = resolveLanguageLocked(
+                    samples = audioChunks.first(),
+                    activeSettings = activeSettings,
+                    onStageProgress = onStageProgress
+                )
+                if (dynamicStageRelease && ear != null) {
+                    DebugLogManager.logInfo(TAG, "Dynamic staging: releasing Ear session before heavy stages")
+                    closeEarLocked()
                 }
 
                 // =========================================================================
-                // Stage 2A: Spoken Language Identification (`Ear`) — Strictly Sequential
+                // Stage 2..4: Process each bounded audio chunk sequentially
                 // =========================================================================
-                val resolvedLanguage = resolveLanguageLocked(enhancedSamples, activeSettings, onStageProgress)
+                val segmentTranscripts = ArrayList<String>(audioChunks.size)
+                val totalChunks = audioChunks.size
 
-                // =========================================================================
-                // Stage 2B: Acoustic Filler Detection (`Uhm`) — Strictly Sequential
-                // =========================================================================
-                val uhmFrames = runUhmStageLocked(enhancedSamples, activeSettings, onStageProgress)
+                for ((chunkIdx, rawChunk) in audioChunks.withIndex()) {
+                    val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
+                    ensureMemoryHeadroomForFfiLocked(rawChunk.size)
 
-                // =========================================================================
-                // Stage 3: Multilingual Speech-to-Text (`Voz`) — Strictly Sequential
-                // =========================================================================
-                setModelActiveStatusLocked(activeSettings, DesertAntModel.VOZ, "Transcribing with Voz ($resolvedLanguage)...")
-                onStageProgress?.invoke("Voz ($resolvedLanguage)")
-                DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)")
-                val transcription = runVozWithRetryLocked(
-                    samples = enhancedSamples,
-                    language = resolvedLanguage,
-                    customVocabulary = activeSettings.customVocabulary,
-                    activeSettings = activeSettings
+                    // Stage 2A: Audio Enhancement (`Clear`)
+                    val enhancedChunk = runClearStageLocked(
+                        rawSamples = rawChunk,
+                        activeSettings = activeSettings,
+                        stageSuffix = chunkSuffix,
+                        onStageProgress = onStageProgress
+                    )
+
+                    if (dynamicStageRelease && clear != null) {
+                        DebugLogManager.logInfo(TAG, "Dynamic staging: releasing Clear session before Voz$chunkSuffix")
+                        closeClearLocked()
+                    }
+
+                    // Stage 2B: Acoustic Filler Detection (`Uhm`)
+                    val uhmFrames = runUhmStageLocked(
+                        samples = enhancedChunk,
+                        activeSettings = activeSettings,
+                        stageSuffix = chunkSuffix,
+                        onStageProgress = onStageProgress
+                    )
+
+                    // Stage 3: Multilingual Speech-to-Text (`Voz`)
+                    ensureMemoryHeadroomForFfiLocked(enhancedChunk.size)
+                    setModelActiveStatusLocked(
+                        activeSettings,
+                        DesertAntModel.VOZ,
+                        "Transcribing with Voz ($resolvedLanguage)$chunkSuffix..."
+                    )
+                    onStageProgress?.invoke("Voz ($resolvedLanguage)$chunkSuffix")
+                    DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)$chunkSuffix")
+
+                    val transcription = runVozWithRetryLocked(
+                        samples = enhancedChunk,
+                        language = resolvedLanguage,
+                        customVocabulary = activeSettings.customVocabulary,
+                        activeSettings = activeSettings
+                    )
+
+                    // Stage 4: Temporal Filler Subtraction & Text Normalization
+                    val segmentText = reconcileTranscript(
+                        transcription = transcription,
+                        uhmFrames = uhmFrames,
+                        uhmEnabled = activeSettings.uhmEnabled,
+                        customVocabulary = activeSettings.customVocabulary
+                    )
+                    if (segmentText.isNotBlank()) {
+                        segmentTranscripts.add(segmentText)
+                    }
+                }
+
+                val finalTranscript = normalizeTranscriptText(
+                    rawText = segmentTranscripts.joinToString(" "),
+                    capitalizeLeadingWord = false
                 )
 
-                // =========================================================================
-                // Stage 4: Temporal Filler Subtraction & Text Normalization
-                // =========================================================================
-                val finalTranscript = reconcileTranscript(
-                    transcription = transcription,
-                    uhmFrames = uhmFrames,
-                    uhmEnabled = activeSettings.uhmEnabled,
-                    customVocabulary = activeSettings.customVocabulary
-                )
+                // Re-attach auxiliary models in ready state if memory is plentiful
+                val postMem = evaluateMemoryPressure()
+                if (!postMem.isAnyMemoryTight) {
+                    ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
+                }
 
                 val totalInferenceMs = (SystemClock.elapsedRealtime() - inferenceStartMs).coerceAtLeast(1L)
                 _pipelineStatus.value = _pipelineStatus.value.copy(
@@ -417,12 +567,17 @@ class SmartPipeline(
                 )
                 DebugLogManager.logInfo(
                     TAG,
-                    "transcribe() completed in ${totalInferenceMs}ms for ${audioDurationMs}ms audio (chars=${finalTranscript.length}, lang=$resolvedLanguage)",
+                    "transcribe() completed in ${totalInferenceMs}ms for ${audioDurationMs}ms audio " +
+                        "(chunks=$totalChunks, chars=${finalTranscript.length}, lang=$resolvedLanguage)",
                     includeMemory = true
                 )
                 finalTranscript
             } catch (t: Throwable) {
-                DebugLogManager.logError(TAG, "transcribe() failed after ${SystemClock.elapsedRealtime() - inferenceStartMs}ms", t)
+                DebugLogManager.logError(
+                    TAG,
+                    "transcribe() failed after ${SystemClock.elapsedRealtime() - inferenceStartMs}ms",
+                    t
+                )
                 throw t
             } finally {
                 isTranscribing = false
@@ -431,7 +586,7 @@ class SmartPipeline(
                 updateStatusSnapshot(
                     activeSettings = snap,
                     phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models loaded in RAM (${resolveAcceleratorLabel(snap.hardwareAccelerator)})"
+                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 )
                 resetIdleEvictionTimerLocked()
             }
@@ -449,11 +604,12 @@ class SmartPipeline(
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
+                System.gc()
                 val snap = settings
                 updateStatusSnapshot(
                     activeSettings = snap,
                     phaseOverride = if (voz != null) PipelinePhase.STANDBY_EVICTED else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "Voz loaded in RAM • Optional models on standby"
+                    messageOverride = "Voz loaded in RAM • Optional models on dynamic standby"
                 )
             }
         }
@@ -482,6 +638,7 @@ class SmartPipeline(
             closeEarLocked()
             closeUhmLocked()
             closeVozLocked()
+            System.gc()
             val snap = settings
             updateStatusSnapshot(
                 activeSettings = snap,
@@ -492,108 +649,111 @@ class SmartPipeline(
     }
 
     // =========================================================================
-    // Internal Stage & Hardware Helpers (Must be called inside `pipelineMutex.withLock`)
+    // Internal Stage, Memory & Hardware Helpers (Called inside `pipelineMutex`)
     // =========================================================================
 
-    private fun applyHardwareAcceleratorSettingsLocked(accelerator: HardwareAccelerator) {
-        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
-        val (numThreads, useNpu, useGpu) = when (accelerator) {
-            HardwareAccelerator.CPU -> Triple(min(8, max(4, cores - 1)), "0", "0")
-            HardwareAccelerator.NPU -> Triple(min(6, max(4, (cores * 2) / 3)), "1", "1")
-            HardwareAccelerator.GPU -> Triple(min(4, max(2, cores / 2)), "0", "1")
-            HardwareAccelerator.AUTO -> Triple(min(6, max(4, cores / 2)), "1", "1")
-        }
-        try {
-            Os.setenv("DAL_LITERT_THREADS", numThreads.toString(), true)
-            Os.setenv("DAL_ACCELERATOR", accelerator.id, true)
-            Os.setenv("LITERT_USE_NPU", useNpu, true)
-            Os.setenv("LITERT_USE_GPU", useGpu, true)
-        } catch (_: Throwable) {
-        }
+    private fun applyHardwareAcceleratorSettingsLocked(
+        accelerator: HardwareAccelerator,
+        lowMemoryPressure: Boolean
+    ) {
+        activeAcceleratorDescription = NpuHardwareManager.configureNativeRuntime(
+            context = appContext,
+            requested = accelerator,
+            lowMemoryPressure = lowMemoryPressure
+        )
         appliedAccelerator = accelerator
     }
 
-    private fun resolveAcceleratorLabel(accelerator: HardwareAccelerator): String {
-        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
-        val hasOpenClGpu = hasOpenClGpuSupport()
-        val hasNpu = hasNpuSupport()
-        return when (accelerator) {
-            HardwareAccelerator.AUTO -> when {
-                hasNpu && hasOpenClGpu -> "Auto (NPU / OpenCL GPU)"
-                hasOpenClGpu -> "Auto (GPU OpenCL + XNNPACK)"
-                else -> "Auto (CPU XNNPACK ${min(8, max(4, cores - 1))}T)"
+    private fun evaluateMemoryPressure(): MemoryPressureReport {
+        val rt = Runtime.getRuntime()
+        val jvmUsedBytes = (rt.totalMemory() - rt.freeMemory()).coerceAtLeast(0L)
+        val jvmMaxBytes = rt.maxMemory().coerceAtLeast(1L)
+        val jvmFreeHeadroomBytes = (jvmMaxBytes - jvmUsedBytes).coerceAtLeast(0L)
+        val nativeAllocatedBytes = runCatching { Debug.getNativeHeapAllocatedSize() }.getOrDefault(0L)
+
+        var sysAvailMb = 2_048L
+        var sysTotalMb = 4_096L
+        var sysLowFlag = false
+        try {
+            val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            if (am != null) {
+                val memInfo = ActivityManager.MemoryInfo()
+                am.getMemoryInfo(memInfo)
+                sysAvailMb = memInfo.availMem / (1024L * 1024L)
+                sysTotalMb = memInfo.totalMem / (1024L * 1024L)
+                sysLowFlag = memInfo.lowMemory
             }
-            HardwareAccelerator.NPU -> if (hasNpu) {
-                "NPU Accelerator (+ GPU/CPU Fallback)"
-            } else if (hasOpenClGpu) {
-                "GPU OpenCL (NPU Fallback)"
-            } else {
-                "CPU XNNPACK (NPU Fallback)"
-            }
-            HardwareAccelerator.GPU -> if (hasOpenClGpu) {
-                "GPU (OpenCL) + XNNPACK"
-            } else {
-                "CPU XNNPACK (GPU Fallback)"
-            }
-            HardwareAccelerator.CPU -> "CPU (XNNPACK ${min(8, max(4, cores - 1))}-Thread)"
+        } catch (_: Throwable) {
+        }
+
+        return MemoryPressureReport(
+            systemAvailMb = sysAvailMb,
+            systemTotalMb = sysTotalMb,
+            systemLowMemoryFlag = sysLowFlag,
+            jvmUsedMb = jvmUsedBytes / (1024L * 1024L),
+            jvmMaxMb = jvmMaxBytes / (1024L * 1024L),
+            jvmFreeHeadroomMb = jvmFreeHeadroomBytes / (1024L * 1024L),
+            nativeAllocatedMb = nativeAllocatedBytes / (1024L * 1024L)
+        )
+    }
+
+    private fun shouldStageAuxiliaryModelsDynamically(
+        activeSettings: ModelSettings,
+        mem: MemoryPressureReport
+    ): Boolean {
+        // Stage auxiliary models (Clear / Ear) on-demand whenever:
+        // 1. Both Clear and Ear are enabled alongside Voz (3 native LiteRT models), OR
+        // 2. Clear is enabled on GPU/NPU (avoids shared OpenCL/QNN buffer contention with Voz), OR
+        // 3. JVM heap, Native heap, or System RAM shows any tightness.
+        if (mem.isAnyMemoryTight) return true
+        if (activeSettings.clearEnabled && activeSettings.earEnabled) return true
+        if (activeSettings.clearEnabled && activeSettings.hardwareAccelerator != HardwareAccelerator.CPU) return true
+        return false
+    }
+
+    /**
+     * Proactively reclaims JVM heap garbage before `FfiWriter.floats()` allocates its
+     * `ByteArrayOutputStream` + `toByteArray()` buffers (~8-12 bytes per audio sample).
+     */
+    private fun ensureMemoryHeadroomForFfiLocked(sampleCount: Int) {
+        val estimatedFfiMegabytes = ((sampleCount.toLong() * 12L) / (1024L * 1024L)).coerceAtLeast(4L)
+        val report = evaluateMemoryPressure()
+        if (report.isJvmHeapTight || report.jvmFreeHeadroomMb < estimatedFfiMegabytes * 3L) {
+            System.gc()
+            System.runFinalization()
         }
     }
 
-    private fun hasOpenClGpuSupport(): Boolean {
-        return try {
-            val openClPaths = listOf(
-                "/vendor/lib64/libOpenCL.so",
-                "/system/vendor/lib64/libOpenCL.so",
-                "/system/lib64/libOpenCL.so",
-                "/vendor/lib64/egl/libGLES_mali.so"
-            )
-            openClPaths.any { File(it).exists() }
-        } catch (_: Throwable) {
-            true
+    private fun areEnabledModelsReadyOrStandbyLocked(activeSettings: ModelSettings): Boolean {
+        if (voz == null) return false
+        if (activeSettings.uhmEnabled &&
+            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM) &&
+            uhm == null
+        ) {
+            return false
         }
-    }
-
-    private fun hasNpuSupport(): Boolean {
-        return try {
-            val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                (Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL).lowercase(Locale.ROOT)
-            } else {
-                (Build.HARDWARE + " " + Build.BOARD).lowercase(Locale.ROOT)
-            }
-            soc.contains("qcom") || soc.contains("qualcomm") || soc.contains("snapdragon") ||
-                soc.contains("mediatek") || soc.contains("mt") || soc.contains("dimensity") ||
-                soc.contains("tensor") || soc.contains("exynos") ||
-                File("/vendor/lib64/libcdsprpc.so").exists() ||
-                File("/vendor/lib64/libneuron_adapter.so").exists()
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun isSystemMemoryLow(): Boolean {
-        return try {
-            val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
-            val memInfo = ActivityManager.MemoryInfo()
-            am.getMemoryInfo(memInfo)
-            val availMb = memInfo.availMem / (1024L * 1024L)
-            memInfo.lowMemory || availMb < 450L
-        } catch (_: Throwable) {
-            false
-        }
+        return true
     }
 
     private suspend fun runClearStageLocked(
         rawSamples: FloatArray,
         activeSettings: ModelSettings,
+        stageSuffix: String = "",
         onStageProgress: ((String) -> Unit)?
     ): FloatArray {
         if (!activeSettings.clearEnabled) return rawSamples
         if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
             return rawSamples
         }
-        // Guard against huge 48 kHz STFT allocations on very long recordings or critically low RAM
-        if (rawSamples.size > MAX_CLEAR_DURATION_SAMPLES || isSystemMemoryLow()) {
-            Log.i(TAG, "Skipping Clear on long/low-memory clip (${rawSamples.size} samples) to preserve RAM for Voz.")
+
+        val mem = evaluateMemoryPressure()
+        if (mem.isCriticalPressure) {
+            Log.i(TAG, "Skipping Clear due to critical memory pressure (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB).")
+            DebugLogManager.logWarn(
+                TAG,
+                "Skipping Clear stage due to critical memory pressure (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB)"
+            )
+            closeClearLocked()
             return rawSamples
         }
 
@@ -602,16 +762,19 @@ class SmartPipeline(
             try {
                 Clear(appContext, clearDir).also { clear = it }
             } catch (t: Throwable) {
-                Log.w(TAG, "Failed to recreate Clear instance: ${t.message}")
+                Log.w(TAG, "Failed to create Clear instance: ${t.message}")
+                DebugLogManager.logWarn(TAG, "Failed to create Clear instance", t)
                 return rawSamples
             }
         }
 
         return try {
-            setModelActiveStatusLocked(activeSettings, DesertAntModel.CLEAR, "Enhancing audio with Clear...")
-            onStageProgress?.invoke("Clear")
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.CLEAR, "Enhancing audio with Clear$stageSuffix...")
+            onStageProgress?.invoke("Clear$stageSuffix")
+            // Explicitly set sampleRate = 16000.0 and Mastering.BYPASS so Clear never upsamples output to 48 kHz
             val options = ai.desertant.clear.Options(
                 strength = 1.0,
+                mastering = Mastering.BYPASS,
                 sampleRate = SAMPLE_RATE_HZ,
                 channelMode = ChannelMode.MONO
             )
@@ -625,26 +788,10 @@ class SmartPipeline(
             if (enhanced.isNotEmpty()) enhanced else rawSamples
         } catch (t: Throwable) {
             Log.w(TAG, "Clear enhancement failed, falling back to raw PCM audio: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Clear enhancement failed, falling back to raw PCM audio", t)
             closeClearLocked()
             System.gc()
             rawSamples
-        }
-    }
-
-    private fun releaseClearNativeBuffersBetweenStagesLocked() {
-        val existing = clear ?: return
-        try {
-            existing.close()
-        } catch (_: Throwable) {
-        }
-        clear = null
-        clearWarmedUp = false
-        if (DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
-            try {
-                val clearDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.CLEAR).absolutePath
-                clear = Clear(appContext, clearDir)
-            } catch (_: Throwable) {
-            }
         }
     }
 
@@ -670,7 +817,22 @@ class SmartPipeline(
             return fallbackLanguage
         }
 
-        val earInstance = ear ?: return fallbackLanguage
+        val mem = evaluateMemoryPressure()
+        if (mem.isCriticalPressure) {
+            DebugLogManager.logWarn(TAG, "Skipping Ear language ID due to critical memory pressure; using $fallbackLanguage")
+            closeEarLocked()
+            return fallbackLanguage
+        }
+
+        val earInstance = ear ?: run {
+            val earDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR).absolutePath
+            try {
+                Ear(appContext, earDir).also { ear = it }
+            } catch (t: Throwable) {
+                DebugLogManager.logWarn(TAG, "Failed to dynamically load Ear: ${t.message}")
+                return fallbackLanguage
+            }
+        }
 
         return try {
             setModelActiveStatusLocked(activeSettings, DesertAntModel.EAR, "Detecting language with Ear...")
@@ -694,7 +856,9 @@ class SmartPipeline(
             }
         } catch (t: Throwable) {
             Log.w(TAG, "Ear language detection failed, falling back to $fallbackLanguage: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Ear language detection failed, falling back to $fallbackLanguage", t)
             closeEarLocked()
+            System.gc()
             fallbackLanguage
         }
     }
@@ -702,19 +866,35 @@ class SmartPipeline(
     private suspend fun runUhmStageLocked(
         samples: FloatArray,
         activeSettings: ModelSettings,
+        stageSuffix: String = "",
         onStageProgress: ((String) -> Unit)?
     ): List<FrameClassification> {
         if (!activeSettings.uhmEnabled) return emptyList()
         if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM)) {
             return emptyList()
         }
-        val uhmInstance = uhm ?: return emptyList()
+        val mem = evaluateMemoryPressure()
+        if (mem.isCriticalPressure) {
+            DebugLogManager.logWarn(TAG, "Skipping Uhm stage due to critical memory pressure")
+            return emptyList()
+        }
+
+        val uhmInstance = uhm ?: run {
+            val uhmDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.UHM).absolutePath
+            try {
+                Uhm(appContext, uhmDir).also { uhm = it }
+            } catch (_: Throwable) {
+                return emptyList()
+            }
+        }
+
         return try {
-            setModelActiveStatusLocked(activeSettings, DesertAntModel.UHM, "Analyzing hesitations with Uhm...")
-            onStageProgress?.invoke("Uhm")
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.UHM, "Analyzing hesitations with Uhm$stageSuffix...")
+            onStageProgress?.invoke("Uhm$stageSuffix")
             uhmInstance.detect(samples, SAMPLE_RATE_HZ)
         } catch (t: Throwable) {
             Log.w(TAG, "Uhm filler inference failed; bypassing filler removal: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Uhm filler inference failed; bypassing filler removal", t)
             emptyList()
         }
     }
@@ -740,26 +920,55 @@ class SmartPipeline(
                 vozWarmedUp = true
             }
         } catch (firstError: Throwable) {
-            Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); freeing auxiliary RAM and retrying once.")
-            DebugLogManager.logWarn(TAG, "Voz inference failed on first attempt; freeing auxiliary RAM and retrying once", firstError)
-            // Free optional native sessions before retrying Voz to guarantee maximum memory headroom
+            Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); freeing auxiliary RAM and retrying.")
+            DebugLogManager.logWarn(
+                TAG,
+                "Voz inference failed on first attempt; shedding auxiliary sessions, switching to safe memory mode, and retrying",
+                firstError
+            )
+            // Free all optional native sessions & compact JVM heap before retrying Voz
             closeClearLocked()
             closeEarLocked()
+            closeUhmLocked()
             closeVozLocked()
             System.gc()
+            System.runFinalization()
+
+            // Re-configure native runtime with conservative thread count / low-memory safe flags
+            applyHardwareAcceleratorSettingsLocked(activeSettings.hardwareAccelerator, lowMemoryPressure = true)
+
             if (!ensureVozLocked(activeSettings, warmUp = false)) {
                 throw IllegalStateException("Transcription failed after re-initialization: ${firstError.message}", firstError)
             }
             val retryVoz = voz ?: throw IllegalStateException("Voz unavailable on retry.", firstError)
-            retryVoz.transcribeWithContext(
-                samples = samples,
-                sampleRate = SAMPLE_RATE_HZ,
-                language = language,
-                customVocabulary = customVocabulary
-            ).also {
+
+            // If the chunk is > 10s, split it in half on retry to halve peak native & FFI memory
+            if (samples.size > 10 * 16_000) {
+                val mid = samples.size / 2
+                val left = samples.copyOfRange(0, mid)
+                val right = samples.copyOfRange(mid, samples.size)
+                val t1 = retryVoz.transcribeWithContext(left, SAMPLE_RATE_HZ, language, customVocabulary)
+                System.gc()
+                val t2 = retryVoz.transcribeWithContext(right, SAMPLE_RATE_HZ, language, customVocabulary)
+                val leftDurationSec = left.size.toDouble() / SAMPLE_RATE_HZ
+                val shiftedRightWords = t2.words.map { w ->
+                    Word(w.text, w.start + leftDurationSec, w.end + leftDurationSec)
+                }
                 vozWarmedUp = true
-                // Restore auxiliary model handles after retry succeeds
-                ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
+                Transcription(
+                    text = listOf(t1.text.trim(), t2.text.trim()).filter { it.isNotEmpty() }.joinToString(" "),
+                    words = t1.words + shiftedRightWords,
+                    duration = t1.duration + t2.duration
+                )
+            } else {
+                retryVoz.transcribeWithContext(
+                    samples = samples,
+                    sampleRate = SAMPLE_RATE_HZ,
+                    language = language,
+                    customVocabulary = customVocabulary
+                ).also {
+                    vozWarmedUp = true
+                }
             }
         }
     }
@@ -772,6 +981,10 @@ class SmartPipeline(
 
         if (voz == null) {
             try {
+                val mem = evaluateMemoryPressure()
+                if (mem.isJvmHeapTight) {
+                    System.gc()
+                }
                 updateSingleModelStateLocked(
                     activeSettings = activeSettings,
                     model = DesertAntModel.VOZ,
@@ -798,7 +1011,7 @@ class SmartPipeline(
                     activeSettings = activeSettings,
                     model = DesertAntModel.VOZ,
                     state = ModelLoadState.LOADING,
-                    message = "Warming up Voz on ${resolveAcceleratorLabel(activeSettings.hardwareAccelerator)}..."
+                    message = "Warming up Voz on $activeAcceleratorDescription..."
                 )
                 val warmupSilence = FloatArray(3_200) // 200 ms silent frame
                 currentVoz.transcribe(samples = warmupSilence, sampleRate = SAMPLE_RATE_HZ)
@@ -813,14 +1026,19 @@ class SmartPipeline(
     }
 
     private suspend fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings, warmUp: Boolean) {
-        val lowMem = isSystemMemoryLow()
-        if (lowMem) {
-            DebugLogManager.logWarn(TAG, "System memory is low during ensureAuxiliaryModelsLocked; skipping auxiliary warm-up")
+        val mem = evaluateMemoryPressure()
+        val dynamicStaging = shouldStageAuxiliaryModelsDynamically(activeSettings, mem)
+
+        if (mem.isAnyMemoryTight) {
+            DebugLogManager.logInfo(
+                TAG,
+                "Memory-aware dynamic loading active (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB, native=${mem.nativeAllocatedMb}MB); auxiliary models will stage on-demand"
+            )
         }
 
         // 1. Ear
         if (activeSettings.earEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
-            if (ear == null) {
+            if (ear == null && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -839,7 +1057,7 @@ class SmartPipeline(
                 }
             }
             val currentEar = ear
-            if (warmUp && currentEar != null && !earWarmedUp && !lowMem) {
+            if (warmUp && currentEar != null && !earWarmedUp && !mem.isAnyMemoryTight) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -863,9 +1081,9 @@ class SmartPipeline(
             closeEarLocked()
         }
 
-        // 2. Clear
+        // 2. Clear — only keep co-resident in idle RAM if not under dynamic staging / tight memory
         if (activeSettings.clearEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
-            if (clear == null) {
+            if (clear == null && !mem.isAnyMemoryTight) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -884,7 +1102,7 @@ class SmartPipeline(
                 }
             }
             val currentClear = clear
-            if (warmUp && currentClear != null && !clearWarmedUp && !lowMem) {
+            if (warmUp && currentClear != null && !clearWarmedUp && !dynamicStaging) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
@@ -898,6 +1116,7 @@ class SmartPipeline(
                         sampleRate = SAMPLE_RATE_HZ,
                         options = ai.desertant.clear.Options(
                             strength = 1.0,
+                            mastering = Mastering.BYPASS,
                             sampleRate = SAMPLE_RATE_HZ,
                             channelMode = ChannelMode.MONO
                         )
@@ -912,7 +1131,7 @@ class SmartPipeline(
             closeClearLocked()
         }
 
-        // 3. Uhm
+        // 3. Uhm (lightweight JVM acoustic detector, < 1 MB resident footprint)
         if (activeSettings.uhmEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM)) {
             if (uhm == null) {
                 try {
@@ -990,7 +1209,8 @@ class SmartPipeline(
         _pipelineStatus.value = _pipelineStatus.value.copy(
             phase = if (state == ModelLoadState.ACTIVE) PipelinePhase.TRANSCRIBING else PipelinePhase.LOADING,
             configuredAccelerator = activeSettings.hardwareAccelerator,
-            activeAcceleratorLabel = resolveAcceleratorLabel(activeSettings.hardwareAccelerator),
+            activeAcceleratorLabel = activeAcceleratorDescription,
+            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             modelStates = map,
             statusMessage = message,
             loadedCount = countLoadedModelsLocked(activeSettings),
@@ -1028,7 +1248,8 @@ class SmartPipeline(
         _pipelineStatus.value = _pipelineStatus.value.copy(
             phase = resolvedPhase,
             configuredAccelerator = activeSettings.hardwareAccelerator,
-            activeAcceleratorLabel = resolveAcceleratorLabel(activeSettings.hardwareAccelerator),
+            activeAcceleratorLabel = activeAcceleratorDescription,
+            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             modelStates = states,
             statusMessage = resolvedMsg,
             loadedCount = loaded,
@@ -1090,6 +1311,63 @@ class SmartPipeline(
             }
         }
     }
+}
+
+/**
+ * Splits a long 16 kHz PCM [samples] buffer into natural speech segments of at most [maxChunkSamples]
+ * by locating the lowest-energy 80 ms pause window within `minChunkSamples..maxChunkSamples`.
+ *
+ * This prevents quadratic Conformer attention memory blowups and JNI/FFI array OOMs on long dictations
+ * while ensuring splits never cut through the middle of a spoken syllable.
+ */
+fun splitAudioIntoSmartChunks(
+    samples: FloatArray,
+    maxChunkSamples: Int = SmartPipeline.DEFAULT_MAX_CHUNK_SAMPLES,
+    minChunkSamples: Int = SmartPipeline.DEFAULT_MIN_CHUNK_SAMPLES,
+    pauseWindowSamples: Int = 1_280 // 80 ms @ 16 kHz
+): List<FloatArray> {
+    if (samples.isEmpty()) return emptyList()
+    val safeMax = max(3_200, maxChunkSamples)
+    if (samples.size <= safeMax) return listOf(samples)
+
+    val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
+    val window = pauseWindowSamples.coerceIn(320, 3_200)
+    val step = max(160, window / 4)
+    val chunks = mutableListOf<FloatArray>()
+
+    var cursor = 0
+    while (cursor < samples.size) {
+        val remaining = samples.size - cursor
+        if (remaining <= safeMax) {
+            chunks.add(samples.copyOfRange(cursor, samples.size))
+            break
+        }
+
+        val searchStart = cursor + safeMin
+        val searchEnd = min(samples.size - window, cursor + safeMax)
+        var bestSplitIndex = cursor + safeMax
+        var lowestEnergy = Double.MAX_VALUE
+
+        var pos = searchStart
+        while (pos <= searchEnd) {
+            var energy = 0.0
+            for (i in 0 until window) {
+                val s = samples[pos + i].toDouble()
+                energy += s * s
+            }
+            if (energy < lowestEnergy) {
+                lowestEnergy = energy
+                bestSplitIndex = pos + (window / 2)
+            }
+            pos += step
+        }
+
+        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, min(samples.size, cursor + safeMax))
+        chunks.add(samples.copyOfRange(cursor, splitAt))
+        cursor = splitAt
+    }
+
+    return chunks
 }
 
 /**

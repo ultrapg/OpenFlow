@@ -328,7 +328,7 @@ fun SpeechRecognitionSettingsSection(
                     pipelineStatus.phase == PipelinePhase.WARMING_UP ||
                     pipelineStatus.phase == PipelinePhase.TRANSCRIBING
                 OutlinedButton(
-                    onClick = { smartPipeline.initializeAsync(warmUp = true) },
+                    onClick = { smartPipeline.initializeAsync(warmUp = true, forceReload = pipelineStatus.isReady) },
                     enabled = !isWorking && !downloadState.isRunning,
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -376,6 +376,11 @@ fun SpeechRecognitionSettingsSection(
                             text = "Active delegate: ${pipelineStatus.activeAcceleratorLabel}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Detected NPU / SoC: ${pipelineStatus.detectedNpuSummary}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     Icon(

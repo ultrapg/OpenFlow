@@ -141,6 +141,10 @@ object DebugLogManager {
         }
     }
 
+    fun logWarning(tag: String, message: String, throwable: Throwable? = null) {
+        logWarn(tag, message, throwable)
+    }
+
     fun logError(tag: String, message: String, throwable: Throwable? = null) {
         val ctx = appContext
         val mem = if (ctx != null) " | ${formatMemorySummary(ctx)}" else ""

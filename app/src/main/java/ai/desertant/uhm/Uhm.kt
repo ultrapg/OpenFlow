@@ -290,9 +290,13 @@ class Uhm(
             lowBandRatios[f] = (1f - highFreqRatio).coerceIn(0f, 1f)
         }
 
-        // Determine adaptive speech energy floor
-        val sortedEnergies = energies.clone().apply { sort() }
-        val medianEnergy = sortedEnergies[totalFrames / 2]
+        // Determine adaptive speech energy floor using a bounded sample (at most 512 frames) to avoid cloning large arrays
+        val sampleStep = max(1, totalFrames / 512)
+        val sampleCount = (totalFrames + sampleStep - 1) / sampleStep
+        val sampledEnergies = FloatArray(sampleCount) { idx ->
+            energies[min(idx * sampleStep, totalFrames - 1)]
+        }.apply { sort() }
+        val medianEnergy = sampledEnergies[sampleCount / 2]
         val voiceThreshold = max(0.012f, medianEnergy * 0.35f)
 
         // Identify sustained steady-envelope voiced plateaus (typical 140 ms - 800 ms hesitation acoustic profile)

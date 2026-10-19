@@ -104,25 +104,25 @@ enum class HardwareAccelerator(
         id = "auto",
         displayName = "Auto (NPU / GPU / CPU)",
         shortLabel = "Auto",
-        description = "Automatically selects NPU or GPU (OpenCL) with multi-threaded CPU XNNPACK fallback"
+        description = "Automatically selects Qualcomm Hexagon NPU, MediaTek NeuroPilot, Tensor TPU, Exynos NPU, or OpenCL GPU with XNNPACK fallback"
     ),
     NPU(
         id = "npu",
         displayName = "NPU / AI Accelerator",
         shortLabel = "NPU",
-        description = "Prioritizes dedicated NPU / AI hardware (QNN / NeuroPilot / Tensor) with GPU & CPU fallback"
+        description = "Prioritizes Qualcomm Hexagon HTP/QNN, MediaTek NeuroPilot APU, Google Tensor TPU, Exynos ENN, Kirin HiAI & NNAPI"
     ),
     GPU(
         id = "gpu",
-        displayName = "GPU (OpenCL)",
+        displayName = "GPU (OpenCL / GLES)",
         shortLabel = "GPU",
-        description = "Accelerates neural audio models on mobile GPU via LiteRT OpenCL with CPU fallback"
+        description = "Accelerates neural audio models on Adreno / Mali / Immortalis GPU via LiteRT OpenCL/GLES with CPU fallback"
     ),
     CPU(
         id = "cpu",
         displayName = "CPU (XNNPACK)",
         shortLabel = "CPU",
-        description = "Multi-threaded ARM NEON / XNNPACK execution; lowest VRAM footprint and maximum stability with all 4 models"
+        description = "Multi-threaded ARM NEON / XNNPACK execution; lowest memory footprint and maximum stability with all 4 models"
     );
 
     companion object {
