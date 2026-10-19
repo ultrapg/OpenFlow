@@ -509,7 +509,7 @@ object NpuHardwareManager {
         requested: HardwareAccelerator,
         lowMemoryPressure: Boolean
     ): String? {
-        if (lowMemoryPressure && requested == HardwareAccelerator.CPU) {
+        if (lowMemoryPressure) {
             return "cpu"
         }
         return when (requested) {

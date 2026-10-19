@@ -11,6 +11,9 @@ fi
 export GRADLE_OPTS="${GRADLE_OPTS:-} -Djava.net.preferIPv4Stack=true"
 if [ -x "$SCRIPT_DIR/gradle-8.9/bin/gradle" ]; then
     exec "$SCRIPT_DIR/gradle-8.9/bin/gradle" "$@"
+elif [ -n "$(find "${HOME}/.gradle/wrapper/dists/gradle-8.9-bin" -maxdepth 4 -name gradle -type f 2>/dev/null | head -n 1)" ]; then
+    CACHED_GRADLE="$(find "${HOME}/.gradle/wrapper/dists/gradle-8.9-bin" -maxdepth 4 -name gradle -type f 2>/dev/null | head -n 1)"
+    exec "$CACHED_GRADLE" "$@"
 else
     exec gradle "$@"
 fi

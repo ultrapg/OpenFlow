@@ -1393,12 +1393,13 @@ inline fun enhanceAudioInSingleWindowSlices(
     val safeMaxWindow = max(1_600, maxWindowSamples)
     if (samples.size <= safeMaxWindow) {
         val single = enhanceSlice(samples)
-        return if (single.size == samples.size) {
-            single
-        } else if (single.isNotEmpty()) {
-            FloatArray(samples.size) { idx -> single[idx.coerceAtMost(single.lastIndex)] }
-        } else {
-            samples
+        if (single.isEmpty()) return samples
+        if (single.size == samples.size && single.all { it.isFinite() }) {
+            return single
+        }
+        return FloatArray(samples.size) { idx ->
+            val candidate = if (idx < single.size) single[idx] else samples[idx]
+            if (candidate.isFinite()) candidate else samples[idx]
         }
     }
 
@@ -1418,7 +1419,7 @@ inline fun enhanceAudioInSingleWindowSlices(
             // Fallback to raw slice for this window if native returned empty
             for (i in 0 until sliceLen) {
                 val outIdx = start + i
-                if (isFirstSlice || i >= safeFade) {
+                if (isFirstSlice || i >= safeFade || safeFade <= 0) {
                     output[outIdx] = rawSlice[i]
                 } else {
                     val alpha = i.toFloat() / safeFade.toFloat()
@@ -1428,8 +1429,9 @@ inline fun enhanceAudioInSingleWindowSlices(
         } else {
             for (i in 0 until sliceLen) {
                 val outIdx = start + i
-                val sampleVal = enhancedSlice[i.coerceAtMost(enhancedSlice.lastIndex)]
-                if (isFirstSlice || i >= safeFade) {
+                val rawCandidate = if (i < enhancedSlice.size) enhancedSlice[i] else rawSlice[i]
+                val sampleVal = if (rawCandidate.isFinite()) rawCandidate else rawSlice[i]
+                if (isFirstSlice || i >= safeFade || safeFade <= 0) {
                     output[outIdx] = sampleVal
                 } else {
                     val alpha = i.toFloat() / safeFade.toFloat()
@@ -1698,6 +1700,11 @@ fun filterWordsByFillerOverlap(
     )
 }
 
+private val LEADING_ORPHAN_PUNCT_REGEX = Regex("^[.,;:\\-–—]+\\s*")
+private val SPACE_BEFORE_PUNCT_REGEX = Regex("\\s+([.,!?:;%€])")
+private val DUPLICATE_PUNCT_REGEX = Regex("([,;:])\\s*[,;:]+")
+private val MULTI_SPACE_REGEX = Regex("\\s+")
+
 /**
  * Cleans up orphaned punctuation, duplicate spaces, and re-capitalizes the new leading word
  * when a sentence-initial filler word was removed.
@@ -1711,13 +1718,13 @@ fun normalizeTranscriptText(
     var cleaned = rawText
         .trim()
         // Strip leading orphaned punctuation left behind after a leading filler removal (e.g. ", ich...")
-        .replace(Regex("^[.,;:\\-–—]+\\s*"), "")
+        .replace(LEADING_ORPHAN_PUNCT_REGEX, "")
         // Collapse spaces before punctuation
-        .replace(Regex("\\s+([.,!?:;%€])"), "$1")
+        .replace(SPACE_BEFORE_PUNCT_REGEX, "$1")
         // Collapse duplicate punctuation (e.g. ", ," -> ",")
-        .replace(Regex("([,;:])\\s*[,;:]+"), "$1")
+        .replace(DUPLICATE_PUNCT_REGEX, "$1")
         // Collapse multiple spaces
-        .replace(Regex("\\s+"), " ")
+        .replace(MULTI_SPACE_REGEX, " ")
         .trim()
 
     if (cleaned.isEmpty()) return ""
@@ -1743,9 +1750,15 @@ fun applyCustomVocabulary(text: String, customVocabulary: List<String>): String 
     for (vocabTerm in customVocabulary) {
         val trimmed = vocabTerm.trim()
         if (trimmed.isEmpty()) continue
-        // Replace case-insensitive exact matches with the user's canonical casing
+        // Replace case-insensitive matches with the user's canonical casing, supporting both
+        // alphanumeric terms and terms starting/ending with punctuation (e.g. ".NET", "C++").
         val escaped = Regex.escape(trimmed)
-        updated = updated.replace(Regex("\\b$escaped\\b", RegexOption.IGNORE_CASE), trimmed)
+        val leadingBoundary = if (trimmed.first().isLetterOrDigit()) "\\b" else "(?<!\\w)"
+        val trailingBoundary = if (trimmed.last().isLetterOrDigit()) "\\b" else "(?!\\w)"
+        updated = updated.replace(
+            Regex("$leadingBoundary$escaped$trailingBoundary", RegexOption.IGNORE_CASE),
+            Regex.escapeReplacement(trimmed)
+        )
     }
     return updated
         .split(' ')
@@ -1765,27 +1778,45 @@ private fun biasWordWithCustomVocabulary(wordText: String, customVocabulary: Lis
         if (core.equals(cleanTerm, ignoreCase = true)) {
             return leadingPunct + cleanTerm + trailingPunct
         }
-        // Single-character edit distance biasing for words >= 5 characters
-        if (core.length >= 5 && cleanTerm.length >= 5 && levenshteinDistance(core.lowercase(Locale.ROOT), cleanTerm.lowercase(Locale.ROOT)) == 1) {
+        // Zero-allocation single-character edit distance biasing for words >= 5 characters
+        if (core.length >= 5 && cleanTerm.length >= 5 && isSingleEditDistanceIgnoreCase(core, cleanTerm)) {
             return leadingPunct + cleanTerm + trailingPunct
         }
     }
     return wordText
 }
 
-private fun levenshteinDistance(a: String, b: String): Int {
-    if (a == b) return 0
-    if (a.isEmpty()) return b.length
-    if (b.isEmpty()) return a.length
-    val prev = IntArray(b.length + 1) { it }
-    val curr = IntArray(b.length + 1)
-    for (i in a.indices) {
-        curr[0] = i + 1
-        for (j in b.indices) {
-            val cost = if (a[i] == b[j]) 0 else 1
-            curr[j + 1] = min(min(curr[j] + 1, prev[j + 1] + 1), prev[j] + cost)
+/**
+ * Fast $O(N)$ zero-allocation check for whether [a] and [b] are at most 1 Levenshtein edit apart
+ * (case-insensitive), avoiding `IntArray` allocations per word-vocabulary pair.
+ */
+internal fun isSingleEditDistanceIgnoreCase(a: String, b: String): Boolean {
+    val lenA = a.length
+    val lenB = b.length
+    if (abs(lenA - lenB) > 1) return false
+
+    var i = 0
+    var j = 0
+    var edits = 0
+    while (i < lenA && j < lenB) {
+        if (a[i].equals(b[j], ignoreCase = true)) {
+            i++
+            j++
+        } else {
+            edits++
+            if (edits > 1) return false
+            when {
+                lenA > lenB -> i++
+                lenB > lenA -> j++
+                else -> {
+                    i++
+                    j++
+                }
+            }
         }
-        System.arraycopy(curr, 0, prev, 0, prev.size)
     }
-    return prev[b.length]
+    if (i < lenA || j < lenB) {
+        edits++
+    }
+    return edits == 1
 }

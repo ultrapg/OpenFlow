@@ -427,24 +427,32 @@ fun mergeFillerFrames(
     frames: List<FrameClassification>,
     maxGapMs: Long = 40L
 ): List<FillerSpan> {
-    val fillerFrames = frames.filter { it.classId in 1..5 }
-    if (fillerFrames.isEmpty()) return emptyList()
+    if (frames.isEmpty()) return emptyList()
 
-    val spans = mutableListOf<FillerSpan>()
-    var currentStart = fillerFrames.first().startMs
-    var currentEnd = fillerFrames.first().endMs
-    var currentClass = fillerFrames.first().classId
-    var confidenceSum = fillerFrames.first().confidence
-    var count = 1
+    var spans: MutableList<FillerSpan>? = null
+    var currentStart = 0L
+    var currentEnd = 0L
+    var currentClass = 0
+    var confidenceSum = 0f
+    var count = 0
 
-    for (i in 1 until fillerFrames.size) {
-        val frame = fillerFrames[i]
-        if (frame.startMs - currentEnd <= maxGapMs) {
+    for (i in frames.indices) {
+        val frame = frames[i]
+        if (frame.classId !in 1..5) continue
+
+        if (count == 0) {
+            currentStart = frame.startMs
+            currentEnd = frame.endMs
+            currentClass = frame.classId
+            confidenceSum = frame.confidence
+            count = 1
+        } else if (frame.startMs - currentEnd <= maxGapMs) {
             currentEnd = max(currentEnd, frame.endMs)
             confidenceSum += frame.confidence
             count++
         } else {
-            spans.add(
+            val list = spans ?: ArrayList<FillerSpan>().also { spans = it }
+            list.add(
                 FillerSpan(
                     startMs = currentStart,
                     endMs = currentEnd,
@@ -460,7 +468,9 @@ fun mergeFillerFrames(
         }
     }
 
-    spans.add(
+    if (count == 0) return emptyList()
+    val list = spans ?: ArrayList<FillerSpan>(1)
+    list.add(
         FillerSpan(
             startMs = currentStart,
             endMs = currentEnd,
@@ -468,5 +478,5 @@ fun mergeFillerFrames(
             confidence = confidenceSum / count
         )
     )
-    return spans
+    return list
 }

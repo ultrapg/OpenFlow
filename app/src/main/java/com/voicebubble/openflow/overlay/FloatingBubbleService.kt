@@ -166,9 +166,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         if (intent?.action == ACTION_REFRESH_SETTINGS) {
             clampBubblePositionToScreen()
-            serviceScope.launch(Dispatchers.Default) {
-                smartPipeline.reloadSettings(ModelSettings.load(this@FloatingBubbleService))
-            }
         }
         return START_STICKY
     }
@@ -376,7 +373,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     var disappearDelayMs by androidx.compose.runtime.remember {
                         androidx.compose.runtime.mutableStateOf(
                             settingsPrefs.getLong(KEY_BUBBLE_DISAPPEAR_DELAY_MS, DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS)
-                                .coerceIn(0L, 10_000L)
+                                .coerceIn(0L, 5_000L)
                         )
                     }
                     var bubbleSize by androidx.compose.runtime.remember {
@@ -407,7 +404,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                         disappearDelayMs = sharedPreferences.getLong(
                                             key,
                                             DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS
-                                        ).coerceIn(0L, 10_000L)
+                                        ).coerceIn(0L, 5_000L)
                                     }
                                     "bubble_size" -> {
                                         bubbleSize = sharedPreferences.getFloat(key, 52f).coerceIn(36f, 80f)
@@ -507,7 +504,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             setKeepScreenOn(true)
                             serviceScope.launch {
-                                audioController.startRecording(this)
+                                val started = audioController.startRecording(this)
+                                if (!started) {
+                                    bubbleState.value = OverlayBubbleState.IDLE
+                                    setKeepScreenOn(false)
+                                    releaseDictationWakeLock()
+                                    withContext(Dispatchers.Main) {
+                                        android.widget.Toast.makeText(
+                                            this@FloatingBubbleService,
+                                            "Could not access microphone (may be in use by another app).",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
                             }
                         },
                         onStopRecording = {

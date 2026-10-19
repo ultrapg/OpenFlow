@@ -72,8 +72,8 @@ class AudioRecordingController {
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun startRecording(coroutineScope: CoroutineScope) {
-        controllerMutex.withLock {
+    suspend fun startRecording(coroutineScope: CoroutineScope): Boolean {
+        return controllerMutex.withLock {
             try {
                 if (audioRecord?.state == AudioRecord.STATE_INITIALIZED &&
                     audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
@@ -88,43 +88,68 @@ class AudioRecordingController {
             releaseInternal()
 
             val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, channelConfig, audioFormat)
-            val bufferSize = maxOf(minBufferSize * 2, 4096)
+            val bufferSize = if (minBufferSize > 0) maxOf(minBufferSize * 2, 4096) else 8192
 
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                SAMPLE_RATE,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
+            val record = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    SAMPLE_RATE,
+                    channelConfig,
+                    audioFormat,
+                    bufferSize
+                )
+            } catch (e: Exception) {
+                DebugLogManager.logWarning("AudioRecordingController", "Failed to create AudioRecord: ${e.message}", e)
+                return@withLock false
+            }
 
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                DebugLogManager.logWarning("AudioRecordingController", "AudioRecord failed to initialize (state=${record.state})")
+                try {
+                    record.release()
+                } catch (_: Throwable) {
+                }
+                return@withLock false
+            }
+
+            audioRecord = record
             synchronized(bufferLock) {
                 pcmBuffer = FloatArray(INITIAL_CAPACITY_SAMPLES)
                 pcmSize = 0
             }
 
-            audioRecord?.let { record ->
-                try {
-                    if (NoiseSuppressor.isAvailable()) {
-                        noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)
-                        noiseSuppressor?.enabled = true
-                    }
-                    if (AutomaticGainControl.isAvailable()) {
-                        agc = AutomaticGainControl.create(record.audioSessionId)
-                        agc?.enabled = true
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-
             try {
-                if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                    audioRecord?.startRecording()
+                if (NoiseSuppressor.isAvailable()) {
+                    noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)
+                    noiseSuppressor?.enabled = true
+                }
+                if (AutomaticGainControl.isAvailable()) {
+                    agc = AutomaticGainControl.create(record.audioSessionId)
+                    agc?.enabled = true
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
-                return@withLock
+            }
+
+            try {
+                record.startRecording()
+                if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    DebugLogManager.logWarning("AudioRecordingController", "AudioRecord did not enter RECORDSTATE_RECORDING")
+                    synchronized(bufferLock) {
+                        pcmBuffer = null
+                        pcmSize = 0
+                    }
+                    releaseInternal()
+                    return@withLock false
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                synchronized(bufferLock) {
+                    pcmBuffer = null
+                    pcmSize = 0
+                }
+                releaseInternal()
+                return@withLock false
             }
 
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
@@ -179,6 +204,7 @@ class AudioRecordingController {
                     }
                 }
             }
+            true
         }
     }
 

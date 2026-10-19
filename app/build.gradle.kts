@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "2.4.0"
+        versionCode = 15
+        versionName = "2.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -63,12 +63,19 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystoreFile = file("../release.jks")
-            if (keystoreFile.exists()) {
-                storeFile = keystoreFile
-                storePassword = "password"
-                keyAlias = "key0"
-                keyPassword = "password"
+            val candidateKeystores = listOfNotNull(
+                System.getenv("RELEASE_KEYSTORE")?.let { file(it) },
+                file("../../release.jks"),
+                file("../release.jks"),
+                file("${System.getProperty("user.home")}/release.jks"),
+                file("${System.getProperty("user.home")}/.android/release.jks")
+            )
+            val resolvedKeystore = candidateKeystores.firstOrNull { it.exists() }
+            if (resolvedKeystore != null) {
+                storeFile = resolvedKeystore
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "password"
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "key0"
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "password"
             }
         }
     }

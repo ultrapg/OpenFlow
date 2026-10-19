@@ -351,19 +351,39 @@ object DebugLogManager {
                 raf.seek(len - keepBytes)
                 raf.readFully(tailBytes)
             }
-            val text = "--- [Older log entries truncated] ---\n" + String(tailBytes, Charsets.UTF_8)
+            val firstNewlineIdx = tailBytes.indexOf('\n'.code.toByte())
+            val startOffset = if (firstNewlineIdx in 0 until tailBytes.lastIndex) firstNewlineIdx + 1 else 0
+            val alignedStr = String(tailBytes, startOffset, tailBytes.size - startOffset, Charsets.UTF_8)
+            val text = "--- [Older log entries truncated] ---\n$alignedStr"
             file.writeText(text)
         } catch (_: Throwable) {
         }
     }
 
-    private fun readTailText(file: File, maxChars: Int): String {
+    internal fun readTailText(file: File, maxChars: Int): String {
         return try {
-            val text = file.readText()
-            if (text.length <= maxChars) {
-                text.trimEnd()
+            val len = file.length()
+            if (len <= 0L) return ""
+            // Read at most maxChars * 3 bytes from the end of the file to avoid loading multi-hundred-KB files into heap
+            val maxBytesToRead = (maxChars.toLong() * 3L).coerceAtLeast(4_096L)
+            if (len <= maxBytesToRead) {
+                val text = file.readText()
+                if (text.length <= maxChars) {
+                    text.trimEnd()
+                } else {
+                    "... [Showing last $maxChars chars] ...\n" + text.takeLast(maxChars).trimEnd()
+                }
             } else {
-                "... [Showing last $maxChars chars] ...\n" + text.takeLast(maxChars).trimEnd()
+                val tailBytes = ByteArray(maxBytesToRead.toInt())
+                RandomAccessFile(file, "r").use { raf ->
+                    raf.seek(len - maxBytesToRead)
+                    raf.readFully(tailBytes)
+                }
+                val firstNewlineIdx = tailBytes.indexOf('\n'.code.toByte())
+                val startOffset = if (firstNewlineIdx in 0 until tailBytes.lastIndex) firstNewlineIdx + 1 else 0
+                val decoded = String(tailBytes, startOffset, tailBytes.size - startOffset, Charsets.UTF_8)
+                val tail = if (decoded.length <= maxChars) decoded.trimEnd() else decoded.takeLast(maxChars).trimEnd()
+                "... [Showing last $maxChars chars] ...\n$tail"
             }
         } catch (t: Throwable) {
             "Failed to read log file: ${t.message}"
@@ -389,8 +409,12 @@ object DebugLogManager {
         return sw.toString().trimEnd()
     }
 
+    private val timestampFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    }
+
     private fun formatTimestamp(epochMs: Long): String {
-        return SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date(epochMs))
+        return timestampFormat.get()!!.format(Date(epochMs))
     }
 
     private fun trimLevelToString(level: Int): String = when (level) {

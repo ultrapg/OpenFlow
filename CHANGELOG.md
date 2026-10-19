@@ -2,6 +2,31 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.4.1] - 2026-10-19
+
+### Fixed
+- **Audio Recording Startup & Resource Leak Hardening (`AudioRecordingController`, `FloatingBubbleService`):**
+  - Fixed a native `AudioRecord` and 960 KB PCM buffer leak when `AudioRecord` fails to initialize or enter `RECORDSTATE_RECORDING` (e.g., when another app holds an exclusive microphone lock).
+  - `AudioRecordingController.startRecording()` now returns a `Boolean` status so `FloatingBubbleService` immediately resets the bubble from `RECORDING` to `IDLE`, clears `FLAG_KEEP_SCREEN_ON`, releases the `WakeLock`, and notifies the user instead of leaving the bubble stuck in a recording state.
+- **Custom Vocabulary Punctuation Boundary & Replacement Escaping Bug (`SmartPipeline`):**
+  - Fixed `applyCustomVocabulary` failing to match custom vocabulary terms that start or end with non-word characters (such as `C++` or `.NET`) due to `\b` word-boundary assertions, and escaped replacement strings via `Regex.escapeReplacement`.
+- **Single-Window `Clear` Slice NaN & Truncation Guard (`SmartPipeline`):**
+  - Hardened `enhanceAudioInSingleWindowSlices` to fall back to the corresponding original raw PCM sample (instead of repeating the last sample or propagating `NaN`/`Infinite` GPU shader glitches) if a slice is shorter than expected or contains non-finite floats.
+- **Low-Memory Native Device ID Fallback (`NpuHardwareManager`):**
+  - Fixed `NpuHardwareManager.resolveNativeDeviceId` so `lowMemoryPressure = true` reliably resolves to `"cpu"` regardless of the requested accelerator mode.
+- **Disappear Delay Range Alignment (`FloatingBubbleService`):**
+  - Aligned the `disappearDelayMs` clamp range (`0L..5_000L`) in `FloatingBubbleService` with the slider in `MainActivity`.
+
+### Changed / Optimized
+- **Zero-Allocation Single-Edit Distance & Pre-Compiled Regexes (`SmartPipeline`):**
+  - Replaced the $O(N \times M)$ `IntArray`-allocating `levenshteinDistance` in `biasWordWithCustomVocabulary` with an $O(N)$ zero-allocation `isSingleEditDistanceIgnoreCase` check, and pre-compiled all text-normalization `Regex` instances in `normalizeTranscriptText`.
+- **Single-Pass Filler Span Merging (`Uhm`):**
+  - Optimized `mergeFillerFrames` to iterate `FrameClassification` lists in a single pass without allocating an intermediate filtered list.
+- **Bounded Log Tail Reading & Newline-Aligned Log Truncation (`DebugLogManager`):**
+  - Optimized `readTailText` to seek and read only the tail bytes via `RandomAccessFile` instead of loading entire multi-hundred-KB log files into JVM heap memory, aligned `trimLogFileInPlace` to newline boundaries so multi-byte UTF-8 sequences are never split mid-character, and cached `SimpleDateFormat` in a `ThreadLocal`.
+- **Eliminated Redundant Pipeline Reloads on UI Settings Changes (`FloatingBubbleService`):**
+  - Stopped `ACTION_REFRESH_SETTINGS` from triggering a redundant `smartPipeline.reloadSettings(...)` pass when only bubble UI preferences (size, haptic feedback, disappear delay) are adjusted.
+
 ## [2.4.0] - 2026-10-19
 
 ### Fixed

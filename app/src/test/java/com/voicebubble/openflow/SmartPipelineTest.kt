@@ -487,4 +487,81 @@ class SmartPipelineTest {
             assertEquals(input[i] * 0.8f, enhanced[i], 1e-5f)
         }
     }
+
+    @Test
+    fun `enhanceAudioInSingleWindowSlices sanitizes NaN samples and falls back to raw on truncated slices`() {
+        val input = FloatArray(5_000) { idx -> (idx % 100) * 0.01f }
+        val enhanced = com.voicebubble.openflow.core.speech.enhanceAudioInSingleWindowSlices(
+            samples = input,
+            maxWindowSamples = 2_000,
+            crossfadeSamples = 200
+        ) { slice ->
+            // Return a truncated slice with a NaN value at index 10
+            FloatArray(slice.size / 2) { i ->
+                if (i == 10) Float.NaN else slice[i]
+            }
+        }
+
+        assertEquals(input.size, enhanced.size)
+        assertTrue("Enhanced output must never contain NaN or Infinite floats", enhanced.all { it.isFinite() })
+        for (i in input.indices) {
+            assertEquals(input[i], enhanced[i], 1e-5f)
+        }
+    }
+
+    @Test
+    fun `applyCustomVocabulary supports punctuation terms and zero-allocation single-edit matching`() {
+        val text = "Wir entwickeln mit c++ und .net für openfloe."
+        val vocab = listOf("C++", ".NET", "OpenFlow")
+        val result = com.voicebubble.openflow.core.speech.applyCustomVocabulary(text, vocab)
+        assertEquals("Wir entwickeln mit C++ und .NET für OpenFlow.", result)
+
+        assertTrue(com.voicebubble.openflow.core.speech.isSingleEditDistanceIgnoreCase("paraket", "Parakeet"))
+        assertTrue(com.voicebubble.openflow.core.speech.isSingleEditDistanceIgnoreCase("OpenFloe", "OpenFlow"))
+        assertFalse(com.voicebubble.openflow.core.speech.isSingleEditDistanceIgnoreCase("OpenFlow", "OpenFlow"))
+        assertFalse(com.voicebubble.openflow.core.speech.isSingleEditDistanceIgnoreCase("short", "very_long_word"))
+    }
+
+    @Test
+    fun `resolveNativeDeviceId falls back to cpu under low memory pressure`() {
+        assertEquals(
+            "cpu",
+            com.voicebubble.openflow.core.speech.NpuHardwareManager.resolveNativeDeviceId(
+                com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+                lowMemoryPressure = true
+            )
+        )
+        assertEquals(
+            "cpu",
+            com.voicebubble.openflow.core.speech.NpuHardwareManager.resolveNativeDeviceId(
+                com.voicebubble.openflow.settings.HardwareAccelerator.CPU,
+                lowMemoryPressure = false
+            )
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.NpuHardwareManager.resolveNativeDeviceId(
+                com.voicebubble.openflow.settings.HardwareAccelerator.GPU,
+                lowMemoryPressure = false
+            )
+        )
+    }
+
+    @Test
+    fun `DebugLogManager readTailText reads bounded tail cleanly aligned to newline`() {
+        val tempFile = java.io.File.createTempFile("openflow_log_tail_test", ".txt")
+        try {
+            val sb = StringBuilder()
+            for (i in 1..400) {
+                sb.append("[2026-10-19 18:00:00.000] [INFO/Test] Log line number ").append(i).append('\n')
+            }
+            tempFile.writeText(sb.toString())
+
+            val tail = com.voicebubble.openflow.core.debug.DebugLogManager.readTailText(tempFile, maxChars = 1_500)
+            assertTrue(tail.contains("Log line number 400"))
+            assertTrue(tail.startsWith("... [Showing last 1500 chars] ..."))
+        } finally {
+            tempFile.delete()
+        }
+    }
 }
