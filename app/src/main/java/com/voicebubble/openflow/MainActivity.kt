@@ -22,12 +22,15 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -42,11 +45,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.permissions.*
 import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
+import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.overlay.FloatingBubbleService
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.ui.onboarding.OnboardingScreen
+import com.voicebubble.openflow.ui.settings.DeveloperModeSection
 import com.voicebubble.openflow.ui.settings.SpeechRecognitionSettingsSection
 import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 
@@ -171,10 +176,76 @@ class MainActivity : ComponentActivity() {
                                 .padding(16.dp)
                                 .verticalScroll(rememberScrollState())
                         ) {
+                            val isDeveloperModeUnlocked by DebugLogManager.isUnlocked.collectAsState()
+                            val appVersionName = remember {
+                                try {
+                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.3.8"
+                                } catch (_: Throwable) {
+                                    "2.3.8"
+                                }
+                            }
+                            var versionTapCount by remember { mutableIntStateOf(0) }
+                            var lastVersionTapMs by remember { mutableLongStateOf(0L) }
+                            var activeToast by remember { mutableStateOf<android.widget.Toast?>(null) }
+
                             Text(
                                 "OpenFlow Settings",
                                 style = MaterialTheme.typography.headlineMedium,
                                 color = MaterialTheme.colorScheme.onBackground
+                            )
+                            Text(
+                                text = if (isDeveloperModeUnlocked) {
+                                    "Version $appVersionName (Developer Mode)"
+                                } else {
+                                    "Version $appVersionName"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isDeveloperModeUnlocked) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                modifier = Modifier
+                                    .padding(top = 2.dp)
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null
+                                    ) {
+                                        val now = SystemClock.elapsedRealtime()
+                                        if (now - lastVersionTapMs > 1_200L) {
+                                            versionTapCount = 1
+                                        } else {
+                                            versionTapCount++
+                                        }
+                                        lastVersionTapMs = now
+
+                                        if (versionTapCount >= 5) {
+                                            versionTapCount = 0
+                                            activeToast?.cancel()
+                                            if (!isDeveloperModeUnlocked) {
+                                                DebugLogManager.setUnlocked(context, true)
+                                                activeToast = android.widget.Toast.makeText(
+                                                    context,
+                                                    "Developer Mode & Crash/Debug Logger activated!",
+                                                    android.widget.Toast.LENGTH_SHORT
+                                                ).also { it.show() }
+                                            } else {
+                                                activeToast = android.widget.Toast.makeText(
+                                                    context,
+                                                    "Developer Mode is already active below.",
+                                                    android.widget.Toast.LENGTH_SHORT
+                                                ).also { it.show() }
+                                            }
+                                        } else if (!isDeveloperModeUnlocked && versionTapCount >= 3) {
+                                            val remaining = 5 - versionTapCount
+                                            activeToast?.cancel()
+                                            activeToast = android.widget.Toast.makeText(
+                                                context,
+                                                "Tap $remaining more time${if (remaining == 1) "" else "s"} to unlock Developer Mode",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).also { it.show() }
+                                        }
+                                    }
                             )
                             Spacer(modifier = Modifier.height(16.dp))
 
@@ -496,6 +567,14 @@ class MainActivity : ComponentActivity() {
                                     Text(if (isBubbleServiceRunning) "Refresh Bubble" else "Start Bubble")
                                 }
                             }
+
+                            if (isDeveloperModeUnlocked) {
+                                Spacer(modifier = Modifier.height(24.dp))
+                                DeveloperModeSection(
+                                    onHideDeveloperMode = {}
+                                )
+                            }
+
                             Spacer(modifier = Modifier.height(16.dp))
                         }
                     }

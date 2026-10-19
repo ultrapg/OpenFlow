@@ -33,6 +33,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.system.Os
 import android.util.Log
+import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.HardwareAccelerator
@@ -208,6 +209,11 @@ class SmartPipeline(
             val startMs = SystemClock.elapsedRealtime()
             val currentSettings = settings
             applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator)
+            DebugLogManager.logInfo(
+                TAG,
+                "initialize(warmUp=$warmUp) start • enabled=${currentSettings.enabledModels().map { it.id }} • accel=${currentSettings.hardwareAccelerator.displayName}",
+                includeMemory = true
+            )
 
             updateStatusSnapshot(
                 activeSettings = currentSettings,
@@ -243,6 +249,11 @@ class SmartPipeline(
                 activeSettings = currentSettings,
                 phaseOverride = finalPhase,
                 messageOverride = finalMsg
+            )
+            DebugLogManager.logInfo(
+                TAG,
+                "initialize(warmUp=$warmUp) finished in ${elapsedMs}ms • vozLoaded=$vozLoaded • status=$finalMsg",
+                includeMemory = true
             )
             vozLoaded
         }
@@ -280,6 +291,7 @@ class SmartPipeline(
 
             if (accelChanged) {
                 Log.i(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; reloading sessions.")
+                DebugLogManager.logInfo(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; closing active sessions", includeMemory = true)
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
@@ -312,6 +324,7 @@ class SmartPipeline(
                 phaseOverride = phase,
                 messageOverride = msg
             )
+            DebugLogManager.logInfo(TAG, "reloadSettings finished • $msg", includeMemory = true)
         }
     }
 
@@ -339,6 +352,11 @@ class SmartPipeline(
             try {
                 val activeSettings = settings
                 applyHardwareAcceleratorSettingsLocked(activeSettings.hardwareAccelerator)
+                DebugLogManager.logInfo(
+                    TAG,
+                    "transcribe() start • rawSamples=${samples.size}, trimmedSamples=${trimmedSamples.size} (${audioDurationMs}ms) • models=${activeSettings.enabledModels().map { it.id }}",
+                    includeMemory = true
+                )
 
                 // Ensure models are ready
                 if (!ensureVozLocked(activeSettings, warmUp = false)) {
@@ -355,6 +373,7 @@ class SmartPipeline(
                 // Keeping Clear warmed up avoids calling eglTerminate on the shared process EGLDisplay
                 // and prevents re-compiling clear-studio.tflite on every dictation.
                 if (activeSettings.clearEnabled && isSystemMemoryLow()) {
+                    DebugLogManager.logWarn(TAG, "Low system memory detected after Clear stage; releasing Clear buffers before Voz")
                     releaseClearNativeBuffersBetweenStagesLocked()
                 }
 
@@ -373,6 +392,7 @@ class SmartPipeline(
                 // =========================================================================
                 setModelActiveStatusLocked(activeSettings, DesertAntModel.VOZ, "Transcribing with Voz ($resolvedLanguage)...")
                 onStageProgress?.invoke("Voz ($resolvedLanguage)")
+                DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)")
                 val transcription = runVozWithRetryLocked(
                     samples = enhancedSamples,
                     language = resolvedLanguage,
@@ -395,7 +415,15 @@ class SmartPipeline(
                     lastInferenceMs = totalInferenceMs,
                     lastAudioDurationMs = audioDurationMs
                 )
+                DebugLogManager.logInfo(
+                    TAG,
+                    "transcribe() completed in ${totalInferenceMs}ms for ${audioDurationMs}ms audio (chars=${finalTranscript.length}, lang=$resolvedLanguage)",
+                    includeMemory = true
+                )
                 finalTranscript
+            } catch (t: Throwable) {
+                DebugLogManager.logError(TAG, "transcribe() failed after ${SystemClock.elapsedRealtime() - inferenceStartMs}ms", t)
+                throw t
             } finally {
                 isTranscribing = false
                 val snap = settings
@@ -417,6 +445,7 @@ class SmartPipeline(
         pipelineMutex.withLock {
             if (!isTranscribing) {
                 Log.i(TAG, "Evicting optional models (Clear, Ear, Uhm) to free native RAM; keeping Voz resident.")
+                DebugLogManager.logInfo(TAG, "Evicting optional models (Clear, Ear, Uhm) from native RAM", includeMemory = true)
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
@@ -434,6 +463,7 @@ class SmartPipeline(
      * Handles Android OS memory pressure callbacks (`TRIM_MEMORY_RUNNING_LOW` or higher).
      */
     fun onTrimMemory(level: Int) {
+        DebugLogManager.logTrimMemory("SmartPipeline", level)
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && !isTranscribing) {
             idleScope.launch {
                 evictOptionalModels()
@@ -711,6 +741,7 @@ class SmartPipeline(
             }
         } catch (firstError: Throwable) {
             Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); freeing auxiliary RAM and retrying once.")
+            DebugLogManager.logWarn(TAG, "Voz inference failed on first attempt; freeing auxiliary RAM and retrying once", firstError)
             // Free optional native sessions before retrying Voz to guarantee maximum memory headroom
             closeClearLocked()
             closeEarLocked()
@@ -747,11 +778,14 @@ class SmartPipeline(
                     state = ModelLoadState.LOADING,
                     message = "Loading Voz speech recognition model..."
                 )
+                DebugLogManager.logInfo(TAG, "Loading Voz native model into RAM...", includeMemory = true)
                 val vozDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.VOZ).absolutePath
                 voz = Voz(appContext, vozDir)
                 vozWarmedUp = false
+                DebugLogManager.logInfo(TAG, "Voz native model loaded into RAM", includeMemory = true)
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to initialize Voz: ${t.message}", t)
+                DebugLogManager.logError(TAG, "Failed to initialize Voz native model", t)
                 closeVozLocked()
                 return false
             }
@@ -769,8 +803,10 @@ class SmartPipeline(
                 val warmupSilence = FloatArray(3_200) // 200 ms silent frame
                 currentVoz.transcribe(samples = warmupSilence, sampleRate = SAMPLE_RATE_HZ)
                 vozWarmedUp = true
+                DebugLogManager.logInfo(TAG, "Voz accelerator warm-up complete", includeMemory = true)
             } catch (t: Throwable) {
                 Log.w(TAG, "Voz warm-up deferred to first dictation: ${t.message}")
+                DebugLogManager.logWarn(TAG, "Voz warm-up deferred to first dictation", t)
             }
         }
         return true
@@ -778,6 +814,9 @@ class SmartPipeline(
 
     private suspend fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings, warmUp: Boolean) {
         val lowMem = isSystemMemoryLow()
+        if (lowMem) {
+            DebugLogManager.logWarn(TAG, "System memory is low during ensureAuxiliaryModelsLocked; skipping auxiliary warm-up")
+        }
 
         // 1. Ear
         if (activeSettings.earEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
@@ -792,8 +831,10 @@ class SmartPipeline(
                     val earDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR).absolutePath
                     ear = Ear(appContext, earDir)
                     earWarmedUp = false
+                    DebugLogManager.logInfo(TAG, "Ear model loaded into RAM", includeMemory = true)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Could not initialize Ear: ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not initialize Ear model", t)
                     closeEarLocked()
                 }
             }
@@ -815,6 +856,7 @@ class SmartPipeline(
                     earWarmedUp = true
                 } catch (t: Throwable) {
                     Log.w(TAG, "Ear warm-up deferred: ${t.message}")
+                    DebugLogManager.logWarn(TAG, "Ear warm-up deferred", t)
                 }
             }
         } else if (!activeSettings.earEnabled) {
@@ -834,8 +876,10 @@ class SmartPipeline(
                     val clearDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.CLEAR).absolutePath
                     clear = Clear(appContext, clearDir)
                     clearWarmedUp = false
+                    DebugLogManager.logInfo(TAG, "Clear model loaded into RAM", includeMemory = true)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Could not initialize Clear: ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not initialize Clear model", t)
                     closeClearLocked()
                 }
             }
@@ -861,6 +905,7 @@ class SmartPipeline(
                     clearWarmedUp = true
                 } catch (t: Throwable) {
                     Log.w(TAG, "Clear warm-up deferred: ${t.message}")
+                    DebugLogManager.logWarn(TAG, "Clear warm-up deferred", t)
                 }
             }
         } else if (!activeSettings.clearEnabled) {
@@ -879,8 +924,10 @@ class SmartPipeline(
                     )
                     val uhmDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.UHM).absolutePath
                     uhm = Uhm(appContext, uhmDir)
+                    DebugLogManager.logInfo(TAG, "Uhm model loaded into RAM", includeMemory = true)
                 } catch (t: Throwable) {
                     Log.w(TAG, "Could not initialize Uhm: ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not initialize Uhm model", t)
                     closeUhmLocked()
                 }
             }

@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.8] - 2026-10-19
+
+### Added
+- **Secret Developer Mode & Persistent OOM / Crash / Debug Logger (`DebugLogManager`, `DeveloperModeSection`, `MainActivity`, `OpenFlowApp`, `SmartPipeline`):**
+  - Added a version subtitle (`Version 2.3.8`) directly under the **OpenFlow Settings** title. Tapping the version number **5 times fast** secretly unlocks **Developer Mode** (with countdown toast hints on taps 3 and 4).
+  - **OOM & Native Crash Detection (`ApplicationExitInfo` + `UncaughtExceptionHandler`):** Inspects Android 11+ `ActivityManager.getHistoricalProcessExitReasons` on startup to capture silent OS Out-Of-Memory kills (`REASON_LOW_MEMORY` / LMKD), native `libLiteRt.so` / OpenCL crashes (`REASON_CRASH_NATIVE` SIGSEGV/SIGABRT), and ANRs alongside last recorded PSS/RSS memory usage, plus uncaught JVM exceptions and `OutOfMemoryError` traces with live heap snapshots.
+  - **Persistent Rolling Debug & Memory Telemetry (`debug_log.txt` & `crash_log.txt`):** Logs JVM heap, native heap (`Debug.getNativeHeapAllocatedSize()`), and system available RAM (`ActivityManager.MemoryInfo`) before/after model loads, inference stages (`Clear`, `Ear`, `Uhm`, `Voz`), and `onTrimMemory` callbacks directly to disk so logs survive sudden OOM process termination.
+  - **Developer Mode Panel (`DeveloperModeSection`):** Provides live auto-refreshing heap/RAM telemetry, a toggle to enable/pause disk debug logging, filter chips (`All Logs`, `Crash & OOM Only`, `Debug & Memory Only`), an in-app scrollable monospace log viewer, **Copy Logs**, **Share**, **Log RAM Now**, **Clear Logs**, and **Hide Dev Mode** controls.
+
 ## [2.3.7] - 2026-10-19
 
 ### Fixed

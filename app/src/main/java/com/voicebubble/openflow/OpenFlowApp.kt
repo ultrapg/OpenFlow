@@ -18,33 +18,19 @@ package com.voicebubble.openflow
 
 import android.app.Application
 import android.content.ComponentCallbacks2
-import android.util.Log
+import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.SmartPipeline
-import java.io.File
-import java.io.PrintWriter
-import java.io.StringWriter
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class OpenFlowApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        DebugLogManager.init(this)
 
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, exception ->
             try {
-                val sw = StringWriter()
-                exception.printStackTrace(PrintWriter(sw))
-                val stackTrace = sw.toString()
-
-                val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                val logMessage = "CRASH at $time\nThread: ${thread.name}\n$stackTrace\n\n"
-
-                val crashFile = File(filesDir, "crash_log.txt")
-                crashFile.appendText(logMessage)
-                Log.e("OpenFlowApp", "FATAL CRASH: $logMessage")
-            } catch (e: Exception) {
+                DebugLogManager.logCrash(thread, exception)
+            } catch (_: Throwable) {
                 // Ignore errors while writing crash log
             } finally {
                 defaultHandler?.uncaughtException(thread, exception)
@@ -54,6 +40,7 @@ class OpenFlowApp : Application() {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+        DebugLogManager.logTrimMemory("OpenFlowApp", level)
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
             SmartPipeline.getInstance(this).onTrimMemory(level)
         }

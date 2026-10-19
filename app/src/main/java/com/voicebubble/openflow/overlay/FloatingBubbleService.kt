@@ -58,6 +58,7 @@ import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilitySer
 import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.database.AppDatabase
 import com.voicebubble.openflow.core.database.TranscriptionRecord
+import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.PipelineStatus
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.ModelSettings
@@ -197,6 +198,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+        DebugLogManager.logTrimMemory("FloatingBubbleService", level)
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && ::smartPipeline.isInitialized) {
             smartPipeline.onTrimMemory(level)
         }
@@ -676,6 +678,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 bubbleState.value = OverlayBubbleState.IDLE
             } catch (t: Throwable) {
                 t.printStackTrace()
+                DebugLogManager.logError("FloatingBubbleService", "processAudio transcription error", t)
                 processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.IDLE
                 withContext(Dispatchers.Main) {
@@ -692,6 +695,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     }
 
     override fun onDestroy() {
+        DebugLogManager.logInfo("FloatingBubbleService", "FloatingBubbleService onDestroy()", includeMemory = true)
         _isRunning.value = false
         releaseDictationWakeLock()
         try {
