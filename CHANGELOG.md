@@ -2,6 +2,12 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.3.7] - 2026-10-19
+
+### Fixed
+- **Adaptive Status Bar & System Bar Icon Appearance (`Theme`, `MainActivity`):**
+  - Updated status bar and navigation bar appearance logic (`WindowCompat.getInsetsController` with `isAppearanceLightStatusBars = !darkTheme` and `enableEdgeToEdge` with `SystemBarStyle.auto`) so status bar icons automatically switch between dark icons in light mode and light icons in dark mode.
+
 ## [2.3.6] - 2026-10-19
 
 ### Fixed
