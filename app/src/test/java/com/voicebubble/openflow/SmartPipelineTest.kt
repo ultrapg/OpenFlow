@@ -574,13 +574,27 @@ class SmartPipelineTest {
 
         val withGemma = defaultSettings.copy(
             gemmaEnabled = true,
-            gemmaFormattingStyle = com.voicebubble.openflow.settings.GemmaFormattingStyle.CONCISE_PROSE
+            gemmaFormattingStyle = com.voicebubble.openflow.settings.GemmaFormattingStyle.BULLET_LIST
         )
         assertTrue(withGemma.gemmaEnabled)
         assertTrue(withGemma.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.GEMMA))
         assertTrue(com.voicebubble.openflow.settings.DesertAntModel.GEMMA in withGemma.enabledModels())
         assertEquals(defaultSettings.activeDiskFootprintMb + 230, withGemma.activeDiskFootprintMb)
         assertEquals(defaultSettings.estimatedPeakRamMb + 260, withGemma.estimatedPeakRamMb)
+
+        // Legacy style IDs map cleanly to the 4 pure layout styles
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.STANDARD,
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.fromId("smart_cleanup")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.BULLET_LIST,
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.fromId("structured_notes")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.COMPACT_CHAT,
+            com.voicebubble.openflow.settings.GemmaFormattingStyle.fromId("casual_chat")
+        )
 
         val gemmaSpec = com.voicebubble.openflow.settings.ModelDownloadManager.MODEL_SPECS[
             com.voicebubble.openflow.settings.DesertAntModel.GEMMA
@@ -626,68 +640,61 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `GemmaFormattingEngine resolves self-corrections stutters ITN and spoken commands`() {
-        // 1. Mid-utterance self-repair + clock time ITN + stutter removal
-        val repairedEn = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "i i think we should meet at 3 pm no wait at 4 30 pm",
+    fun `GemmaFormattingEngine formats punctuation spoken commands numbers and layout styles without rewriting words`() {
+        // 1. Spoken clock times ("three thirty pm"), thousands ("two thousand twenty six"), stutters, and decimals
+        val formattedEn = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "i i think we should meet at three thirty pm in two thousand twenty six to review version two point five",
             language = "en"
         )
-        assertEquals("I think we should meet at 4:30 PM.", repairedEn)
+        assertEquals("I think we should meet at 3:30 PM in 2026 to review version 2.5.", formattedEn)
 
-        // 2. German self-repair + Uhr ITN + percentage ITN
-        val repairedDe = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "wir wir treffen uns um 14 uhr nein warte um 15 uhr 30 und der umsatz stieg um zwanzig prozent",
+        // 2. German Uhr ITN, percentage ITN, and duplicate function word cleanup
+        val formattedDe = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "wir wir treffen uns um fünfzehn uhr dreißig und der umsatz stieg um fünfundzwanzig — 25 prozent",
             language = "de"
         )
-        assertEquals("Wir treffen uns um 15:30 Uhr und der umsatz stieg um 20%.", repairedDe)
+        assertEquals("Wir treffen uns um 15:30 Uhr und der umsatz stieg um fünfundzwanzig — 25%.", formattedDe)
 
-        // 3. Spoken punctuation & layout commands + question detection + currency ITN
+        // 3. Spoken punctuation & layout commands (including when Voz puts periods around commands)
         val layoutFormatted = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "can you review the budget question mark new line bullet point it costs fifty dollars",
+            rawText = "hello comma can you review the budget. Question mark. New line. Bullet point. It costs three hundred fifty dollars period",
             language = "en"
         )
-        assertEquals("Can you review the budget?\n• It costs \$50.", layoutFormatted)
+        assertEquals("Hello, can you review the budget?\n• It costs \$350.", layoutFormatted)
 
-        // 4. CONCISE_PROSE mode strips conversational hedges
-        val concise = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "I just wanted to say that to be completely honest we are ready to ship openfloe",
+        // 4. BULLET_LIST formats multi-sentence or enumerated dictations into bullets
+        val bullets = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "Update the repository. Run the test suite. Publish the release.",
             language = "en",
-            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.CONCISE_PROSE,
-            customVocabulary = listOf("OpenFlow")
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.BULLET_LIST
         )
-        assertEquals("We are ready to ship OpenFlow.", concise)
+        assertEquals("• Update the repository.\n• Run the test suite.\n• Publish the release.", bullets)
 
-        // 5. STRUCTURED_NOTES mode turns sequential items into bulleted lists
-        val notes = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "First update the repository second run the test suite third publish the release",
+        // 5. NUMBERED_LIST formats multi-sentence or enumerated dictations into a numbered list
+        val numbered = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "First update the repository, second run the test suite, and third publish the release",
             language = "en",
-            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.STRUCTURED_NOTES
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.NUMBERED_LIST
         )
-        assertEquals("• Update the repository.\n• Run the test suite.\n• Publish the release.", notes)
+        assertEquals("1. Update the repository.\n2. Run the test suite.\n3. Publish the release.", numbered)
 
-        // 6. PROFESSIONAL_EMAIL mode expands contractions and separates greetings & sign-offs
-        val email = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "Hi Sarah I'm writing to let you know we can't ship until 4 pm best regards Alex",
-            language = "en",
-            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.PROFESSIONAL_EMAIL
-        )
-        assertEquals("Hi Sarah,\n\nI am writing to let you know we cannot ship until 4:00 PM.\n\nBest regards,\nAlex.", email)
-
-        // 7. CASUAL_CHAT mode omits trailing period on single short sentences while keeping repairs
+        // 6. COMPACT_CHAT omits trailing period on single short sentences while preserving '?' and '!'
         val chat = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "see you at 6 pm no wait at 7 pm",
+            rawText = "see you at seven pm",
             language = "en",
-            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.CASUAL_CHAT
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.COMPACT_CHAT
         )
         assertEquals("See you at 7:00 PM", chat)
 
-        // 8. TECHNICAL_CODE mode formats spoken identifier casing and code operators
-        val codeText = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = "check if camel case user profile id double equals inline code null",
-            language = "en",
-            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.TECHNICAL_CODE
+        // 7. Non-rewriting & decimal/abbreviation safety: never rewrites "I mean", "however you want", "nothing but", or decimals
+        val preservedWords = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "Mr. Smith said you can format it however you want and we want nothing but the best for $4.50, do you know what I mean",
+            language = "en"
         )
-        assertEquals("Check if userProfileId == `null`.", codeText)
+        assertEquals(
+            "Mr. Smith said you can format it however you want and we want nothing but the best for $4.50, do you know what I mean.",
+            preservedWords
+        )
     }
 
     @Test
@@ -695,7 +702,7 @@ class SmartPipelineTest {
         // 1. Cross-chunk boundary stitching heals artificial mid-sentence periods from 20s chunks
         val chunks = listOf(
             "We need to send the report to.",
-            "The marketing team no wait to the engineering team.",
+            "The engineering team.",
             "And we should also review the three hundred fifty dollars budget."
         )
         val stitched = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.stitchChunkTranscripts(chunks)
@@ -704,24 +711,11 @@ class SmartPipelineTest {
             language = "en"
         )
         assertEquals(
-            "We need to send the report to the engineering team and we should also review the \$350 budget.",
+            "We need to send the report to The engineering team and we should also review the \$350 budget.",
             formattedFromChunks
         )
 
-        // 2. Bounded clause cancellation ("scratch that") inside a long unpunctuated dictation
-        // must only cancel the local clause and preserve earlier content
-        val longWithScratchThat =
-            "We completed the architecture review this morning and the latency benchmarks looked great " +
-                "and we should delete the staging database scratch that we should back up the staging database first"
-        val formattedScratch = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
-            rawText = longWithScratchThat,
-            language = "en"
-        )
-        assertTrue(formattedScratch.contains("We completed the architecture review this morning"))
-        assertFalse(formattedScratch.contains("delete the staging database"))
-        assertTrue(formattedScratch.contains("we should back up the staging database first."))
-
-        // 3. Long multi-minute dictation (> 2,500 chars / 24 sentences) splits into windows and auto-paragraphs cleanly
+        // 2. Long multi-minute dictation (> 2,500 chars / 24 sentences) splits into windows and auto-paragraphs cleanly
         val longSentences = (1..12).joinToString(" ") { idx ->
             "Sentence number $idx explains the quarterly product roadmap in detail. " +
                 "Meanwhile we are optimizing the on-device neural pipeline for low latency."
@@ -743,17 +737,17 @@ class SmartPipelineTest {
         val compactParagraphs = formattedCompact.split("\n\n")
         assertTrue("Expected multiple paragraphs in long dictation, got ${compactParagraphs.size}", compactParagraphs.size >= 6)
 
-        // 4. Disabling individual toggles in GemmaFormattingConfig is respected
-        val rawToggleInput = "i i think it costs fifty dollars no wait sixty dollars"
+        // 3. Disabling individual toggles in GemmaFormattingConfig is respected
+        val rawToggleInput = "i i think it costs fifty dollars comma new line thank you"
         val withAllDisabled = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
             rawText = rawToggleInput,
             language = "en",
             config = com.voicebubble.openflow.settings.GemmaFormattingConfig(
-                selfCorrectionEnabled = false,
                 stutterRemovalEnabled = false,
-                smartNumbersEnabled = false
+                smartNumbersEnabled = false,
+                spokenCommandsEnabled = false
             )
         )
-        assertEquals("I I think it costs fifty dollars no wait sixty dollars.", withAllDisabled)
+        assertEquals("I I think it costs fifty dollars comma new line thank you.", withAllDisabled)
     }
 }

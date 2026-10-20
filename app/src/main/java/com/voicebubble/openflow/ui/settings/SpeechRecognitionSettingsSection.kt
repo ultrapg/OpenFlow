@@ -539,7 +539,7 @@ fun SpeechRecognitionSettingsSection(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = "Gemma 3 270M Formatting Style",
+                            text = "Gemma 3 270M Layout Style",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
@@ -571,51 +571,15 @@ fun SpeechRecognitionSettingsSection(
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
                         Text(
-                            text = "SLM Processing & Long-Dictation Options",
+                            text = "Formatting Options",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
                         )
 
                         GemmaFeatureSwitchRow(
-                            title = "Mid-Sentence Self-Correction & Repair",
-                            subtitle = "Resolves 'no wait', 'I mean', 'scratch that', and multi-word phrase repairs",
-                            checked = settings.gemmaSelfCorrectionEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSelfCorrectionEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Word & Phrase Stutter Removal",
-                            subtitle = "Deduplicates accidental word and phrase repetitions ('I I think that that')",
-                            checked = settings.gemmaStutterRemovalEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaStutterRemovalEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Spoken Punctuation & Layout Commands",
-                            subtitle = "Executes 'new line', 'new paragraph', 'bullet point', 'question mark', 'colon'",
-                            checked = settings.gemmaSpokenCommandsEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSpokenCommandsEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Smart Numbers, Times & Currencies (ITN)",
-                            subtitle = "Formats spoken hundreds, percentages ('25%'), currencies ('$50'), and clock times ('4:30 PM')",
-                            checked = settings.gemmaSmartNumbersEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSmartNumbersEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Discourse Clause & Question Punctuation",
-                            subtitle = "Segments run-on STT sentences, adds natural clause commas, and detects questions ('?')",
+                            title = "Sentence Capitalization & Punctuation",
+                            subtitle = "Capitalizes sentences and 'I', adds periods and question marks ('?'), and places clause commas",
                             checked = settings.gemmaSmartPunctuationEnabled,
                             onCheckedChange = {
                                 persistAndReload(settings.copy(gemmaSmartPunctuationEnabled = it))
@@ -623,52 +587,79 @@ fun SpeechRecognitionSettingsSection(
                         )
 
                         GemmaFeatureSwitchRow(
-                            title = "Auto-Paragraph Long Dictations",
-                            subtitle = "Breaks multi-minute dictations into readable paragraphs at topic shifts and sentence cadence",
-                            checked = settings.gemmaAutoParagraphEnabled,
+                            title = "Spoken Punctuation & Layout Commands",
+                            subtitle = "Formats 'comma', 'period', 'question mark', 'colon', 'new line', 'new paragraph', 'bullet point'",
+                            checked = settings.gemmaSpokenCommandsEnabled,
                             onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaAutoParagraphEnabled = it))
+                                persistAndReload(settings.copy(gemmaSpokenCommandsEnabled = it))
                             }
                         )
 
-                        if (settings.gemmaAutoParagraphEnabled &&
-                            settings.gemmaFormattingStyle != GemmaFormattingStyle.STRUCTURED_NOTES
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 2.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Text(
-                                    text = "Long-Dictation Paragraph Cadence",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Medium,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                FlowRow(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        GemmaFeatureSwitchRow(
+                            title = "Number, Time & Currency Formatting",
+                            subtitle = "Converts spoken numbers ('350'), times ('3:30 PM'), percentages ('25%'), and currencies ('$50')",
+                            checked = settings.gemmaSmartNumbersEnabled,
+                            onCheckedChange = {
+                                persistAndReload(settings.copy(gemmaSmartNumbersEnabled = it))
+                            }
+                        )
+
+                        GemmaFeatureSwitchRow(
+                            title = "Duplicate Function-Word Cleanup",
+                            subtitle = "Removes accidental immediate word stutters ('the the' -> 'the', 'I I' -> 'I')",
+                            checked = settings.gemmaStutterRemovalEnabled,
+                            onCheckedChange = {
+                                persistAndReload(settings.copy(gemmaStutterRemovalEnabled = it))
+                            }
+                        )
+
+                        if (settings.gemmaFormattingStyle == GemmaFormattingStyle.STANDARD) {
+                            GemmaFeatureSwitchRow(
+                                title = "Auto-Paragraph Long Dictations",
+                                subtitle = "Breaks multi-sentence dictations into paragraphs at topic transitions and sentence cadence",
+                                checked = settings.gemmaAutoParagraphEnabled,
+                                onCheckedChange = {
+                                    persistAndReload(settings.copy(gemmaAutoParagraphEnabled = it))
+                                }
+                            )
+
+                            if (settings.gemmaAutoParagraphEnabled) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 2.dp),
                                     verticalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
-                                    GemmaParagraphDensity.entries.forEach { density ->
-                                        val selected = settings.gemmaParagraphDensity == density
-                                        FilterChip(
-                                            selected = selected,
-                                            onClick = {
-                                                if (!selected) {
-                                                    persistAndReload(settings.copy(gemmaParagraphDensity = density))
-                                                }
-                                            },
-                                            label = { Text(density.displayName) }
-                                        )
+                                    Text(
+                                        text = "Paragraph Break Cadence",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    FlowRow(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        GemmaParagraphDensity.entries.forEach { density ->
+                                            val selected = settings.gemmaParagraphDensity == density
+                                            FilterChip(
+                                                selected = selected,
+                                                onClick = {
+                                                    if (!selected) {
+                                                        persistAndReload(settings.copy(gemmaParagraphDensity = density))
+                                                    }
+                                                },
+                                                label = { Text(density.displayName) }
+                                            )
+                                        }
                                     }
+                                    Text(
+                                        text = settings.gemmaParagraphDensity.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
-                                Text(
-                                    text = settings.gemmaParagraphDensity.description,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
                             }
                         }
                     }
