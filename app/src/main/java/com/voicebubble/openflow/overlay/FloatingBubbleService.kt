@@ -334,13 +334,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val modelPrefs = ModelSettings.getPreferences(this)
         modelPrefs.registerOnSharedPreferenceChangeListener(modelPrefsListener)
 
-        // Keep status-bar notification updated with live model load & accelerator status
-        serviceScope.launch {
-            smartPipeline.pipelineStatus.collect { status ->
-                updateForegroundNotification(status)
-            }
-        }
-
         // React immediately on Main thread when Accessibility IME state, connection, or bubble recording state changes
         serviceScope.launch {
             TextInjectionAccessibilityService.isInputFieldFocused.collect {
@@ -718,16 +711,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val title = if (status.isReady) {
-            "OpenFlow Active • ${status.loadedCount}/${status.enabledCount} Models in RAM"
-        } else {
-            "OpenFlow Active • ${status.phase.label}"
-        }
-        val subtitle = "${status.activeAcceleratorLabel} — Tap floating bubble to dictate"
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(subtitle)
+            .setContentTitle("OpenFlow Service Active")
             .setSmallIcon(com.voicebubble.openflow.R.drawable.ic_notification)
             .setContentIntent(contentPendingIntent)
             .setDeleteIntent(deletePendingIntent)

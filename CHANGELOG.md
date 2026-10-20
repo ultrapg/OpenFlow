@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.6] - 2026-10-20
+
+### Changed
+- **Minimal Foreground Service Notification (`FloatingBubbleService`):** Simplified the ongoing status-bar notification to display only `"OpenFlow Service Active"` as the title with no subtitle/body text.
+
 ## [2.5.5] - 2026-10-20
 
 ### Fixed
