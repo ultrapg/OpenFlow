@@ -20,6 +20,8 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.SmartPipeline
+import com.voicebubble.openflow.overlay.BootAndRestartReceiver
+import com.voicebubble.openflow.overlay.FloatingBubbleService
 
 class OpenFlowApp : Application() {
     override fun onCreate() {
@@ -30,8 +32,17 @@ class OpenFlowApp : Application() {
         Thread.setDefaultUncaughtExceptionHandler { thread, exception ->
             try {
                 DebugLogManager.logCrash(thread, exception)
+                if (FloatingBubbleService.shouldAutoStart(this@OpenFlowApp) &&
+                    BootAndRestartReceiver.recordCrashAndAllowRestart(this@OpenFlowApp)
+                ) {
+                    BootAndRestartReceiver.scheduleRestart(
+                        context = this@OpenFlowApp,
+                        delayMs = 1_500L,
+                        reason = "uncaught_crash"
+                    )
+                }
             } catch (_: Throwable) {
-                // Ignore errors while writing crash log
+                // Ignore errors while writing crash log or scheduling restart
             } finally {
                 defaultHandler?.uncaughtException(thread, exception)
             }

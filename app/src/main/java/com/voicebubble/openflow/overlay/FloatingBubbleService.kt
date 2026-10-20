@@ -18,15 +18,18 @@ package com.voicebubble.openflow.overlay
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
@@ -73,6 +76,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -88,15 +92,141 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     companion object {
         const val ACTION_REFRESH_SETTINGS = "com.voicebubble.openflow.ACTION_REFRESH_SETTINGS"
+        const val ACTION_RESTORE_NOTIFICATION = "com.voicebubble.openflow.ACTION_RESTORE_NOTIFICATION"
+        const val ACTION_EXPLICIT_STOP = "com.voicebubble.openflow.ACTION_EXPLICIT_STOP"
+
+        const val PREFS_NAME = "openflow_settings"
         const val KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v3"
         const val LEGACY_KEY_SHOW_ONLY_ON_INPUTS = "show_only_on_inputs_v2"
         const val KEY_BUBBLE_DISAPPEAR_DELAY_MS = "bubble_disappear_delay_ms"
         const val DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS = 500L
+        const val KEY_BUBBLE_ENABLED_BY_USER = "bubble_enabled_by_user"
+        const val KEY_AUTO_START_BUBBLE = "auto_start_bubble"
+
         private const val CHANNEL_ID = "bubble_service_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val REQUEST_CODE_RESTORE_NOTIFICATION = 1002
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+
+        private fun getDeviceProtectedPrefs(context: Context) =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                context.applicationContext
+                    .createDeviceProtectedStorageContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            } else {
+                context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            }
+
+        /**
+         * Returns `true` if the user wants the floating bubble active (default `true` until the user
+         * explicitly taps "Stop Bubble" in Settings).
+         */
+        fun isBubbleEnabledByUser(context: Context): Boolean {
+            return try {
+                val dpPrefs = getDeviceProtectedPrefs(context)
+                if (dpPrefs.contains(KEY_BUBBLE_ENABLED_BY_USER)) {
+                    dpPrefs.getBoolean(KEY_BUBBLE_ENABLED_BY_USER, true)
+                } else {
+                    val userPrefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    userPrefs.getBoolean(KEY_BUBBLE_ENABLED_BY_USER, true)
+                }
+            } catch (_: Throwable) {
+                true
+            }
+        }
+
+        fun setBubbleEnabledByUser(context: Context, enabled: Boolean) {
+            try {
+                getDeviceProtectedPrefs(context).edit()
+                    .putBoolean(KEY_BUBBLE_ENABLED_BY_USER, enabled)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+            try {
+                context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putBoolean(KEY_BUBBLE_ENABLED_BY_USER, enabled)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+        }
+
+        /**
+         * Returns `true` if automatic startup on phone boot and automatic restart after crashes is enabled.
+         */
+        fun isAutoStartEnabled(context: Context): Boolean {
+            return try {
+                val dpPrefs = getDeviceProtectedPrefs(context)
+                if (dpPrefs.contains(KEY_AUTO_START_BUBBLE)) {
+                    dpPrefs.getBoolean(KEY_AUTO_START_BUBBLE, true)
+                } else {
+                    val userPrefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    userPrefs.getBoolean(KEY_AUTO_START_BUBBLE, true)
+                }
+            } catch (_: Throwable) {
+                true
+            }
+        }
+
+        fun setAutoStartEnabled(context: Context, enabled: Boolean) {
+            try {
+                getDeviceProtectedPrefs(context).edit()
+                    .putBoolean(KEY_AUTO_START_BUBBLE, enabled)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+            try {
+                context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putBoolean(KEY_AUTO_START_BUBBLE, enabled)
+                    .apply()
+            } catch (_: Throwable) {
+            }
+        }
+
+        /**
+         * Checks whether [FloatingBubbleService] should be automatically started/restarted on boot,
+         * crash recovery, or notification dismissal.
+         */
+        fun shouldAutoStart(context: Context): Boolean {
+            val appContext = context.applicationContext
+            if (!isBubbleEnabledByUser(appContext) || !isAutoStartEnabled(appContext)) return false
+            val canDraw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Settings.canDrawOverlays(appContext)
+            } else {
+                true
+            }
+            return canDraw
+        }
+
+        /**
+         * Starts [FloatingBubbleService] if [shouldAutoStart] is `true` and the service is not already running.
+         */
+        fun ensureRunningIfEnabled(context: Context, reason: String = "watchdog"): Boolean {
+            val appContext = context.applicationContext
+            if (_isRunning.value) return true
+            if (!shouldAutoStart(appContext)) return false
+            return try {
+                val intent = Intent(appContext, FloatingBubbleService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    appContext.startForegroundService(intent)
+                } else {
+                    appContext.startService(intent)
+                }
+                DebugLogManager.logInfo(
+                    "FloatingBubbleService",
+                    "ensureRunningIfEnabled started service (reason=$reason)"
+                )
+                true
+            } catch (t: Throwable) {
+                DebugLogManager.logError(
+                    "FloatingBubbleService",
+                    "ensureRunningIfEnabled failed (reason=$reason)",
+                    t
+                )
+                false
+            }
+        }
     }
 
     override val viewModelStore: ViewModelStore = ViewModelStore()
@@ -109,6 +239,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     private lateinit var composeView: ComposeView
     private lateinit var layoutParams: WindowManager.LayoutParams
     private var isOverlayAttached = false
+    private var stoppedExplicitlyByUser = false
+    private var screenReceiverRegistered = false
 
     private val audioController = AudioRecordingController()
     private lateinit var smartPipeline: SmartPipeline
@@ -118,6 +250,26 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
+    private val isScreenActiveAndUnlocked = MutableStateFlow(true)
+
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    onScreenTurnedOffOrLocked()
+                }
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    val activeAndUnlocked = checkScreenActiveAndUnlocked()
+                    isScreenActiveAndUnlocked.value = activeAndUnlocked
+                    if (!activeAndUnlocked) {
+                        onScreenTurnedOffOrLocked()
+                    } else {
+                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                    }
+                }
+            }
+        }
+    }
 
     override fun onBind(intent: Intent): IBinder? {
         super.onBind(intent)
@@ -134,13 +286,17 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     override fun onCreate() {
         super.onCreate()
         _isRunning.value = true
+        stoppedExplicitlyByUser = false
+        setBubbleEnabledByUser(this, true)
         savedStateRegistryController.performRestore(null)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         smartPipeline = SmartPipeline.getInstance(this)
+        isScreenActiveAndUnlocked.value = checkScreenActiveAndUnlocked()
 
         // Start foreground immediately in onCreate to satisfy Android 8-15 strict FGS timeout
         startCustomForeground(smartPipeline.pipelineStatus.value)
 
+        registerScreenStateReceiver()
         setupOverlayView()
         initializePipeline()
 
@@ -153,21 +309,61 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 updateForegroundNotification(status)
             }
         }
+
+        // Self-healing watchdog: restores dismissed notification on Android 14+, re-attaches overlay if detached,
+        // and enforces screen-off / lockscreen hiding
+        serviceScope.launch {
+            while (isActive) {
+                delay(4_000L)
+                val activeAndUnlocked = checkScreenActiveAndUnlocked()
+                if (isScreenActiveAndUnlocked.value != activeAndUnlocked) {
+                    isScreenActiveAndUnlocked.value = activeAndUnlocked
+                }
+                if (!activeAndUnlocked) {
+                    setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                } else {
+                    ensureOverlayAttached()
+                }
+                ensureNotificationPresent()
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        val action = intent?.action
+        if (action == ACTION_EXPLICIT_STOP) {
+            stoppedExplicitlyByUser = true
+            setBubbleEnabledByUser(this, false)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         _isRunning.value = true
+        stoppedExplicitlyByUser = false
+        setBubbleEnabledByUser(this, true)
         startCustomForeground(smartPipeline.pipelineStatus.value)
 
-        if (!isOverlayAttached && Settings.canDrawOverlays(this)) {
-            setupOverlayView()
-        }
+        isScreenActiveAndUnlocked.value = checkScreenActiveAndUnlocked()
+        ensureOverlayAttached()
 
-        if (intent?.action == ACTION_REFRESH_SETTINGS) {
+        if (action == ACTION_REFRESH_SETTINGS) {
             clampBubblePositionToScreen()
+        } else if (action == ACTION_RESTORE_NOTIFICATION) {
+            DebugLogManager.logInfo("FloatingBubbleService", "Restoring dismissed foreground notification")
+            updateForegroundNotification(smartPipeline.pipelineStatus.value)
         }
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        DebugLogManager.logInfo("FloatingBubbleService", "onTaskRemoved() called")
+        if (!stoppedExplicitlyByUser && shouldAutoStart(this)) {
+            startCustomForeground(smartPipeline.pipelineStatus.value)
+            ensureOverlayAttached()
+            BootAndRestartReceiver.scheduleRestart(this, delayMs = 800L, reason = "onTaskRemoved")
+        }
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -175,10 +371,100 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         clampBubblePositionToScreen()
     }
 
+    private fun registerScreenStateReceiver() {
+        if (screenReceiverRegistered) return
+        try {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenStateReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(screenStateReceiver, filter)
+            }
+            screenReceiverRegistered = true
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        if (!screenReceiverRegistered) return
+        try {
+            unregisterReceiver(screenStateReceiver)
+        } catch (_: Throwable) {
+        }
+        screenReceiverRegistered = false
+    }
+
+    private fun checkScreenActiveAndUnlocked(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            val isInteractive = pm?.isInteractive ?: true
+            val isKeyguardLocked = km?.isKeyguardLocked ?: false
+            isInteractive && !isKeyguardLocked
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    /**
+     * Immediately hides the floating bubble surface when the screen turns off or the lockscreen engages,
+     * bypassing Compose VSYNC delays (since Choreographer stops ticking when the display is off).
+     */
+    private fun onScreenTurnedOffOrLocked() {
+        isScreenActiveAndUnlocked.value = false
+        TextInjectionAccessibilityService.isInputFieldFocused.value = false
+
+        if (bubbleState.value == OverlayBubbleState.RECORDING) {
+            bubbleState.value = OverlayBubbleState.IDLE
+            setKeepScreenOn(false)
+            releaseDictationWakeLock()
+            serviceScope.launch {
+                try {
+                    audioController.stopRecording()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        // Synchronously hide WindowManager overlay surface with 0ms delay
+        setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+    }
+
+    private fun ensureOverlayAttached() {
+        if (!Settings.canDrawOverlays(this)) return
+        val viewAttached = isOverlayAttached && ::composeView.isInitialized && composeView.isAttachedToWindow
+        if (!viewAttached) {
+            if (isOverlayAttached && ::composeView.isInitialized) {
+                try {
+                    windowManager.removeViewImmediate(composeView)
+                } catch (_: Throwable) {
+                }
+                isOverlayAttached = false
+            }
+            setupOverlayView()
+        }
+    }
+
+    private fun ensureNotificationPresent() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val hasNotification = nm.activeNotifications.any { it.id == NOTIFICATION_ID }
+            if (!hasNotification) {
+                startCustomForeground(smartPipeline.pipelineStatus.value)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun clampBubblePositionToScreen() {
         if (!isOverlayAttached || !::layoutParams.isInitialized || !::composeView.isInitialized) return
         try {
-            val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val bubbleSizeDp = prefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
             val dm = resources.displayMetrics
             val bubblePx = (bubbleSizeDp * dm.density).roundToInt().coerceAtLeast(96)
@@ -208,7 +494,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         initPipelineJob = serviceScope.launch(Dispatchers.Default) {
             previousJob?.cancelAndJoin()
             try {
-                val loadedSettings = ModelSettings.load(this@FloatingBubbleService)
                 val ready = smartPipeline.initialize(warmUp = true)
                 withContext(Dispatchers.Main) {
                     if (!ready && !com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDownloaded(
@@ -235,16 +520,29 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 CHANNEL_ID,
                 "Voice Dictation Service",
                 NotificationManager.IMPORTANCE_LOW
-            )
+            ).apply {
+                setShowBadge(false)
+            }
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
         }
 
-        val pendingIntent = PendingIntent.getActivity(
+        val contentPendingIntent = PendingIntent.getActivity(
             this,
             0,
             Intent(this, com.voicebubble.openflow.MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        // If the user swipes/dismisses the ongoing notification on Android 13/14/15, immediately restore it
+        val restoreNotificationIntent = Intent(this, FloatingBubbleService::class.java).apply {
+            action = ACTION_RESTORE_NOTIFICATION
+        }
+        val deletePendingIntent = PendingIntent.getService(
+            this,
+            REQUEST_CODE_RESTORE_NOTIFICATION,
+            restoreNotificationIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -259,9 +557,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             .setContentTitle(title)
             .setContentText(subtitle)
             .setSmallIcon(com.voicebubble.openflow.R.drawable.ic_notification)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(contentPendingIntent)
+            .setDeleteIntent(deletePendingIntent)
             .setOngoing(true)
+            .setAutoCancel(false)
             .setOnlyAlertOnce(true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
 
@@ -281,6 +582,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 try {
                     startForeground(NOTIFICATION_ID, notification, fgsType)
                 } catch (_: Throwable) {
+                    // When started on BOOT_COMPLETED in Android 14/15, MICROPHONE type may be restricted
+                    // until first user interaction; SPECIAL_USE succeeds on boot and upgrades on tap.
                     startForeground(
                         NOTIFICATION_ID,
                         notification,
@@ -288,11 +591,15 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     )
                 }
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
+                try {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    )
+                } catch (_: Throwable) {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
@@ -311,23 +618,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     @SuppressLint("RtlHardcoded")
     private fun setupOverlayView() {
-        if (isOverlayAttached) return
+        if (isOverlayAttached && ::composeView.isInitialized && composeView.isAttachedToWindow) return
         if (!Settings.canDrawOverlays(this)) {
-            android.widget.Toast.makeText(
-                this,
-                "Overlay permission is required to display the floating bubble.",
-                android.widget.Toast.LENGTH_LONG
-            ).show()
-            stopSelf()
             return
         }
 
-        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val metrics = resources.displayMetrics
         val savedX = prefs.getInt("bubble_x", 80).coerceIn(0, (metrics.widthPixels - 140).coerceAtLeast(0))
         val savedY = prefs.getInt("bubble_y", 400).coerceIn(0, (metrics.heightPixels - 180).coerceAtLeast(0))
         val initialShowOnlyOnKeyboard = prefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
-        val initiallyVisible = !initialShowOnlyOnKeyboard || TextInjectionAccessibilityService.isInputFieldFocused.value
+        val screenActive = checkScreenActiveAndUnlocked()
+        isScreenActiveAndUnlocked.value = screenActive
+        val initiallyVisible = screenActive && (!initialShowOnlyOnKeyboard || TextInjectionAccessibilityService.isInputFieldFocused.value)
 
         layoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -358,12 +661,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             setContent {
                 OpenFlowTheme {
                     val currentState by bubbleState.collectAsState()
+                    val screenActiveState by isScreenActiveAndUnlocked.collectAsState()
                     val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
                     val isAccessibilityImeVisible by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
                     val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
 
                     val settingsPrefs = androidx.compose.runtime.remember {
-                        getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+                        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     }
                     var showOnlyOnInputs by androidx.compose.runtime.remember {
                         androidx.compose.runtime.mutableStateOf(
@@ -386,10 +690,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     }
 
                     // Poll WindowInsetsCompat.Type.ime() on API 30+ as a direct fallback if Accessibility Service is not yet enabled
-                    androidx.compose.runtime.LaunchedEffect(isAccessibilityConnected) {
-                        while (!isAccessibilityConnected) {
+                    androidx.compose.runtime.LaunchedEffect(isAccessibilityConnected, screenActiveState) {
+                        while (!isAccessibilityConnected && screenActiveState) {
                             isWindowInsetsImeVisible = checkWindowInsetsImeVisible()
                             delay(180L)
+                        }
+                        if (!screenActiveState) {
+                            isWindowInsetsImeVisible = false
                         }
                     }
 
@@ -421,21 +728,30 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         }
                     }
 
-                    val isKeyboardCurrentlyOnScreen = if (isAccessibilityConnected) {
+                    val isKeyboardCurrentlyOnScreen = if (!screenActiveState) {
+                        false
+                    } else if (isAccessibilityConnected) {
                         isAccessibilityImeVisible
                     } else {
                         isWindowInsetsImeVisible
                     }
-                    val rawShouldShow = !showOnlyOnInputs ||
-                        isKeyboardCurrentlyOnScreen ||
-                        currentState != OverlayBubbleState.IDLE
+
+                    val rawShouldShow = screenActiveState && (
+                        !showOnlyOnInputs ||
+                            isKeyboardCurrentlyOnScreen ||
+                            currentState != OverlayBubbleState.IDLE
+                        )
 
                     var isBubbleVisible by androidx.compose.runtime.remember {
                         androidx.compose.runtime.mutableStateOf(rawShouldShow)
                     }
 
-                    androidx.compose.runtime.LaunchedEffect(rawShouldShow, disappearDelayMs) {
-                        if (rawShouldShow) {
+                    androidx.compose.runtime.LaunchedEffect(rawShouldShow, screenActiveState, disappearDelayMs) {
+                        if (!screenActiveState) {
+                            // Screen is off or locked: hide immediately without waiting for disappearDelayMs or animation
+                            isBubbleVisible = false
+                            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                        } else if (rawShouldShow) {
                             setOverlayWindowVisibleAndTouchable(visible = true, touchable = true)
                             isBubbleVisible = true
                         } else {
@@ -454,7 +770,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     BubbleOverlayComponent(
                         audioController = audioController,
                         bubbleState = currentState,
-                        isInputFieldFocused = isBubbleVisible,
+                        isInputFieldFocused = isBubbleVisible && screenActiveState,
                         processingProgress = processingProgress.collectAsState(initial = "").value,
                         bubbleSize = bubbleSize,
                         pipelinePhase = pipelineStatus.phase,
@@ -499,6 +815,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 ).show()
                                 return@BubbleOverlayComponent
                             }
+                            // Ensure MICROPHONE foreground service type is active on user tap (if started on boot as SPECIAL_USE)
+                            startCustomForeground(smartPipeline.pipelineStatus.value)
                             acquireDictationWakeLock()
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
@@ -538,11 +856,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         } catch (t: Throwable) {
             t.printStackTrace()
             isOverlayAttached = false
-            stopSelf()
         }
     }
 
     private fun checkWindowInsetsImeVisible(): Boolean {
+        if (!checkScreenActiveAndUnlocked()) return false
         if (!::composeView.isInitialized || !composeView.isAttachedToWindow) return false
         return try {
             val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(composeView) ?: return false
@@ -626,7 +944,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     }
 
     private fun processAudio(samples: FloatArray) {
-        val prefs = getSharedPreferences("openflow_settings", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         serviceScope.launch {
             try {
@@ -704,8 +1022,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     }
 
     override fun onDestroy() {
-        DebugLogManager.logInfo("FloatingBubbleService", "FloatingBubbleService onDestroy()", includeMemory = true)
+        DebugLogManager.logInfo(
+            "FloatingBubbleService",
+            "FloatingBubbleService onDestroy() (explicitStop=$stoppedExplicitlyByUser)",
+            includeMemory = true
+        )
         _isRunning.value = false
+        unregisterScreenStateReceiver()
         releaseDictationWakeLock()
         try {
             val modelPrefs = ModelSettings.getPreferences(this)
@@ -720,6 +1043,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             } catch (_: Throwable) {
             }
             isOverlayAttached = false
+        }
+        if (!stoppedExplicitlyByUser && shouldAutoStart(this)) {
+            BootAndRestartReceiver.scheduleRestart(this, delayMs = 1_000L, reason = "onDestroy_unexpected")
         }
         super.onDestroy()
     }

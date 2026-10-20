@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
                 isCheckingModels = false
                 if (allReady) {
                     SmartPipeline.getInstance(context).initializeAsync(warmUp = true)
+                    FloatingBubbleService.ensureRunningIfEnabled(context, reason = "main_activity_launch")
                 }
             }
 
@@ -109,9 +110,13 @@ class MainActivity : ComponentActivity() {
                 )
             }
             var hapticFeedback by remember { mutableStateOf(prefs.getBoolean("haptic_feedback", true)) }
+            var autoStartBubble by remember {
+                mutableStateOf(FloatingBubbleService.isAutoStartEnabled(context))
+            }
             var bubbleSize by remember { mutableFloatStateOf(prefs.getFloat("bubble_size", 52f)) }
 
             val startOrRefreshBubbleService = {
+                FloatingBubbleService.setBubbleEnabledByUser(context, true)
                 val intent = Intent(context, FloatingBubbleService::class.java).apply {
                     if (isBubbleServiceRunning) {
                         action = FloatingBubbleService.ACTION_REFRESH_SETTINGS
@@ -179,9 +184,9 @@ class MainActivity : ComponentActivity() {
                             val isDeveloperModeUnlocked by DebugLogManager.isUnlocked.collectAsState()
                             val appVersionName = remember {
                                 try {
-                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.5.3"
+                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.5.4"
                                 } catch (_: Throwable) {
-                                    "2.5.3"
+                                    "2.5.4"
                                 }
                             }
                             var versionTapCount by remember { mutableIntStateOf(0) }
@@ -478,6 +483,20 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = autoStartBubble,
+                                    onCheckedChange = {
+                                        autoStartBubble = it
+                                        FloatingBubbleService.setAutoStartEnabled(context, it)
+                                    }
+                                )
+                                Text(
+                                    "Auto-start on phone boot & auto-restart after crash",
+                                    color = MaterialTheme.colorScheme.onBackground
+                                )
+                            }
+
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
                                 "Bubble Size: ${bubbleSize.toInt()} dp",
@@ -528,8 +547,15 @@ class MainActivity : ComponentActivity() {
                             ) {
                                 Button(
                                     onClick = {
-                                        val intent = Intent(context, FloatingBubbleService::class.java)
-                                        context.stopService(intent)
+                                        FloatingBubbleService.setBubbleEnabledByUser(context, false)
+                                        val stopIntent = Intent(context, FloatingBubbleService::class.java).apply {
+                                            action = FloatingBubbleService.ACTION_EXPLICIT_STOP
+                                        }
+                                        try {
+                                            context.startService(stopIntent)
+                                        } catch (_: Throwable) {
+                                        }
+                                        context.stopService(Intent(context, FloatingBubbleService::class.java))
                                     },
                                     enabled = isBubbleServiceRunning,
                                     modifier = Modifier.weight(1f),

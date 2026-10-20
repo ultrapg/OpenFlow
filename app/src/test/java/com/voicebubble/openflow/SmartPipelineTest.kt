@@ -564,4 +564,18 @@ class SmartPipelineTest {
             tempFile.delete()
         }
     }
+
+    @Test
+    fun `BootAndRestartReceiver parseRecentCrashTimestamps filters crashes within rolling 60s window`() {
+        val now = 1_000_000L
+        val raw = "${now - 120_000L},${now - 45_000L},${now - 10_000L},invalid,${now - 1_000L}"
+        val recent = com.voicebubble.openflow.overlay.BootAndRestartReceiver.parseRecentCrashTimestamps(
+            raw = raw,
+            nowMs = now,
+            windowMs = 60_000L
+        )
+        assertEquals(3, recent.size)
+        assertEquals(listOf(now - 45_000L, now - 10_000L, now - 1_000L), recent)
+        assertTrue(com.voicebubble.openflow.overlay.BootAndRestartReceiver.parseRecentCrashTimestamps(null, now).isEmpty())
+    }
 }

@@ -2,6 +2,21 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.4] - 2026-10-20
+
+### Fixed
+- **Screen-Off & Lockscreen Floating Bubble Persistence Bug (`FloatingBubbleService`, `TextInjectionAccessibilityService`):**
+  - Registered a real-time screen-state `BroadcastReceiver` (`ACTION_SCREEN_OFF`, `ACTION_SCREEN_ON`, `ACTION_USER_PRESENT`) and `PowerManager.isInteractive` / `KeyguardManager.isKeyguardLocked` checks in both `FloatingBubbleService` and `TextInjectionAccessibilityService`.
+  - When the screen turns off or the lockscreen engages, the floating bubble surface is now hidden synchronously with `0 ms` delay (bypassing Compose `Choreographer` VSYNC, which stops ticking when the display powers off) and any active recording is cleanly stopped.
+- **Notification Dismissal & Task Removal Disappearance Bug (`FloatingBubbleService`, `AndroidManifest.xml`):**
+  - Added a `deleteIntent` (`ACTION_RESTORE_NOTIFICATION`) and a 4-second `NotificationManager.activeNotifications` + `composeView.isAttachedToWindow` self-healing watchdog so swiping away the ongoing foreground notification on Android 13–15 immediately restores the notification and keeps the floating bubble alive.
+  - Set `android:stopWithTask="false"` and implemented `onTaskRemoved` recovery so swiping OpenFlow away from Recent Apps does not kill the floating bubble.
+
+### Added
+- **Auto-Start on Phone Boot & Automatic Crash Recovery (`BootAndRestartReceiver`, `OpenFlowApp`, `FloatingBubbleService`, `TextInjectionAccessibilityService`, `MainActivity`):**
+  - Added `BootAndRestartReceiver` (`BOOT_COMPLETED`, `LOCKED_BOOT_COMPLETED`, `QUICKBOOT_POWERON`, `MY_PACKAGE_REPLACED`) with Direct Boot storage support and Android 14/15 `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` boot fallback so the floating bubble starts automatically when the phone boots.
+  - Added multi-layered automatic crash recovery via `OpenFlowApp`'s `UncaughtExceptionHandler` (`AlarmManager` wakeup with a 3-in-60s crash-loop guard), `FloatingBubbleService.onDestroy()` self-healing, and an `AccessibilityService` watchdog (`TextInjectionAccessibilityService`), plus a new **"Auto-start on phone boot & auto-restart after crash"** toggle in Settings.
+
 ## [2.5.3] - 2026-10-20
 
 ### Removed

@@ -1,15 +1,19 @@
 package com.voicebubble.openflow.core.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import com.voicebubble.openflow.overlay.FloatingBubbleService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,19 +46,37 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var pollingJob: Job? = null
+    private var lastWatchdogCheckMs = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = WeakReference(this)
         isServiceConnected.value = true
 
+        // Automatically start the floating bubble service on phone boot or after process crash recovery
+        FloatingBubbleService.ensureRunningIfEnabled(this, reason = "accessibility_onServiceConnected")
+
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
             while (isActive) {
                 refreshKeyboardVisibilityState()
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastWatchdogCheckMs >= 8_000L) {
+                    lastWatchdogCheckMs = now
+                    if (!FloatingBubbleService.isRunning.value) {
+                        FloatingBubbleService.ensureRunningIfEnabled(
+                            this@TextInjectionAccessibilityService,
+                            reason = "accessibility_watchdog"
+                        )
+                    }
+                }
                 delay(180L)
             }
         }
+    }
+
+    fun refreshNow() {
+        refreshKeyboardVisibilityState()
     }
 
     override fun onDestroy() {
@@ -83,8 +105,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     /**
      * Strictly checks whether the on-screen soft keyboard (`TYPE_INPUT_METHOD` window) is currently
-     * visible on screen. Does NOT fall back to `hasFocusedEditableNode()` alone, because Android
-     * `EditText` views often retain view focus even after the user dismisses the keyboard.
+     * visible on screen while the screen is interactive and unlocked.
      */
     private fun refreshKeyboardVisibilityState() {
         try {
@@ -96,6 +117,11 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private fun isSoftKeyboardWindowVisible(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
         return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isInteractive) return false
+            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            if (km != null && km.isKeyguardLocked) return false
+
             val allWindows = windows ?: return false
             val dm = resources.displayMetrics
             val screenHeight = dm.heightPixels
