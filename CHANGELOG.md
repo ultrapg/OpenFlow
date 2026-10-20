@@ -2,36 +2,10 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
-## [2.5.2] - 2026-10-20
+## [2.5.3] - 2026-10-20
 
-### Changed / Improved
-- **Gemma 3 270M SLM Formatting Engine Refocused on Reliable Non-Destructive Formatting (`GemmaFormattingEngine`, `ModelSettings`, `SpeechRecognitionSettingsSection`):**
-  - Replaced unreliable word/tone rewriting presets and regexes with **4 deterministic layout styles** that never alter or delete user vocabulary:
-    - **Standard Paragraphs (Default):** Sentence capitalization, English `"I"` pronoun casing, terminal punctuation (`.` / `?`), natural clause commas, and automatic paragraph breaks on long dictations.
-    - **Bullet List:** Formats dictated sentences, spoken `"bullet point"` / `"new line"` commands, or enumerated items into a bulleted list (`• Item`).
-    - **Numbered List:** Formats dictated sentences, spoken commands, or enumerated items into a numbered list (`1. Item`, `2. Item`).
-    - **Compact / Chat:** Keeps dictation in a single compact block without automatic paragraph splitting and omits the trailing period on single-sentence messages.
-  - **5 Granular Formatting Toggles (`GemmaFormattingConfig`):**
-    - **Sentence Capitalization & Punctuation** (now protects decimal numbers like `3.5` / `$4.50` and abbreviations like `Mr.` / `Dr.` from false sentence splits, and avoids false commas or splits on phrases like `"nothing but"` or `"however you want"`).
-    - **Spoken Punctuation & Layout Commands** (added `"comma"` and `"period"`, and automatically strips stray punctuation inserted by `Voz` around spoken commands like `"Question mark."` or `"New line."`).
-    - **Number, Time & Currency Formatting** (expanded spoken number conversion to cover `0`–`9,999`, spoken decimals like `"two point five"` → `"2.5"`, and spoken clock times like `"three thirty pm"` → `"3:30 PM"`).
-    - **Duplicate Function-Word Cleanup** (`"the the"` → `"the"`, `"I I"` → `"I"`).
-    - **Auto-Paragraph Long Dictations** with **Compact (3 sentences)**, **Balanced (4 sentences)**, and **Long-Form (6 sentences)** cadence and cross-chunk continuity stitching across 20s audio chunks.
-
-## [2.5.1] - 2026-10-20
-
-### Added
-- **Experimental Gemma 3 270M SLM Formatting Engine (`GemmaFormattingEngine`, `DesertAntModel.GEMMA`, `GemmaFormattingStyle`, `GemmaFormattingConfig`, `GemmaParagraphDensity`, `SmartPipeline`, `ModelDownloadManager`, `SpeechRecognitionSettingsSection`, `OnboardingScreen`):**
-  - Added an optional **Stage 5 Small Language Model (SLM) Formatting Engine** powered by **Gemma 3 270M Instruct QAT** (`gemma-3-270m-it-qat-Q4_0.gguf`, `230 MB` / `241,410,624` bytes, SHA-256 `3626e245220ca4a1c5911eb4010b3ecb7bdbf5bc53c79403c21355354d1e2dc6`), **disabled by default** (`gemmaEnabled = false`).
-  - **Seamless Model Download & Storage Integration:** Handled through the exact same `ModelDownloadManager` and `DesertAntModelStorage` pipeline as `Voz`, `Ear`, `Clear`, and `Uhm` — including HTTP `Range` pause/resume, foreground service status-bar progress notifications, real-time `MB/s` speed and ETA telemetry, zero-wait streaming SHA-256 verification (`.openflow_verified`), GGUF v3 binary header verification, and one-tap cache deletion when inactive.
-  - **4 Pure Layout Styles (`GemmaFormattingStyle` — Non-Destructive Formatting Without Rewriting Words):**
-    - **Standard Paragraphs (Default):** Formats dictation into capitalized, punctuated sentences (protecting decimals like `3.5` / `$4.50` and abbreviations like `Mr.` / `Dr.`) and groups long dictations into paragraphs.
-    - **Bullet List:** Formats dictated sentences, spoken `"bullet point"` / `"new line"` commands, or enumerated items into a bulleted list (`• Item`).
-    - **Numbered List:** Formats dictated sentences, spoken commands, or enumerated items into a numbered list (`1. Item`, `2. Item`).
-    - **Compact / Chat:** Keeps dictation in a single compact block without automatic paragraph breaks and omits trailing periods on single-sentence chat messages.
-  - **5 Granular Formatting Toggles & Long-Dictation Engine (`GemmaFormattingConfig` / `GemmaParagraphDensity`):**
-    - Added individual toggles in Settings for **Sentence Capitalization & Punctuation**, **Spoken Punctuation & Layout Commands** (`"comma"`, `"period"`, `"question mark"`, `"exclamation mark"`, `"colon"`, `"semicolon"`, `"new line"`, `"new paragraph"`, `"bullet point"`, quotes, and parentheses), **Number, Time & Currency Formatting** (`0`–`9,999`, spoken decimals, `"three thirty pm"` → `"3:30 PM"`, `"25%"`, `"$50"`, `"€50"`), **Duplicate Function-Word Cleanup** (`"the the"` → `"the"`, `"I I"` → `"I"`), and **Auto-Paragraph Long Dictations** (**Compact 3 sentences**, **Balanced 4 sentences**, **Long-Form 6 sentences**).
-    - **Cross-Chunk Continuity Stitcher (`stitchChunkTranscripts`) & Sliding Discourse Windows (`splitIntoDiscourseWindows`):** Heals artificial mid-sentence periods across 20s audio chunks and processes arbitrarily long multi-minute dictations in bounded `<= 1,600`-character discourse windows in linear $O(N)$ time.
+### Removed
+- **Removed Experimental Gemma 3 270M SLM Formatting Engine:** Reverted the experimental Stage 5 SLM post-processing engine and restored the clean 4-model Desert Ant Labs audio pipeline (`Voz`, `Ear`, `Clear`, `Uhm`) with native `Voz` punctuation, capitalization, and custom vocabulary biasing.
 
 ## [2.4.1] - 2026-10-19
 

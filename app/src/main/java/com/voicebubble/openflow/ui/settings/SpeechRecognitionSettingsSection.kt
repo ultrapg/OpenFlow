@@ -85,8 +85,6 @@ import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
-import com.voicebubble.openflow.settings.GemmaFormattingStyle
-import com.voicebubble.openflow.settings.GemmaParagraphDensity
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
@@ -148,7 +146,6 @@ fun SpeechRecognitionSettingsSection(
                 DesertAntModel.EAR -> settings.copy(earEnabled = false)
                 DesertAntModel.CLEAR -> settings.copy(clearEnabled = false)
                 DesertAntModel.UHM -> settings.copy(uhmEnabled = false)
-                DesertAntModel.GEMMA -> settings.copy(gemmaEnabled = false)
                 DesertAntModel.VOZ -> settings
             }
             persistAndReload(updated)
@@ -162,7 +159,6 @@ fun SpeechRecognitionSettingsSection(
                         DesertAntModel.EAR -> settings.copy(earEnabled = true)
                         DesertAntModel.CLEAR -> settings.copy(clearEnabled = true)
                         DesertAntModel.UHM -> settings.copy(uhmEnabled = true)
-                        DesertAntModel.GEMMA -> settings.copy(gemmaEnabled = true)
                         DesertAntModel.VOZ -> settings
                     }
                     persistAndReload(updated)
@@ -307,7 +303,7 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/${DesertAntModel.entries.size})",
+                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/4)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -512,158 +508,6 @@ fun SpeechRecognitionSettingsSection(
                     onResume = { handleOptionalToggle(DesertAntModel.UHM, true) },
                     onCheckedChange = { handleOptionalToggle(DesertAntModel.UHM, it) }
                 )
-
-                HorizontalDivider()
-
-                // Gemma 3 270M (Experimental SLM Formatting Engine, OFF by default)
-                ModelToggleItem(
-                    title = "Gemma 3 270M — SLM Formatting Engine (${DesertAntModel.GEMMA.sizeMb} MB)",
-                    subtitle = DesertAntModel.GEMMA.roleSummary,
-                    loadState = pipelineStatus.modelStates[DesertAntModel.GEMMA],
-                    checked = settings.gemmaEnabled || DesertAntModel.GEMMA in downloadState.pendingAutoEnableModels,
-                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.GEMMA),
-                    isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.GEMMA && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
-                    onPause = { ModelDownloadManager.pauseDownloads() },
-                    onResume = { handleOptionalToggle(DesertAntModel.GEMMA, true) },
-                    onCheckedChange = { handleOptionalToggle(DesertAntModel.GEMMA, it) }
-                )
-
-                if (settings.gemmaEnabled) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.65f))
-                            .padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "Gemma 3 270M Layout Style",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        FlowRow(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            GemmaFormattingStyle.entries.forEach { style ->
-                                val selected = settings.gemmaFormattingStyle == style
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = {
-                                        if (!selected) {
-                                            persistAndReload(settings.copy(gemmaFormattingStyle = style))
-                                        }
-                                    },
-                                    label = { Text(style.displayName) }
-                                )
-                            }
-                        }
-                        Text(
-                            text = settings.gemmaFormattingStyle.description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-
-                        Text(
-                            text = "Formatting Options",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Sentence Capitalization & Punctuation",
-                            subtitle = "Capitalizes sentences and 'I', adds periods and question marks ('?'), and places clause commas",
-                            checked = settings.gemmaSmartPunctuationEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSmartPunctuationEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Spoken Punctuation & Layout Commands",
-                            subtitle = "Formats 'comma', 'period', 'question mark', 'colon', 'new line', 'new paragraph', 'bullet point'",
-                            checked = settings.gemmaSpokenCommandsEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSpokenCommandsEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Number, Time & Currency Formatting",
-                            subtitle = "Converts spoken numbers ('350'), times ('3:30 PM'), percentages ('25%'), and currencies ('$50')",
-                            checked = settings.gemmaSmartNumbersEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaSmartNumbersEnabled = it))
-                            }
-                        )
-
-                        GemmaFeatureSwitchRow(
-                            title = "Duplicate Function-Word Cleanup",
-                            subtitle = "Removes accidental immediate word stutters ('the the' -> 'the', 'I I' -> 'I')",
-                            checked = settings.gemmaStutterRemovalEnabled,
-                            onCheckedChange = {
-                                persistAndReload(settings.copy(gemmaStutterRemovalEnabled = it))
-                            }
-                        )
-
-                        if (settings.gemmaFormattingStyle == GemmaFormattingStyle.STANDARD) {
-                            GemmaFeatureSwitchRow(
-                                title = "Auto-Paragraph Long Dictations",
-                                subtitle = "Breaks multi-sentence dictations into paragraphs at topic transitions and sentence cadence",
-                                checked = settings.gemmaAutoParagraphEnabled,
-                                onCheckedChange = {
-                                    persistAndReload(settings.copy(gemmaAutoParagraphEnabled = it))
-                                }
-                            )
-
-                            if (settings.gemmaAutoParagraphEnabled) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 2.dp),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text(
-                                        text = "Paragraph Break Cadence",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Medium,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    FlowRow(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        GemmaParagraphDensity.entries.forEach { density ->
-                                            val selected = settings.gemmaParagraphDensity == density
-                                            FilterChip(
-                                                selected = selected,
-                                                onClick = {
-                                                    if (!selected) {
-                                                        persistAndReload(settings.copy(gemmaParagraphDensity = density))
-                                                    }
-                                                },
-                                                label = { Text(density.displayName) }
-                                            )
-                                        }
-                                    }
-                                    Text(
-                                        text = settings.gemmaParagraphDensity.description,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
 
                 if (downloadState.errorMessage != null) {
                     Text(
@@ -1122,41 +966,5 @@ private fun ModelToggleItem(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun GemmaFeatureSwitchRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange
-        )
     }
 }

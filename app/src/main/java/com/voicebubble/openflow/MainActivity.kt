@@ -179,9 +179,9 @@ class MainActivity : ComponentActivity() {
                             val isDeveloperModeUnlocked by DebugLogManager.isUnlocked.collectAsState()
                             val appVersionName = remember {
                                 try {
-                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.5.2"
+                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.5.3"
                                 } catch (_: Throwable) {
-                                    "2.5.2"
+                                    "2.5.3"
                                 }
                             }
                             var versionTapCount by remember { mutableIntStateOf(0) }

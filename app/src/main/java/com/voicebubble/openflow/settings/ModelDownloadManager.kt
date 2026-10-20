@@ -61,8 +61,7 @@ import kotlin.math.roundToInt
 data class ModelFileArtifact(
     val relativePath: String,
     val sizeBytes: Long,
-    val sha256: String,
-    val downloadUrl: String? = null
+    val sha256: String
 )
 
 enum class ModelQueueStatus {
@@ -254,16 +253,6 @@ object ModelDownloadManager {
                     sha256 = "07163e5f6f8a68f9ffeed7a8ff770c68098c2db216232321912188bd614b9a72"
                 )
             )
-            ),
-        DesertAntModel.GEMMA to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "gemma-3-270m-it-qat-Q4_0.gguf",
-                    sizeBytes = 241_410_624L,
-                    sha256 = "3626e245220ca4a1c5911eb4010b3ecb7bdbf5bc53c79403c21355354d1e2dc6",
-                    downloadUrl = "https://huggingface.co/ggml-org/gemma-3-270m-it-qat-GGUF/resolve/7dba9faa7cdb58c7dc44b238c7dbb00e391fbf65/gemma-3-270m-it-qat-Q4_0.gguf"
-                )
-            )
             )
     )
 
@@ -327,7 +316,6 @@ object ModelDownloadManager {
                 DesertAntModel.EAR -> current.copy(earEnabled = true)
                 DesertAntModel.CLEAR -> current.copy(clearEnabled = true)
                 DesertAntModel.UHM -> current.copy(uhmEnabled = true)
-                DesertAntModel.GEMMA -> current.copy(gemmaEnabled = true)
                 DesertAntModel.VOZ -> current
             }
             if (updated != current) {
@@ -613,8 +601,7 @@ object ModelDownloadManager {
                 }
             }
 
-            val urlStr = artifact.downloadUrl
-                ?: "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
             val completedBeforeFile = completedArtifactBytes
             downloadFileWithAutoResume(
                 urlStr = urlStr,
@@ -691,8 +678,7 @@ object ModelDownloadManager {
                 }
             }
 
-            val urlStr = artifact.downloadUrl
-                ?: "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
             val completedBeforeThisFile = completedBytesInModel
 
             val currentQueueSnapshot = synchronized(queueLock) { activeQueue.toList() }
