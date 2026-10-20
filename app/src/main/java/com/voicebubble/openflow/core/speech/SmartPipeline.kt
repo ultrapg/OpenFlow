@@ -143,7 +143,8 @@ data class PipelineStatus(
         DesertAntModel.VOZ to ModelLoadState.STANDBY,
         DesertAntModel.EAR to ModelLoadState.STANDBY,
         DesertAntModel.CLEAR to ModelLoadState.STANDBY,
-        DesertAntModel.UHM to ModelLoadState.STANDBY
+        DesertAntModel.UHM to ModelLoadState.STANDBY,
+        DesertAntModel.GEMMA to ModelLoadState.DISABLED
     ),
     val statusMessage: String = "Models on disk — ready to load",
     val lastInferenceMs: Long? = null,
@@ -238,10 +239,12 @@ class SmartPipeline(
     private var ear: Ear? = null
     private var clear: Clear? = null
     private var uhm: Uhm? = null
+    private var gemma: GemmaFormattingEngine? = null
 
     private var vozWarmedUp: Boolean = false
     private var earWarmedUp: Boolean = false
     private var clearWarmedUp: Boolean = false
+    private var gemmaWarmedUp: Boolean = false
 
     @Volatile
     private var isTranscribing: Boolean = false
@@ -407,12 +410,14 @@ class SmartPipeline(
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
+                closeGemmaLocked()
                 closeVozLocked()
                 System.gc()
             } else {
                 if (!snapshot.clearEnabled) closeClearLocked()
                 if (!snapshot.earEnabled) closeEarLocked()
                 if (!snapshot.uhmEnabled) closeUhmLocked()
+                if (!snapshot.gemmaEnabled) closeGemmaLocked()
             }
 
             updateStatusSnapshot(
@@ -582,9 +587,19 @@ class SmartPipeline(
                     }
                 }
 
-                val finalTranscript = normalizeTranscriptText(
+                val rawMergedTranscript = normalizeTranscriptText(
                     rawText = segmentTranscripts.joinToString(" "),
                     capitalizeLeadingWord = false
+                )
+
+                // =========================================================================
+                // Stage 5 (Optional / Experimental): Gemma 3 270M SLM Formatting Engine
+                // =========================================================================
+                val finalTranscript = runGemmaStageLocked(
+                    rawTranscript = rawMergedTranscript,
+                    language = resolvedLanguage,
+                    activeSettings = activeSettings,
+                    onStageProgress = onStageProgress
                 )
 
                 // Re-attach auxiliary models in ready state if memory is healthy
@@ -632,11 +647,12 @@ class SmartPipeline(
     suspend fun evictOptionalModels() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             if (!isTranscribing) {
-                Log.i(TAG, "Evicting optional models (Clear, Ear, Uhm) to free native RAM; keeping Voz resident.")
-                DebugLogManager.logInfo(TAG, "Evicting optional models (Clear, Ear, Uhm) from native RAM", includeMemory = true)
+                Log.i(TAG, "Evicting optional models (Clear, Ear, Uhm, Gemma) to free RAM; keeping Voz resident.")
+                DebugLogManager.logInfo(TAG, "Evicting optional models (Clear, Ear, Uhm, Gemma) from RAM", includeMemory = true)
                 closeClearLocked()
                 closeEarLocked()
                 closeUhmLocked()
+                closeGemmaLocked()
                 System.gc()
                 val snap = settings
                 updateStatusSnapshot(
@@ -670,6 +686,7 @@ class SmartPipeline(
             closeClearLocked()
             closeEarLocked()
             closeUhmLocked()
+            closeGemmaLocked()
             closeVozLocked()
             System.gc()
             val snap = settings
@@ -772,6 +789,12 @@ class SmartPipeline(
         if (activeSettings.uhmEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.UHM) &&
             uhm == null
+        ) {
+            return false
+        }
+        if (activeSettings.gemmaEnabled &&
+            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA) &&
+            gemma == null
         ) {
             return false
         }
@@ -954,6 +977,56 @@ class SmartPipeline(
         }
     }
 
+    private fun runGemmaStageLocked(
+        rawTranscript: String,
+        language: String,
+        activeSettings: ModelSettings,
+        onStageProgress: ((String) -> Unit)?
+    ): String {
+        if (!activeSettings.gemmaEnabled || rawTranscript.isBlank()) {
+            return rawTranscript
+        }
+        if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA)) {
+            return rawTranscript
+        }
+
+        val gemmaInstance = gemma ?: run {
+            val gemmaDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.GEMMA)
+            try {
+                GemmaFormattingEngine(appContext, gemmaDir).also {
+                    it.warmUp()
+                    gemma = it
+                    gemmaWarmedUp = true
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to create GemmaFormattingEngine: ${t.message}")
+                DebugLogManager.logWarn(TAG, "Failed to create GemmaFormattingEngine", t)
+                return rawTranscript
+            }
+        }
+
+        return try {
+            setModelActiveStatusLocked(
+                activeSettings,
+                DesertAntModel.GEMMA,
+                "Formatting with Gemma 3 270M (${activeSettings.gemmaFormattingStyle.displayName})..."
+            )
+            onStageProgress?.invoke("Gemma 3 270M")
+            val formatted = gemmaInstance.format(
+                rawTranscript = rawTranscript,
+                language = language,
+                style = activeSettings.gemmaFormattingStyle,
+                customVocabulary = activeSettings.customVocabulary
+            )
+            gemmaWarmedUp = true
+            formatted.ifBlank { rawTranscript }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Gemma 3 270M formatting failed; returning unformatted transcript: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Gemma 3 270M formatting failed; returning unformatted transcript", t)
+            rawTranscript
+        }
+    }
+
     private suspend fun runVozWithRetryLocked(
         samples: FloatArray,
         language: String,
@@ -985,6 +1058,7 @@ class SmartPipeline(
             closeClearLocked()
             closeEarLocked()
             closeUhmLocked()
+            closeGemmaLocked()
             closeVozLocked()
             System.gc()
             System.runFinalization()
@@ -1209,6 +1283,34 @@ class SmartPipeline(
         } else if (!activeSettings.uhmEnabled) {
             closeUhmLocked()
         }
+
+        // 4. Gemma 3 270M (Experimental SLM Formatting Engine)
+        if (activeSettings.gemmaEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA)) {
+            if (gemma == null) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.GEMMA,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading Gemma 3 270M SLM formatter..."
+                    )
+                    val gemmaDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.GEMMA)
+                    val engine = GemmaFormattingEngine(appContext, gemmaDir)
+                    if (warmUp) {
+                        engine.warmUp()
+                        gemmaWarmedUp = true
+                    }
+                    gemma = engine
+                    DebugLogManager.logInfo(TAG, "Gemma 3 270M SLM formatting engine loaded into RAM", includeMemory = true)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not initialize Gemma 3 270M: ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not initialize Gemma 3 270M", t)
+                    closeGemmaLocked()
+                }
+            }
+        } else if (!activeSettings.gemmaEnabled) {
+            closeGemmaLocked()
+        }
     }
 
     private fun countLoadedModelsLocked(activeSettings: ModelSettings): Int {
@@ -1217,6 +1319,7 @@ class SmartPipeline(
         if (activeSettings.earEnabled && ear != null) count++
         if (activeSettings.clearEnabled && clear != null) count++
         if (activeSettings.uhmEnabled && uhm != null) count++
+        if (activeSettings.gemmaEnabled && gemma != null) count++
         return count
     }
 
@@ -1238,6 +1341,7 @@ class SmartPipeline(
                 DesertAntModel.EAR -> ear != null
                 DesertAntModel.CLEAR -> clear != null
                 DesertAntModel.UHM -> uhm != null
+                DesertAntModel.GEMMA -> gemma != null
             }
             result[model] = when {
                 !enabled -> ModelLoadState.DISABLED
@@ -1360,6 +1464,18 @@ class SmartPipeline(
     private fun closeUhmLocked() {
         val instance = uhm
         uhm = null
+        if (instance != null) {
+            try {
+                instance.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun closeGemmaLocked() {
+        val instance = gemma
+        gemma = null
+        gemmaWarmedUp = false
         if (instance != null) {
             try {
                 instance.close()

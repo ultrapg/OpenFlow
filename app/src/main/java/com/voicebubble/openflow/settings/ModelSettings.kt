@@ -88,7 +88,46 @@ enum class DesertAntModel(
         sizeMb = 23,
         expectedBytes = 23_919_709L,
         isRequired = false
+    ),
+    GEMMA(
+        id = "gemma",
+        displayName = "Gemma 3 270M — SLM Formatting Engine (Experimental)",
+        roleSummary = "Experimental • Smart punctuation, self-correction resolution, ITN & structured notes",
+        sizeMb = 230,
+        expectedBytes = 241_410_624L,
+        isRequired = false
     );
+}
+
+/**
+ * Formatting style preset for the experimental Gemma 3 270M SLM text formatting engine.
+ */
+enum class GemmaFormattingStyle(
+    val id: String,
+    val displayName: String,
+    val description: String
+) {
+    SMART_CLEANUP(
+        id = "smart_cleanup",
+        displayName = "Smart Cleanup",
+        description = "Fixes punctuation, spoken commands, numbers/times, stutters, and mid-sentence self-corrections"
+    ),
+    CONCISE_PROSE(
+        id = "concise_prose",
+        displayName = "Concise Prose",
+        description = "Tightens rambling speech and removes conversational hedging into crisp written prose"
+    ),
+    STRUCTURED_NOTES(
+        id = "structured_notes",
+        displayName = "Structured Notes",
+        description = "Formats dictated sequences ('First... Second...') and action items into bulleted lists"
+    );
+
+    companion object {
+        fun fromId(id: String?): GemmaFormattingStyle {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: SMART_CLEANUP
+        }
+    }
 }
 
 /**
@@ -139,6 +178,8 @@ data class ModelSettings(
     val earEnabled: Boolean = true,
     val clearEnabled: Boolean = false,
     val uhmEnabled: Boolean = false,
+    val gemmaEnabled: Boolean = false,
+    val gemmaFormattingStyle: GemmaFormattingStyle = GemmaFormattingStyle.SMART_CLEANUP,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -155,25 +196,30 @@ data class ModelSettings(
         get() = DesertAntModel.VOZ.sizeMb +
             (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
             (if (clearEnabled) DesertAntModel.CLEAR.sizeMb else 0) +
-            (if (uhmEnabled) DesertAntModel.UHM.sizeMb else 0)
+            (if (uhmEnabled) DesertAntModel.UHM.sizeMb else 0) +
+            (if (gemmaEnabled) DesertAntModel.GEMMA.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on actual loaded LiteRT model weights + runtime buffers:
+     * Estimated peak RAM in MB based on actual loaded LiteRT / GGUF model weights + runtime buffers:
      * - Base (`Voz` 1,187 MB weights + ~213 MB app & LiteRT runtime): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      * - `Clear` (47 MB weights + streaming conformer/FFT state buffers): +150 MB
      * - `Uhm` (23 MB weights + frame buffers): +80 MB
+     * - `Gemma 3 270M` (230 MB Q4_0 weights + ~30 MB KV cache & formatting runtime): +260 MB
      */
     val estimatedPeakRamMb: Int
-        get() = when {
-            earEnabled && clearEnabled && uhmEnabled -> 1680
-            earEnabled && !clearEnabled && uhmEnabled -> 1530
-            earEnabled && clearEnabled && !uhmEnabled -> 1600
-            earEnabled && !clearEnabled && !uhmEnabled -> 1450
-            !earEnabled && clearEnabled && uhmEnabled -> 1630
-            !earEnabled && !clearEnabled && uhmEnabled -> 1480
-            !earEnabled && clearEnabled && !uhmEnabled -> 1550
-            else -> 1400
+        get() {
+            val audioPipelineRam = when {
+                earEnabled && clearEnabled && uhmEnabled -> 1680
+                earEnabled && !clearEnabled && uhmEnabled -> 1530
+                earEnabled && clearEnabled && !uhmEnabled -> 1600
+                earEnabled && !clearEnabled && !uhmEnabled -> 1450
+                !earEnabled && clearEnabled && uhmEnabled -> 1630
+                !earEnabled && !clearEnabled && uhmEnabled -> 1480
+                !earEnabled && clearEnabled && !uhmEnabled -> 1550
+                else -> 1400
+            }
+            return audioPipelineRam + (if (gemmaEnabled) 260 else 0)
         }
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
@@ -181,6 +227,7 @@ data class ModelSettings(
         DesertAntModel.EAR -> earEnabled
         DesertAntModel.CLEAR -> clearEnabled
         DesertAntModel.UHM -> uhmEnabled
+        DesertAntModel.GEMMA -> gemmaEnabled
     }
 
     fun enabledModels(): List<DesertAntModel> = buildList {
@@ -188,6 +235,7 @@ data class ModelSettings(
         if (earEnabled) add(DesertAntModel.EAR)
         if (clearEnabled) add(DesertAntModel.CLEAR)
         if (uhmEnabled) add(DesertAntModel.UHM)
+        if (gemmaEnabled) add(DesertAntModel.GEMMA)
     }
 
     companion object {
@@ -195,6 +243,8 @@ data class ModelSettings(
         const val KEY_EAR_ENABLED = "ear_enabled"
         const val KEY_CLEAR_ENABLED = "clear_enabled"
         const val KEY_UHM_ENABLED = "uhm_enabled"
+        const val KEY_GEMMA_ENABLED = "gemma_enabled"
+        const val KEY_GEMMA_STYLE = "gemma_formatting_style"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -220,11 +270,16 @@ data class ModelSettings(
             val accel = HardwareAccelerator.fromId(
                 prefs.getString(KEY_HARDWARE_ACCELERATOR, HardwareAccelerator.AUTO.id)
             )
+            val gemmaStyle = GemmaFormattingStyle.fromId(
+                prefs.getString(KEY_GEMMA_STYLE, GemmaFormattingStyle.SMART_CLEANUP.id)
+            )
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 clearEnabled = prefs.getBoolean(KEY_CLEAR_ENABLED, false),
                 uhmEnabled = prefs.getBoolean(KEY_UHM_ENABLED, false),
+                gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false),
+                gemmaFormattingStyle = gemmaStyle,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel
@@ -250,6 +305,8 @@ data class ModelSettings(
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
                 .putBoolean(KEY_CLEAR_ENABLED, settings.clearEnabled)
                 .putBoolean(KEY_UHM_ENABLED, settings.uhmEnabled)
+                .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
+                .putString(KEY_GEMMA_STYLE, settings.gemmaFormattingStyle.id)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
@@ -308,7 +365,8 @@ object DesertAntModelStorage {
         DesertAntModel.VOZ to "v0.4.0",
         DesertAntModel.EAR to "v0.2.0",
         DesertAntModel.CLEAR to "v0.3.0",
-        DesertAntModel.UHM to "v1.1.0"
+        DesertAntModel.UHM to "v1.1.0",
+        DesertAntModel.GEMMA to "v1.0.0"
     )
 
     @Volatile

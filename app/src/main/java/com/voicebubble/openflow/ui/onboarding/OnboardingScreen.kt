@@ -91,6 +91,7 @@ fun OnboardingScreen(
     var earSelected by remember { mutableStateOf(initialSettings.earEnabled) }
     var clearSelected by remember { mutableStateOf(initialSettings.clearEnabled) }
     var uhmSelected by remember { mutableStateOf(initialSettings.uhmEnabled) }
+    var gemmaSelected by remember { mutableStateOf(initialSettings.gemmaEnabled) }
 
     var step by remember {
         mutableStateOf(
@@ -105,7 +106,8 @@ fun OnboardingScreen(
     val configuredSettings = initialSettings.copy(
         earEnabled = earSelected,
         clearEnabled = clearSelected,
-        uhmEnabled = uhmSelected
+        uhmEnabled = uhmSelected,
+        gemmaEnabled = gemmaSelected
     )
 
     val selectedModels = configuredSettings.enabledModels()
@@ -255,6 +257,18 @@ fun OnboardingScreen(
                             enabled = true,
                             isLocked = false,
                             onCheckedChange = { uhmSelected = it }
+                        )
+
+                        HorizontalDivider()
+
+                        // Gemma 3 270M (Experimental, OFF by default)
+                        OnboardingModelRow(
+                            title = "Gemma 3 270M — SLM Formatting Engine (${DesertAntModel.GEMMA.sizeMb} MB)",
+                            subtitle = DesertAntModel.GEMMA.roleSummary,
+                            checked = gemmaSelected,
+                            enabled = true,
+                            isLocked = false,
+                            onCheckedChange = { gemmaSelected = it }
                         )
                     }
                 }

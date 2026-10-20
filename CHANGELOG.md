@@ -2,6 +2,17 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.1] - 2026-10-20
+
+### Added
+- **Experimental Gemma 3 270M SLM Formatting Engine (`GemmaFormattingEngine`, `DesertAntModel.GEMMA`, `GemmaFormattingStyle`, `SmartPipeline`, `ModelDownloadManager`, `SpeechRecognitionSettingsSection`, `OnboardingScreen`):**
+  - Added an optional **Stage 5 Small Language Model (SLM) Formatting Engine** powered by **Gemma 3 270M Instruct QAT** (`gemma-3-270m-it-qat-Q4_0.gguf`, `230 MB` / `241,410,624` bytes, SHA-256 `3626e245220ca4a1c5911eb4010b3ecb7bdbf5bc53c79403c21355354d1e2dc6`), **disabled by default** (`gemmaEnabled = false`).
+  - **Seamless Model Download & Storage Integration:** Handled through the exact same `ModelDownloadManager` and `DesertAntModelStorage` pipeline as `Voz`, `Ear`, `Clear`, and `Uhm` — including HTTP `Range` pause/resume, foreground service status-bar progress notifications, real-time `MB/s` speed and ETA telemetry, zero-wait streaming SHA-256 verification (`.openflow_verified`), GGUF v3 binary header verification, and one-tap cache deletion when inactive.
+  - **3 Configurable Formatting Modes (`GemmaFormattingStyle`):**
+    - **Smart Cleanup (Default):** Resolves mid-sentence self-corrections and repairs (*"meet at 3 pm no wait at 4:30 pm"* → *"Meet at 4:30 PM."*, *"scratch that"* clause cancellation), deduplicates word/phrase stutters (*"I I think that that"* → *"I think that"*), executes spoken layout & punctuation commands (*"new line"*, *"new paragraph"*, *"bullet point"*, *"question mark"*, *"colon"*, *"open quote"* across English, German, French, and Spanish), performs Inverse Text Normalization (ITN) for clock times, percentages, and currencies, segments run-on clauses, and detects questions (`?`) vs statements (`.`).
+    - **Concise Prose:** Performs all Smart Cleanup transformations plus removes verbose conversational hedging (*"I just wanted to say that"*, *"to be completely honest"*, *"im Grunde genommen"*) for crisp written prose.
+    - **Structured Notes:** Automatically detects sequential enumerations (*"First... Second... Third..."*, *"Erstens... Zweitens..."*) and converts them into clean bulleted lists (`• ...`).
+
 ## [2.4.1] - 2026-10-19
 
 ### Fixed

@@ -26,15 +26,15 @@ android {
     compileSdk = 35
 
     androidResources {
-        noCompress += listOf("tflite", "f16", "f32")
+        noCompress += listOf("tflite", "f16", "f32", "gguf")
     }
 
     defaultConfig {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "2.4.1"
+        versionCode = 16
+        versionName = "2.5.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

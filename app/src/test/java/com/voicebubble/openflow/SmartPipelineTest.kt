@@ -564,4 +564,105 @@ class SmartPipelineTest {
             tempFile.delete()
         }
     }
+
+    @Test
+    fun `Gemma 3 270M model is disabled by default and integrates into ModelSettings and ModelDownloadManager`() {
+        val defaultSettings = ModelSettings()
+        assertFalse("Gemma 3 270M must be disabled by default", defaultSettings.gemmaEnabled)
+        assertFalse(defaultSettings.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.GEMMA))
+        assertFalse(com.voicebubble.openflow.settings.DesertAntModel.GEMMA in defaultSettings.enabledModels())
+
+        val withGemma = defaultSettings.copy(
+            gemmaEnabled = true,
+            gemmaFormattingStyle = com.voicebubble.openflow.settings.GemmaFormattingStyle.CONCISE_PROSE
+        )
+        assertTrue(withGemma.gemmaEnabled)
+        assertTrue(withGemma.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.GEMMA))
+        assertTrue(com.voicebubble.openflow.settings.DesertAntModel.GEMMA in withGemma.enabledModels())
+        assertEquals(defaultSettings.activeDiskFootprintMb + 230, withGemma.activeDiskFootprintMb)
+        assertEquals(defaultSettings.estimatedPeakRamMb + 260, withGemma.estimatedPeakRamMb)
+
+        val gemmaSpec = com.voicebubble.openflow.settings.ModelDownloadManager.MODEL_SPECS[
+            com.voicebubble.openflow.settings.DesertAntModel.GEMMA
+        ]
+        assertTrue(gemmaSpec != null)
+        val (rev, artifacts) = gemmaSpec!!
+        assertEquals("v1.0.0", rev)
+        assertEquals(1, artifacts.size)
+        assertEquals("gemma-3-270m-it-qat-Q4_0.gguf", artifacts[0].relativePath)
+        assertEquals(241_410_624L, artifacts[0].sizeBytes)
+        assertEquals("3626e245220ca4a1c5911eb4010b3ecb7bdbf5bc53c79403c21355354d1e2dc6", artifacts[0].sha256)
+        assertTrue(artifacts[0].downloadUrl?.startsWith("https://huggingface.co/ggml-org/gemma-3-270m-it-qat-GGUF/resolve/") == true)
+    }
+
+    @Test
+    fun `GemmaFormattingEngine validates GGUF v3 header accurately`() {
+        val validTemp = java.io.File.createTempFile("gemma_valid", ".gguf")
+        val invalidTemp = java.io.File.createTempFile("gemma_invalid", ".gguf")
+        try {
+            val header = java.nio.ByteBuffer.allocate(32).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            header.put("GGUF".toByteArray(Charsets.US_ASCII))
+            header.putInt(3)       // GGUF v3
+            header.putLong(236L)   // 236 tensors in Gemma 3 270M
+            header.putLong(28L)    // 28 KV entries
+            header.putLong(0L)
+            validTemp.writeBytes(header.array())
+
+            val parsed = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.parseGgufHeader(validTemp)
+            assertTrue(parsed != null)
+            assertTrue(parsed!!.isValidGemma3Gguf)
+            assertEquals("GGUF", parsed.magic)
+            assertEquals(3, parsed.version)
+            assertEquals(236L, parsed.tensorCount)
+            assertEquals(28L, parsed.metadataKvCount)
+
+            invalidTemp.writeBytes("NOT_A_GGUF_HEADER_AT_ALL_12345678".toByteArray())
+            val invalidParsed = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.parseGgufHeader(invalidTemp)
+            assertFalse(invalidParsed?.isValidGemma3Gguf == true)
+        } finally {
+            validTemp.delete()
+            invalidTemp.delete()
+        }
+    }
+
+    @Test
+    fun `GemmaFormattingEngine resolves self-corrections stutters ITN and spoken commands`() {
+        // 1. Mid-utterance self-repair + clock time ITN + stutter removal
+        val repairedEn = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "i i think we should meet at 3 pm no wait at 4 30 pm",
+            language = "en"
+        )
+        assertEquals("I think we should meet at 4:30 PM.", repairedEn)
+
+        // 2. German self-repair + Uhr ITN + percentage ITN
+        val repairedDe = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "wir wir treffen uns um 14 uhr nein warte um 15 uhr 30 und der umsatz stieg um zwanzig prozent",
+            language = "de"
+        )
+        assertEquals("Wir treffen uns um 15:30 Uhr und der umsatz stieg um 20%.", repairedDe)
+
+        // 3. Spoken punctuation & layout commands + question detection + currency ITN
+        val layoutFormatted = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "can you review the budget question mark new line bullet point it costs fifty dollars",
+            language = "en"
+        )
+        assertEquals("Can you review the budget?\n• It costs \$50.", layoutFormatted)
+
+        // 4. CONCISE_PROSE mode strips conversational hedges
+        val concise = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "I just wanted to say that to be completely honest we are ready to ship openfloe",
+            language = "en",
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.CONCISE_PROSE,
+            customVocabulary = listOf("OpenFlow")
+        )
+        assertEquals("We are ready to ship OpenFlow.", concise)
+
+        // 5. STRUCTURED_NOTES mode turns sequential items into bulleted lists
+        val notes = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "First update the repository second run the test suite third publish the release",
+            language = "en",
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.STRUCTURED_NOTES
+        )
+        assertEquals("• Update the repository.\n• Run the test suite.\n• Publish the release.", notes)
+    }
 }
