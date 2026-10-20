@@ -2,6 +2,22 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.2] - 2026-10-20
+
+### Changed / Improved
+- **Gemma 3 270M SLM Formatting Engine Refocused on Reliable Non-Destructive Formatting (`GemmaFormattingEngine`, `ModelSettings`, `SpeechRecognitionSettingsSection`):**
+  - Replaced unreliable word/tone rewriting presets and regexes with **4 deterministic layout styles** that never alter or delete user vocabulary:
+    - **Standard Paragraphs (Default):** Sentence capitalization, English `"I"` pronoun casing, terminal punctuation (`.` / `?`), natural clause commas, and automatic paragraph breaks on long dictations.
+    - **Bullet List:** Formats dictated sentences, spoken `"bullet point"` / `"new line"` commands, or enumerated items into a bulleted list (`• Item`).
+    - **Numbered List:** Formats dictated sentences, spoken commands, or enumerated items into a numbered list (`1. Item`, `2. Item`).
+    - **Compact / Chat:** Keeps dictation in a single compact block without automatic paragraph splitting and omits the trailing period on single-sentence messages.
+  - **5 Granular Formatting Toggles (`GemmaFormattingConfig`):**
+    - **Sentence Capitalization & Punctuation** (now protects decimal numbers like `3.5` / `$4.50` and abbreviations like `Mr.` / `Dr.` from false sentence splits, and avoids false commas or splits on phrases like `"nothing but"` or `"however you want"`).
+    - **Spoken Punctuation & Layout Commands** (added `"comma"` and `"period"`, and automatically strips stray punctuation inserted by `Voz` around spoken commands like `"Question mark."` or `"New line."`).
+    - **Number, Time & Currency Formatting** (expanded spoken number conversion to cover `0`–`9,999`, spoken decimals like `"two point five"` → `"2.5"`, and spoken clock times like `"three thirty pm"` → `"3:30 PM"`).
+    - **Duplicate Function-Word Cleanup** (`"the the"` → `"the"`, `"I I"` → `"I"`).
+    - **Auto-Paragraph Long Dictations** with **Compact (3 sentences)**, **Balanced (4 sentences)**, and **Long-Form (6 sentences)** cadence and cross-chunk continuity stitching across 20s audio chunks.
+
 ## [2.5.1] - 2026-10-20
 
 ### Added
