@@ -587,8 +587,9 @@ class SmartPipeline(
                     }
                 }
 
+                val stitchedChunks = GemmaFormattingEngine.stitchChunkTranscripts(segmentTranscripts)
                 val rawMergedTranscript = normalizeTranscriptText(
-                    rawText = segmentTranscripts.joinToString(" "),
+                    rawText = stitchedChunks,
                     capitalizeLeadingWord = false
                 )
 
@@ -1015,7 +1016,7 @@ class SmartPipeline(
             val formatted = gemmaInstance.format(
                 rawTranscript = rawTranscript,
                 language = language,
-                style = activeSettings.gemmaFormattingStyle,
+                config = activeSettings.gemmaConfig,
                 customVocabulary = activeSettings.customVocabulary
             )
             gemmaWarmedUp = true

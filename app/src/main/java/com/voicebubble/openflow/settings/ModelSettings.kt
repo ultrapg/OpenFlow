@@ -110,17 +110,32 @@ enum class GemmaFormattingStyle(
     SMART_CLEANUP(
         id = "smart_cleanup",
         displayName = "Smart Cleanup",
-        description = "Fixes punctuation, spoken commands, numbers/times, stutters, and mid-sentence self-corrections"
+        description = "Balanced cleanup: fixes punctuation, spoken commands, numbers/times, stutters, and mid-sentence self-corrections"
     ),
     CONCISE_PROSE(
         id = "concise_prose",
         displayName = "Concise Prose",
-        description = "Tightens rambling speech and removes conversational hedging into crisp written prose"
+        description = "Tightens rambling speech and removes verbose conversational hedging into crisp written prose"
     ),
     STRUCTURED_NOTES(
         id = "structured_notes",
         displayName = "Structured Notes",
-        description = "Formats dictated sequences ('First... Second...') and action items into bulleted lists"
+        description = "Formats dictated sequences ('First... Second...'), action items, and multi-point notes into bulleted lists"
+    ),
+    PROFESSIONAL_EMAIL(
+        id = "professional_email",
+        displayName = "Professional / Email",
+        description = "Expands casual contractions ('don't' -> 'do not'), formats greetings & sign-offs onto paragraphs, and polishes business tone"
+    ),
+    CASUAL_CHAT(
+        id = "casual_chat",
+        displayName = "Casual Chat",
+        description = "Lightweight messaging cleanup: fixes self-repairs and stutters while keeping conversational tone and casual punctuation"
+    ),
+    TECHNICAL_CODE(
+        id = "technical_code",
+        displayName = "Technical / Dev",
+        description = "Converts spoken developer syntax ('camel case', 'snake case', 'inline code', 'fat arrow', 'double equals') into code-ready text"
     );
 
     companion object {
@@ -129,6 +144,59 @@ enum class GemmaFormattingStyle(
         }
     }
 }
+
+/**
+ * Paragraph break cadence for long multi-sentence dictations in Gemma 3 270M.
+ */
+enum class GemmaParagraphDensity(
+    val id: String,
+    val displayName: String,
+    val shortLabel: String,
+    val targetSentences: Int,
+    val description: String
+) {
+    COMPACT(
+        id = "compact",
+        displayName = "Compact (3–4 sentences)",
+        shortLabel = "Compact",
+        targetSentences = 3,
+        description = "Splits long dictations into short, scannable paragraphs every ~3 sentences or topic shift"
+    ),
+    BALANCED(
+        id = "balanced",
+        displayName = "Balanced (4–5 sentences)",
+        shortLabel = "Balanced",
+        targetSentences = 4,
+        description = "Splits long dictations at natural discourse transitions or every ~4 sentences"
+    ),
+    LONG_FORM(
+        id = "long_form",
+        displayName = "Long-Form (6–8 sentences)",
+        shortLabel = "Long-Form",
+        targetSentences = 6,
+        description = "Keeps longer essay-style paragraphs, breaking primarily at major topic transitions"
+    );
+
+    companion object {
+        fun fromId(id: String?): GemmaParagraphDensity {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: BALANCED
+        }
+    }
+}
+
+/**
+ * Fine-grained configuration options for the Gemma 3 270M SLM Formatting Engine.
+ */
+data class GemmaFormattingConfig(
+    val style: GemmaFormattingStyle = GemmaFormattingStyle.SMART_CLEANUP,
+    val selfCorrectionEnabled: Boolean = true,
+    val stutterRemovalEnabled: Boolean = true,
+    val spokenCommandsEnabled: Boolean = true,
+    val smartNumbersEnabled: Boolean = true,
+    val smartPunctuationEnabled: Boolean = true,
+    val autoParagraphEnabled: Boolean = true,
+    val paragraphDensity: GemmaParagraphDensity = GemmaParagraphDensity.BALANCED
+)
 
 /**
  * Hardware acceleration preference for LiteRT on-device audio inference.
@@ -180,6 +248,13 @@ data class ModelSettings(
     val uhmEnabled: Boolean = false,
     val gemmaEnabled: Boolean = false,
     val gemmaFormattingStyle: GemmaFormattingStyle = GemmaFormattingStyle.SMART_CLEANUP,
+    val gemmaSelfCorrectionEnabled: Boolean = true,
+    val gemmaStutterRemovalEnabled: Boolean = true,
+    val gemmaSpokenCommandsEnabled: Boolean = true,
+    val gemmaSmartNumbersEnabled: Boolean = true,
+    val gemmaSmartPunctuationEnabled: Boolean = true,
+    val gemmaAutoParagraphEnabled: Boolean = true,
+    val gemmaParagraphDensity: GemmaParagraphDensity = GemmaParagraphDensity.BALANCED,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -188,6 +263,21 @@ data class ModelSettings(
      * `Voz` is the core STT engine and cannot be disabled.
      */
     val vozEnabled: Boolean = true
+
+    /**
+     * Snapshot of all Gemma 3 270M SLM formatting options.
+     */
+    val gemmaConfig: GemmaFormattingConfig
+        get() = GemmaFormattingConfig(
+            style = gemmaFormattingStyle,
+            selfCorrectionEnabled = gemmaSelfCorrectionEnabled,
+            stutterRemovalEnabled = gemmaStutterRemovalEnabled,
+            spokenCommandsEnabled = gemmaSpokenCommandsEnabled,
+            smartNumbersEnabled = gemmaSmartNumbersEnabled,
+            smartPunctuationEnabled = gemmaSmartPunctuationEnabled,
+            autoParagraphEnabled = gemmaAutoParagraphEnabled,
+            paragraphDensity = gemmaParagraphDensity
+        )
 
     /**
      * Active disk footprint in MB based on currently enabled models.
@@ -245,6 +335,13 @@ data class ModelSettings(
         const val KEY_UHM_ENABLED = "uhm_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
         const val KEY_GEMMA_STYLE = "gemma_formatting_style"
+        const val KEY_GEMMA_SELF_CORRECTION = "gemma_self_correction_enabled"
+        const val KEY_GEMMA_STUTTER_REMOVAL = "gemma_stutter_removal_enabled"
+        const val KEY_GEMMA_SPOKEN_COMMANDS = "gemma_spoken_commands_enabled"
+        const val KEY_GEMMA_SMART_NUMBERS = "gemma_smart_numbers_enabled"
+        const val KEY_GEMMA_SMART_PUNCTUATION = "gemma_smart_punctuation_enabled"
+        const val KEY_GEMMA_AUTO_PARAGRAPH = "gemma_auto_paragraph_enabled"
+        const val KEY_GEMMA_PARAGRAPH_DENSITY = "gemma_paragraph_density"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -273,6 +370,9 @@ data class ModelSettings(
             val gemmaStyle = GemmaFormattingStyle.fromId(
                 prefs.getString(KEY_GEMMA_STYLE, GemmaFormattingStyle.SMART_CLEANUP.id)
             )
+            val paragraphDensity = GemmaParagraphDensity.fromId(
+                prefs.getString(KEY_GEMMA_PARAGRAPH_DENSITY, GemmaParagraphDensity.BALANCED.id)
+            )
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
@@ -280,6 +380,13 @@ data class ModelSettings(
                 uhmEnabled = prefs.getBoolean(KEY_UHM_ENABLED, false),
                 gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false),
                 gemmaFormattingStyle = gemmaStyle,
+                gemmaSelfCorrectionEnabled = prefs.getBoolean(KEY_GEMMA_SELF_CORRECTION, true),
+                gemmaStutterRemovalEnabled = prefs.getBoolean(KEY_GEMMA_STUTTER_REMOVAL, true),
+                gemmaSpokenCommandsEnabled = prefs.getBoolean(KEY_GEMMA_SPOKEN_COMMANDS, true),
+                gemmaSmartNumbersEnabled = prefs.getBoolean(KEY_GEMMA_SMART_NUMBERS, true),
+                gemmaSmartPunctuationEnabled = prefs.getBoolean(KEY_GEMMA_SMART_PUNCTUATION, true),
+                gemmaAutoParagraphEnabled = prefs.getBoolean(KEY_GEMMA_AUTO_PARAGRAPH, true),
+                gemmaParagraphDensity = paragraphDensity,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel
@@ -307,6 +414,13 @@ data class ModelSettings(
                 .putBoolean(KEY_UHM_ENABLED, settings.uhmEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
                 .putString(KEY_GEMMA_STYLE, settings.gemmaFormattingStyle.id)
+                .putBoolean(KEY_GEMMA_SELF_CORRECTION, settings.gemmaSelfCorrectionEnabled)
+                .putBoolean(KEY_GEMMA_STUTTER_REMOVAL, settings.gemmaStutterRemovalEnabled)
+                .putBoolean(KEY_GEMMA_SPOKEN_COMMANDS, settings.gemmaSpokenCommandsEnabled)
+                .putBoolean(KEY_GEMMA_SMART_NUMBERS, settings.gemmaSmartNumbersEnabled)
+                .putBoolean(KEY_GEMMA_SMART_PUNCTUATION, settings.gemmaSmartPunctuationEnabled)
+                .putBoolean(KEY_GEMMA_AUTO_PARAGRAPH, settings.gemmaAutoParagraphEnabled)
+                .putString(KEY_GEMMA_PARAGRAPH_DENSITY, settings.gemmaParagraphDensity.id)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)

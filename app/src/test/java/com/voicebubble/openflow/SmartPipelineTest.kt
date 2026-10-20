@@ -664,5 +664,96 @@ class SmartPipelineTest {
             style = com.voicebubble.openflow.settings.GemmaFormattingStyle.STRUCTURED_NOTES
         )
         assertEquals("• Update the repository.\n• Run the test suite.\n• Publish the release.", notes)
+
+        // 6. PROFESSIONAL_EMAIL mode expands contractions and separates greetings & sign-offs
+        val email = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "Hi Sarah I'm writing to let you know we can't ship until 4 pm best regards Alex",
+            language = "en",
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.PROFESSIONAL_EMAIL
+        )
+        assertEquals("Hi Sarah,\n\nI am writing to let you know we cannot ship until 4:00 PM.\n\nBest regards,\nAlex.", email)
+
+        // 7. CASUAL_CHAT mode omits trailing period on single short sentences while keeping repairs
+        val chat = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "see you at 6 pm no wait at 7 pm",
+            language = "en",
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.CASUAL_CHAT
+        )
+        assertEquals("See you at 7:00 PM", chat)
+
+        // 8. TECHNICAL_CODE mode formats spoken identifier casing and code operators
+        val codeText = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = "check if camel case user profile id double equals inline code null",
+            language = "en",
+            style = com.voicebubble.openflow.settings.GemmaFormattingStyle.TECHNICAL_CODE
+        )
+        assertEquals("Check if userProfileId == `null`.", codeText)
+    }
+
+    @Test
+    fun `GemmaFormattingEngine handles long multi-chunk dictations auto-paragraphing and granular config toggles`() {
+        // 1. Cross-chunk boundary stitching heals artificial mid-sentence periods from 20s chunks
+        val chunks = listOf(
+            "We need to send the report to.",
+            "The marketing team no wait to the engineering team.",
+            "And we should also review the three hundred fifty dollars budget."
+        )
+        val stitched = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.stitchChunkTranscripts(chunks)
+        val formattedFromChunks = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = stitched,
+            language = "en"
+        )
+        assertEquals(
+            "We need to send the report to the engineering team and we should also review the \$350 budget.",
+            formattedFromChunks
+        )
+
+        // 2. Bounded clause cancellation ("scratch that") inside a long unpunctuated dictation
+        // must only cancel the local clause and preserve earlier content
+        val longWithScratchThat =
+            "We completed the architecture review this morning and the latency benchmarks looked great " +
+                "and we should delete the staging database scratch that we should back up the staging database first"
+        val formattedScratch = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = longWithScratchThat,
+            language = "en"
+        )
+        assertTrue(formattedScratch.contains("We completed the architecture review this morning"))
+        assertFalse(formattedScratch.contains("delete the staging database"))
+        assertTrue(formattedScratch.contains("we should back up the staging database first."))
+
+        // 3. Long multi-minute dictation (> 2,500 chars / 24 sentences) splits into windows and auto-paragraphs cleanly
+        val longSentences = (1..12).joinToString(" ") { idx ->
+            "Sentence number $idx explains the quarterly product roadmap in detail. " +
+                "Meanwhile we are optimizing the on-device neural pipeline for low latency."
+        }
+        assertTrue(longSentences.length > com.voicebubble.openflow.core.speech.GemmaFormattingEngine.MAX_DISCOURSE_WINDOW_CHARS)
+
+        val windows = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.splitIntoDiscourseWindows(longSentences)
+        assertTrue(windows.size >= 2)
+        assertTrue(windows.all { it.length <= com.voicebubble.openflow.core.speech.GemmaFormattingEngine.MAX_DISCOURSE_WINDOW_CHARS })
+
+        val formattedCompact = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = longSentences,
+            language = "en",
+            config = com.voicebubble.openflow.settings.GemmaFormattingConfig(
+                autoParagraphEnabled = true,
+                paragraphDensity = com.voicebubble.openflow.settings.GemmaParagraphDensity.COMPACT
+            )
+        )
+        val compactParagraphs = formattedCompact.split("\n\n")
+        assertTrue("Expected multiple paragraphs in long dictation, got ${compactParagraphs.size}", compactParagraphs.size >= 6)
+
+        // 4. Disabling individual toggles in GemmaFormattingConfig is respected
+        val rawToggleInput = "i i think it costs fifty dollars no wait sixty dollars"
+        val withAllDisabled = com.voicebubble.openflow.core.speech.GemmaFormattingEngine.formatTranscript(
+            rawText = rawToggleInput,
+            language = "en",
+            config = com.voicebubble.openflow.settings.GemmaFormattingConfig(
+                selfCorrectionEnabled = false,
+                stutterRemovalEnabled = false,
+                smartNumbersEnabled = false
+            )
+        )
+        assertEquals("I I think it costs fifty dollars no wait sixty dollars.", withAllDisabled)
     }
 }
