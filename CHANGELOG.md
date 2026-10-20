@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.8] - 2026-10-20
+
+### Changed
+- **Hide Notification Icon from Top Status Bar (`FloatingBubbleService`):** Migrated the foreground service notification channel to `NotificationManager.IMPORTANCE_MIN` (`NotificationCompat.PRIORITY_MIN`, `setSilent(true)`) and deleted the legacy `IMPORTANCE_LOW` channel so the microphone notification icon no longer clutters the top status bar while keeping the service notification active in the notification shade.
+
 ## [2.5.7] - 2026-10-20
 
 ### Changed

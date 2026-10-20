@@ -103,7 +103,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         const val KEY_BUBBLE_ENABLED_BY_USER = "bubble_enabled_by_user"
         const val KEY_AUTO_START_BUBBLE = "auto_start_bubble"
 
-        private const val CHANNEL_ID = "bubble_service_channel"
+        private const val LEGACY_CHANNEL_ID = "bubble_service_channel"
+        private const val CHANNEL_ID = "bubble_service_channel_min"
         private const val NOTIFICATION_ID = 1001
         private const val REQUEST_CODE_RESTORE_NOTIFICATION = 1002
 
@@ -681,14 +682,22 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private fun buildForegroundNotification(status: PipelineStatus): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            try {
+                nm.deleteNotificationChannel(LEGACY_CHANNEL_ID)
+            } catch (_: Throwable) {
+            }
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Voice Dictation Service",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_MIN
             ).apply {
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
             }
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+            nm.createNotificationChannel(channel)
         }
 
         val contentPendingIntent = PendingIntent.getActivity(
@@ -716,6 +725,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             .setSmallIcon(com.voicebubble.openflow.R.drawable.ic_notification)
             .setContentIntent(contentPendingIntent)
             .setDeleteIntent(deletePendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setSilent(true)
+            .setShowWhen(false)
             .setOngoing(true)
             .setAutoCancel(false)
             .setOnlyAlertOnce(true)
