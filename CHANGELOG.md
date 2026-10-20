@@ -2,6 +2,14 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.5] - 2026-10-20
+
+### Fixed
+- **Floating Bubble Re-Appearance After Screen Off / Screen On (`FloatingBubbleService`, `TextInjectionAccessibilityService`, `BubbleOverlayComponent`):**
+  - Moved the authoritative floating bubble visibility & `WindowManager.LayoutParams` (`alpha`, `FLAG_NOT_TOUCHABLE`) controller out of `@Composable LaunchedEffect` (which depends on `Choreographer` VSYNC frames and skipped `true -> false -> true` state transitions across `Display.STATE_OFF`) and directly into `FloatingBubbleService.serviceScope` (`Dispatchers.Main` via `Looper.getMainLooper()`) with a `200 ms` main-thread heartbeat and staggered wake-up refreshes.
+  - Fixed a lock-state race condition where `KeyguardManager.isKeyguardLocked` remained `true` during `ACTION_SCREEN_ON` / `ACTION_USER_PRESENT` keyguard exit animations (or when keyguard was occluded), preventing `TextInjectionAccessibilityService` and `FloatingBubbleService` from detecting the on-screen keyboard after waking the screen.
+  - Ensured `BubbleOverlayComponent` renders at `alpha = 1.0f` immediately on the first visible frame so interrupted `Choreographer` animation frames during display sleep can never leave the bubble transparent.
+
 ## [2.5.4] - 2026-10-20
 
 ### Fixed

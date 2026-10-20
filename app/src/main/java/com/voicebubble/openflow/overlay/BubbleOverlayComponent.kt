@@ -219,8 +219,12 @@ fun BubbleOverlayComponent(
     )
 
     val bubbleShape = RoundedCornerShape(cornerRadius)
-    val effectiveScale = (scale * (0.4f + 0.6f * visibilityProgress)).coerceAtLeast(0.01f)
-    val effectiveAlpha = visibilityProgress.coerceIn(0f, 1f)
+    val effectiveScale = if (isVisible) {
+        (scale * (0.88f + 0.12f * visibilityProgress)).coerceAtLeast(0.88f)
+    } else {
+        (scale * (0.4f + 0.6f * visibilityProgress)).coerceAtLeast(0.01f)
+    }
+    val effectiveAlpha = if (isVisible) 1f else visibilityProgress.coerceIn(0f, 1f)
 
     Box(
         modifier = Modifier

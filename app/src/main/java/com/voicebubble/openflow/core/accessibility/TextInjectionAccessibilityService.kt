@@ -38,6 +38,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
          */
         val isInputFieldFocused = MutableStateFlow(false)
         val isServiceConnected = MutableStateFlow(false)
+        val isScreenInteractive = MutableStateFlow(true)
 
         fun getSharedInstance(): TextInjectionAccessibilityService? {
             return instance?.get()
@@ -56,6 +57,10 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         // Automatically start the floating bubble service on phone boot or after process crash recovery
         FloatingBubbleService.ensureRunningIfEnabled(this, reason = "accessibility_onServiceConnected")
 
+        startPollingLoop()
+    }
+
+    private fun startPollingLoop() {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
             while (isActive) {
@@ -76,6 +81,9 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     fun refreshNow() {
+        if (pollingJob?.isActive != true) {
+            startPollingLoop()
+        }
         refreshKeyboardVisibilityState()
     }
 
@@ -117,10 +125,21 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private fun isSoftKeyboardWindowVisible(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
         return try {
+            if (!isScreenInteractive.value) return false
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (pm != null && !pm.isInteractive) return false
             val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            if (km != null && km.isKeyguardLocked) return false
+            if (km != null && km.isDeviceLocked) {
+                val focusedOnLockscreen = findFocusedEditableNode(requireEditableFlag = false)
+                if (focusedOnLockscreen == null) {
+                    return false
+                }
+                try {
+                    @Suppress("DEPRECATION")
+                    focusedOnLockscreen.recycle()
+                } catch (_: Throwable) {
+                }
+            }
 
             val allWindows = windows ?: return false
             val dm = resources.displayMetrics

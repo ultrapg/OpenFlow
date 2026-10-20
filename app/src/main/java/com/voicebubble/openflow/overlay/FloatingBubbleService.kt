@@ -227,6 +227,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 false
             }
         }
+
+        internal fun computeShouldShowBubble(
+            isScreenInteractive: Boolean,
+            showOnlyOnInputs: Boolean,
+            isKeyboardOnScreen: Boolean,
+            bubbleState: OverlayBubbleState,
+            isDeviceLocked: Boolean
+        ): Boolean {
+            if (!isScreenInteractive) return false
+            if (isKeyboardOnScreen || bubbleState != OverlayBubbleState.IDLE) return true
+            if (!showOnlyOnInputs) return !isDeviceLocked
+            return false
+        }
     }
 
     override val viewModelStore: ViewModelStore = ViewModelStore()
@@ -250,22 +263,20 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
-    private val isScreenActiveAndUnlocked = MutableStateFlow(true)
+    private val isScreenInteractive = MutableStateFlow(true)
+    private val isBubbleVisibleFlow = MutableStateFlow(false)
+    private val bubbleSizeFlow = MutableStateFlow(52f)
+    private var hideDelayJob: Job? = null
+    private var screenWakeRefreshJob: Job? = null
 
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
-                    onScreenTurnedOffOrLocked()
+                    onScreenTurnedOff()
                 }
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
-                    val activeAndUnlocked = checkScreenActiveAndUnlocked()
-                    isScreenActiveAndUnlocked.value = activeAndUnlocked
-                    if (!activeAndUnlocked) {
-                        onScreenTurnedOffOrLocked()
-                    } else {
-                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
-                    }
+                    onScreenTurnedOn()
                 }
             }
         }
@@ -283,6 +294,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
+    private val settingsPrefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (prefs == null || key == null) return@OnSharedPreferenceChangeListener
+        when (key) {
+            "bubble_size" -> {
+                bubbleSizeFlow.value = prefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
+                clampBubblePositionToScreen()
+            }
+            KEY_SHOW_ONLY_ON_INPUTS, KEY_BUBBLE_DISAPPEAR_DELAY_MS -> {
+                syncBubbleVisibility()
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         _isRunning.value = true
@@ -291,13 +315,20 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         savedStateRegistryController.performRestore(null)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         smartPipeline = SmartPipeline.getInstance(this)
-        isScreenActiveAndUnlocked.value = checkScreenActiveAndUnlocked()
+        val interactive = checkScreenInteractive()
+        isScreenInteractive.value = interactive
+        TextInjectionAccessibilityService.isScreenInteractive.value = interactive
+
+        val settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        bubbleSizeFlow.value = settingsPrefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
+        settingsPrefs.registerOnSharedPreferenceChangeListener(settingsPrefsListener)
 
         // Start foreground immediately in onCreate to satisfy Android 8-15 strict FGS timeout
         startCustomForeground(smartPipeline.pipelineStatus.value)
 
         registerScreenStateReceiver()
         setupOverlayView()
+        syncBubbleVisibility()
         initializePipeline()
 
         val modelPrefs = ModelSettings.getPreferences(this)
@@ -310,21 +341,52 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             }
         }
 
-        // Self-healing watchdog: restores dismissed notification on Android 14+, re-attaches overlay if detached,
-        // and enforces screen-off / lockscreen hiding
+        // React immediately on Main thread when Accessibility IME state, connection, or bubble recording state changes
         serviceScope.launch {
+            TextInjectionAccessibilityService.isInputFieldFocused.collect {
+                syncBubbleVisibility()
+            }
+        }
+        serviceScope.launch {
+            TextInjectionAccessibilityService.isServiceConnected.collect {
+                syncBubbleVisibility()
+            }
+        }
+        serviceScope.launch {
+            bubbleState.collect {
+                syncBubbleVisibility()
+            }
+        }
+
+        // Main-thread heartbeat (independent of Compose Choreographer VSYNC):
+        // enforces immediate screen-off hiding, restores visibility as soon as keyboard opens after screen-on,
+        // and self-heals overlay attachment & notification every 4 seconds.
+        serviceScope.launch {
+            var tickCount = 0
             while (isActive) {
-                delay(4_000L)
-                val activeAndUnlocked = checkScreenActiveAndUnlocked()
-                if (isScreenActiveAndUnlocked.value != activeAndUnlocked) {
-                    isScreenActiveAndUnlocked.value = activeAndUnlocked
-                }
-                if (!activeAndUnlocked) {
-                    setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                delay(200L)
+                tickCount++
+                val nowInteractive = checkScreenInteractive()
+                if (!nowInteractive) {
+                    if (isScreenInteractive.value || isBubbleVisibleFlow.value ||
+                        (::layoutParams.isInitialized && layoutParams.alpha > 0f)
+                    ) {
+                        onScreenTurnedOff()
+                    }
                 } else {
-                    ensureOverlayAttached()
+                    if (!isScreenInteractive.value) {
+                        onScreenTurnedOn()
+                    } else {
+                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                        syncBubbleVisibility()
+                    }
+                    if (tickCount % 20 == 0) {
+                        ensureOverlayAttached()
+                    }
                 }
-                ensureNotificationPresent()
+                if (tickCount % 20 == 0) {
+                    ensureNotificationPresent()
+                }
             }
         }
     }
@@ -344,11 +406,15 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         setBubbleEnabledByUser(this, true)
         startCustomForeground(smartPipeline.pipelineStatus.value)
 
-        isScreenActiveAndUnlocked.value = checkScreenActiveAndUnlocked()
+        val interactive = checkScreenInteractive()
+        isScreenInteractive.value = interactive
+        TextInjectionAccessibilityService.isScreenInteractive.value = interactive
         ensureOverlayAttached()
+        syncBubbleVisibility()
 
         if (action == ACTION_REFRESH_SETTINGS) {
             clampBubblePositionToScreen()
+            syncBubbleVisibility()
         } else if (action == ACTION_RESTORE_NOTIFICATION) {
             DebugLogManager.logInfo("FloatingBubbleService", "Restoring dismissed foreground notification")
             updateForegroundNotification(smartPipeline.pipelineStatus.value)
@@ -398,25 +464,29 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         screenReceiverRegistered = false
     }
 
-    private fun checkScreenActiveAndUnlocked(): Boolean {
+    private fun checkScreenInteractive(): Boolean {
         return try {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            val isInteractive = pm?.isInteractive ?: true
-            val isKeyguardLocked = km?.isKeyguardLocked ?: false
-            isInteractive && !isKeyguardLocked
+            pm?.isInteractive ?: true
         } catch (_: Throwable) {
             true
         }
     }
 
     /**
-     * Immediately hides the floating bubble surface when the screen turns off or the lockscreen engages,
+     * Immediately hides the floating bubble surface when the screen turns off,
      * bypassing Compose VSYNC delays (since Choreographer stops ticking when the display is off).
      */
-    private fun onScreenTurnedOffOrLocked() {
-        isScreenActiveAndUnlocked.value = false
+    private fun onScreenTurnedOff() {
+        screenWakeRefreshJob?.cancel()
+        screenWakeRefreshJob = null
+        hideDelayJob?.cancel()
+        hideDelayJob = null
+
+        isScreenInteractive.value = false
+        TextInjectionAccessibilityService.isScreenInteractive.value = false
         TextInjectionAccessibilityService.isInputFieldFocused.value = false
+        isBubbleVisibleFlow.value = false
 
         if (bubbleState.value == OverlayBubbleState.RECORDING) {
             bubbleState.value = OverlayBubbleState.IDLE
@@ -431,7 +501,109 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
 
         // Synchronously hide WindowManager overlay surface with 0ms delay
-        setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+        setOverlayWindowVisibleAndTouchable(visible = false, touchable = false, forceUpdate = true)
+    }
+
+    /**
+     * Restores interactive screen tracking when the screen turns on or the user unlocks the device,
+     * and triggers immediate + staggered keyboard checks so the bubble appears as soon as an input is active.
+     */
+    private fun onScreenTurnedOn() {
+        isScreenInteractive.value = true
+        TextInjectionAccessibilityService.isScreenInteractive.value = true
+        ensureOverlayAttached()
+        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+        syncBubbleVisibility()
+
+        screenWakeRefreshJob?.cancel()
+        screenWakeRefreshJob = serviceScope.launch {
+            for (waitMs in longArrayOf(80L, 180L, 350L, 650L, 1_100L)) {
+                delay(waitMs)
+                if (!checkScreenInteractive()) break
+                isScreenInteractive.value = true
+                TextInjectionAccessibilityService.isScreenInteractive.value = true
+                TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                syncBubbleVisibility()
+            }
+        }
+    }
+
+    private fun shouldShowBubbleNow(): Boolean {
+        val interactive = isScreenInteractive.value && checkScreenInteractive()
+        if (!interactive) return false
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val showOnlyOnInputs = prefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
+        val isKeyboardOnScreen = if (TextInjectionAccessibilityService.isServiceConnected.value) {
+            TextInjectionAccessibilityService.isInputFieldFocused.value || checkWindowInsetsImeVisible()
+        } else {
+            checkWindowInsetsImeVisible()
+        }
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val deviceLocked = km?.isDeviceLocked ?: false
+        return computeShouldShowBubble(
+            isScreenInteractive = true,
+            showOnlyOnInputs = showOnlyOnInputs,
+            isKeyboardOnScreen = isKeyboardOnScreen,
+            bubbleState = bubbleState.value,
+            isDeviceLocked = deviceLocked
+        )
+    }
+
+    /**
+     * Authoritative main-thread visibility controller (runs on [Dispatchers.Main] via `Looper.getMainLooper()`,
+     * never blocked by Compose `Choreographer` VSYNC suspension across screen-off/screen-on cycles).
+     */
+    private fun syncBubbleVisibility() {
+        val interactive = checkScreenInteractive()
+        if (!interactive || !isScreenInteractive.value) {
+            hideDelayJob?.cancel()
+            hideDelayJob = null
+            isBubbleVisibleFlow.value = false
+            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+            return
+        }
+
+        if (shouldShowBubbleNow()) {
+            hideDelayJob?.cancel()
+            hideDelayJob = null
+            ensureOverlayAttached()
+            val wasHidden = !isBubbleVisibleFlow.value
+            isBubbleVisibleFlow.value = true
+            setOverlayWindowVisibleAndTouchable(
+                visible = true,
+                touchable = true,
+                forceUpdate = wasHidden
+            )
+        } else {
+            if (!isBubbleVisibleFlow.value) {
+                if (hideDelayJob == null) {
+                    setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                }
+            } else if (hideDelayJob == null) {
+                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val disappearDelayMs = prefs.getLong(
+                    KEY_BUBBLE_DISAPPEAR_DELAY_MS,
+                    DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS
+                ).coerceIn(0L, 5_000L)
+                hideDelayJob = serviceScope.launch {
+                    try {
+                        if (disappearDelayMs > 0L) {
+                            delay(disappearDelayMs)
+                        }
+                        if (shouldShowBubbleNow()) return@launch
+                        isBubbleVisibleFlow.value = false
+                        // Immediately disable touch interception while exit animation plays
+                        setOverlayWindowVisibleAndTouchable(visible = true, touchable = false)
+                        delay(160L)
+                        if (!shouldShowBubbleNow()) {
+                            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
+                        }
+                    } finally {
+                        hideDelayJob = null
+                    }
+                }
+            }
+        }
     }
 
     private fun ensureOverlayAttached() {
@@ -627,10 +799,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val metrics = resources.displayMetrics
         val savedX = prefs.getInt("bubble_x", 80).coerceIn(0, (metrics.widthPixels - 140).coerceAtLeast(0))
         val savedY = prefs.getInt("bubble_y", 400).coerceIn(0, (metrics.heightPixels - 180).coerceAtLeast(0))
-        val initialShowOnlyOnKeyboard = prefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
-        val screenActive = checkScreenActiveAndUnlocked()
-        isScreenActiveAndUnlocked.value = screenActive
-        val initiallyVisible = screenActive && (!initialShowOnlyOnKeyboard || TextInjectionAccessibilityService.isInputFieldFocused.value)
+        bubbleSizeFlow.value = prefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
+        val interactive = checkScreenInteractive()
+        isScreenInteractive.value = interactive
+        TextInjectionAccessibilityService.isScreenInteractive.value = interactive
+        val initiallyVisible = shouldShowBubbleNow()
+        isBubbleVisibleFlow.value = initiallyVisible
 
         layoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -661,117 +835,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             setContent {
                 OpenFlowTheme {
                     val currentState by bubbleState.collectAsState()
-                    val screenActiveState by isScreenActiveAndUnlocked.collectAsState()
-                    val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
-                    val isAccessibilityImeVisible by TextInjectionAccessibilityService.isInputFieldFocused.collectAsState()
+                    val isBubbleVisible by isBubbleVisibleFlow.collectAsState()
+                    val bubbleSize by bubbleSizeFlow.collectAsState()
                     val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
-
+                    val progressText by processingProgress.collectAsState()
                     val settingsPrefs = androidx.compose.runtime.remember {
                         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    }
-                    var showOnlyOnInputs by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(
-                            settingsPrefs.getBoolean(KEY_SHOW_ONLY_ON_INPUTS, true)
-                        )
-                    }
-                    var disappearDelayMs by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(
-                            settingsPrefs.getLong(KEY_BUBBLE_DISAPPEAR_DELAY_MS, DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS)
-                                .coerceIn(0L, 5_000L)
-                        )
-                    }
-                    var bubbleSize by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(
-                            settingsPrefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
-                        )
-                    }
-                    var isWindowInsetsImeVisible by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(false)
-                    }
-
-                    // Poll WindowInsetsCompat.Type.ime() on API 30+ as a direct fallback if Accessibility Service is not yet enabled
-                    androidx.compose.runtime.LaunchedEffect(isAccessibilityConnected, screenActiveState) {
-                        while (!isAccessibilityConnected && screenActiveState) {
-                            isWindowInsetsImeVisible = checkWindowInsetsImeVisible()
-                            delay(180L)
-                        }
-                        if (!screenActiveState) {
-                            isWindowInsetsImeVisible = false
-                        }
-                    }
-
-                    val listener = androidx.compose.runtime.remember {
-                        android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
-                            if (sharedPreferences != null && key != null) {
-                                when (key) {
-                                    KEY_SHOW_ONLY_ON_INPUTS -> {
-                                        showOnlyOnInputs = sharedPreferences.getBoolean(key, true)
-                                    }
-                                    KEY_BUBBLE_DISAPPEAR_DELAY_MS -> {
-                                        disappearDelayMs = sharedPreferences.getLong(
-                                            key,
-                                            DEFAULT_BUBBLE_DISAPPEAR_DELAY_MS
-                                        ).coerceIn(0L, 5_000L)
-                                    }
-                                    "bubble_size" -> {
-                                        bubbleSize = sharedPreferences.getFloat(key, 52f).coerceIn(36f, 80f)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    androidx.compose.runtime.DisposableEffect(settingsPrefs, listener) {
-                        settingsPrefs.registerOnSharedPreferenceChangeListener(listener)
-                        onDispose {
-                            settingsPrefs.unregisterOnSharedPreferenceChangeListener(listener)
-                        }
-                    }
-
-                    val isKeyboardCurrentlyOnScreen = if (!screenActiveState) {
-                        false
-                    } else if (isAccessibilityConnected) {
-                        isAccessibilityImeVisible
-                    } else {
-                        isWindowInsetsImeVisible
-                    }
-
-                    val rawShouldShow = screenActiveState && (
-                        !showOnlyOnInputs ||
-                            isKeyboardCurrentlyOnScreen ||
-                            currentState != OverlayBubbleState.IDLE
-                        )
-
-                    var isBubbleVisible by androidx.compose.runtime.remember {
-                        androidx.compose.runtime.mutableStateOf(rawShouldShow)
-                    }
-
-                    androidx.compose.runtime.LaunchedEffect(rawShouldShow, screenActiveState, disappearDelayMs) {
-                        if (!screenActiveState) {
-                            // Screen is off or locked: hide immediately without waiting for disappearDelayMs or animation
-                            isBubbleVisible = false
-                            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
-                        } else if (rawShouldShow) {
-                            setOverlayWindowVisibleAndTouchable(visible = true, touchable = true)
-                            isBubbleVisible = true
-                        } else {
-                            if (disappearDelayMs > 0L) {
-                                delay(disappearDelayMs)
-                            }
-                            isBubbleVisible = false
-                            // Immediately disable touch interception while exit animation plays
-                            setOverlayWindowVisibleAndTouchable(visible = true, touchable = false)
-                            delay(160L)
-                            // Completely hide the WindowManager surface so SurfaceFlinger never leaves a frozen frame
-                            setOverlayWindowVisibleAndTouchable(visible = false, touchable = false)
-                        }
                     }
 
                     BubbleOverlayComponent(
                         audioController = audioController,
                         bubbleState = currentState,
-                        isInputFieldFocused = isBubbleVisible && screenActiveState,
-                        processingProgress = processingProgress.collectAsState(initial = "").value,
+                        isInputFieldFocused = isBubbleVisible,
+                        processingProgress = progressText,
                         bubbleSize = bubbleSize,
                         pipelinePhase = pipelineStatus.phase,
                         isModelLoaded = pipelineStatus.isReady,
@@ -860,7 +936,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     }
 
     private fun checkWindowInsetsImeVisible(): Boolean {
-        if (!checkScreenActiveAndUnlocked()) return false
+        if (!checkScreenInteractive()) return false
         if (!::composeView.isInitialized || !composeView.isAttachedToWindow) return false
         return try {
             val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(composeView) ?: return false
@@ -885,7 +961,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
-    private fun setOverlayWindowVisibleAndTouchable(visible: Boolean, touchable: Boolean) {
+    private fun setOverlayWindowVisibleAndTouchable(
+        visible: Boolean,
+        touchable: Boolean,
+        forceUpdate: Boolean = false
+    ) {
         if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
         val newFlags = if (touchable) {
             layoutParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
@@ -893,12 +973,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             layoutParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         }
         val newAlpha = if (visible) 1.0f else 0.0f
-        if (newFlags == layoutParams.flags && layoutParams.alpha == newAlpha) return
+        val changed = newFlags != layoutParams.flags || layoutParams.alpha != newAlpha
+        if (!changed && !forceUpdate) return
         layoutParams.flags = newFlags
         layoutParams.alpha = newAlpha
         try {
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)
+                if (visible) {
+                    composeView.invalidate()
+                }
             }
         } catch (_: Throwable) {
         }
@@ -1033,6 +1117,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         try {
             val modelPrefs = ModelSettings.getPreferences(this)
             modelPrefs.unregisterOnSharedPreferenceChangeListener(modelPrefsListener)
+        } catch (_: Throwable) {
+        }
+        try {
+            val settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            settingsPrefs.unregisterOnSharedPreferenceChangeListener(settingsPrefsListener)
         } catch (_: Throwable) {
         }
         audioController.releaseNow()

@@ -578,4 +578,60 @@ class SmartPipelineTest {
         assertEquals(listOf(now - 45_000L, now - 10_000L, now - 1_000L), recent)
         assertTrue(com.voicebubble.openflow.overlay.BootAndRestartReceiver.parseRecentCrashTimestamps(null, now).isEmpty())
     }
+
+    @Test
+    fun `FloatingBubbleService computeShouldShowBubble hides on screen off and restores when screen on and keyboard visible`() {
+        // Screen off -> always hidden even if keyboard flag was true
+        assertFalse(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldShowBubble(
+                isScreenInteractive = false,
+                showOnlyOnInputs = true,
+                isKeyboardOnScreen = true,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                isDeviceLocked = false
+            )
+        )
+
+        // Screen on + keyboard visible -> always shown immediately
+        assertTrue(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldShowBubble(
+                isScreenInteractive = true,
+                showOnlyOnInputs = true,
+                isKeyboardOnScreen = true,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                isDeviceLocked = false
+            )
+        )
+
+        // Screen on + keyboard hidden + showOnlyOnInputs=true -> hidden when IDLE
+        assertFalse(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldShowBubble(
+                isScreenInteractive = true,
+                showOnlyOnInputs = true,
+                isKeyboardOnScreen = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                isDeviceLocked = false
+            )
+        )
+
+        // Screen on + showOnlyOnInputs=false -> hidden on locked lockscreen when keyboard closed, visible once unlocked
+        assertFalse(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldShowBubble(
+                isScreenInteractive = true,
+                showOnlyOnInputs = false,
+                isKeyboardOnScreen = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                isDeviceLocked = true
+            )
+        )
+        assertTrue(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldShowBubble(
+                isScreenInteractive = true,
+                showOnlyOnInputs = false,
+                isKeyboardOnScreen = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                isDeviceLocked = false
+            )
+        )
+    }
 }
