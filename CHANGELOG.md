@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.7] - 2026-10-20
+
+### Changed
+- **Material Design 3 Microphone Icon (`ic_notification`, `ic_launcher`, `AndroidManifest.xml`):** Updated both the notification icon and the adaptive app launcher icon (including Android 13+ Material You monochrome themed icon support) to the Material Design 3 rounded microphone (`Icons.Rounded.Mic`).
+
 ## [2.5.6] - 2026-10-20
 
 ### Changed
