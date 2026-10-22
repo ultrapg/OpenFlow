@@ -484,17 +484,18 @@ class SmartPipeline(
                 )
 
                 val dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, initialMem)
-                // User-configurable chunk limit (default 20 s); low-memory devices are additionally capped.
+                // User-configurable chunk limit (default 20 s). With chunking switched off only the 60 s safety
+                // ceiling applies; low-memory devices are always additionally capped to protect the native models.
                 val chunkSettings = DictationChunkSettings.load(appContext)
                 val maxChunkSamples = if (initialMem.isAnyMemoryTight) {
-                    min(chunkSettings.maxChunkSamples, LOW_MEM_MAX_CHUNK_SAMPLES)
+                    min(chunkSettings.effectiveMaxChunkSamples, LOW_MEM_MAX_CHUNK_SAMPLES)
                 } else {
-                    chunkSettings.maxChunkSamples
+                    chunkSettings.effectiveMaxChunkSamples
                 }
                 val minChunkSamples = if (initialMem.isAnyMemoryTight) {
-                    min(chunkSettings.offlineMinChunkSamples, LOW_MEM_MIN_CHUNK_SAMPLES)
+                    min(chunkSettings.effectiveOfflineMinChunkSamples, LOW_MEM_MIN_CHUNK_SAMPLES)
                 } else {
-                    chunkSettings.offlineMinChunkSamples
+                    chunkSettings.effectiveOfflineMinChunkSamples
                 }
 
                 val audioChunks = splitAudioIntoSmartChunks(

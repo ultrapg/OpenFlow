@@ -918,7 +918,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
                             streamingSession?.cancel()
                             val chunkSettings = DictationChunkSettings.load(this@FloatingBubbleService)
-                            val session = if (chunkSettings.liveTranscriptionEnabled) {
+                            val session = if (chunkSettings.liveActive) {
                                 StreamingDictationSession(
                                     scope = serviceScope,
                                     audio = audioController,

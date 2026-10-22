@@ -56,16 +56,38 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
-                checked = settings.liveTranscriptionEnabled,
-                onCheckedChange = { apply(settings.copy(liveTranscriptionEnabled = it), persist = true) }
+                checked = settings.chunkingEnabled,
+                onCheckedChange = { apply(settings.copy(chunkingEnabled = it), persist = true) }
             )
             Text(
-                "Transcribe while still recording",
+                "Enable audio chunking",
                 color = MaterialTheme.colorScheme.onBackground
             )
         }
+        if (!settings.chunkingEnabled) {
+            Text(
+                "Off: dictations are processed in one piece and live transcription is unavailable. " +
+                    "Audio is only split if it exceeds 60 s or memory is very low.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 12.dp, bottom = 4.dp)
+            )
+        }
 
-        if (settings.liveTranscriptionEnabled) {
+        if (settings.chunkingEnabled) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = settings.liveTranscriptionEnabled,
+                    onCheckedChange = { apply(settings.copy(liveTranscriptionEnabled = it), persist = true) }
+                )
+                Text(
+                    "Transcribe while still recording",
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            }
+        }
+
+        if (settings.liveActive) {
             ChunkSlider(
                 label = String.format(Locale.US, "Pause that ends a chunk: %.2fs", settings.pauseMs / 1000.0),
                 value = settings.pauseMs.toFloat(),
@@ -84,6 +106,16 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(
+                    checked = settings.adaptivePause,
+                    onCheckedChange = { apply(settings.copy(adaptivePause = it), persist = true) }
+                )
+                Text(
+                    "Smart pause: accept shorter pauses in long stretches",
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
                     checked = settings.reuseLanguage,
                     onCheckedChange = { apply(settings.copy(reuseLanguage = it), persist = true) }
                 )
@@ -94,7 +126,7 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
             }
         }
 
-        ChunkSlider(
+        if (settings.chunkingEnabled) ChunkSlider(
             label = String.format(Locale.US, "Maximum chunk length: %.0fs", settings.maxChunkSeconds),
             value = settings.maxChunkSeconds,
             range = DictationChunkSettings.MIN_MAX_CHUNK_SECONDS..DictationChunkSettings.MAX_MAX_CHUNK_SECONDS,
@@ -102,7 +134,7 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
             onChange = { apply(settings.copy(maxChunkSeconds = it.roundToInt().toFloat()), persist = false) },
             onFinished = { apply(settings, persist = true) }
         )
-        ChunkSlider(
+        if (settings.chunkingEnabled) ChunkSlider(
             label = String.format(Locale.US, "Silence level: %.3f (lower = only very quiet pauses count)", settings.silenceThreshold),
             value = settings.silenceThreshold,
             range = DictationChunkSettings.MIN_SILENCE_THRESHOLD..DictationChunkSettings.MAX_SILENCE_THRESHOLD,

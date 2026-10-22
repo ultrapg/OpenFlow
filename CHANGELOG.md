@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.1] - 2026-10-22
+
+### Added
+- **Enable audio chunking option (`DictationChunkSettings`, Settings):** new master switch, **on by default**. When off, dictations are processed in one piece and live transcription is unavailable; audio is only split past a 60 s safety ceiling (or when memory is very low) so the native models are never fed multi-minute inputs.
+- **Smart pause (adaptive pause length):** the longer a live chunk has been growing without a clear pause, the shorter a gap has to be to count as a cut point (down to half the configured pause at 75% of the maximum length). Natural gaps are now used before a hard forced cut mid-phrase. Can be turned off.
+
+### Improved
+- **Better chunking (`AudioChunking`):** clicks, taps and lip smacks (< 60 ms loud bursts surrounded by silence) no longer split a pause into two runs that are each too short to qualify; real short words still do.
+- **Tuned defaults:** pause 600 ms -> **500 ms** (phrase ends are typically 400-800 ms, gaps between words almost always < 300 ms) and minimum live chunk 4 s -> **3 s** (enough context for accuracy, starts transcribing earlier). Users who never changed these two sliders are migrated automatically; customised values are kept.
+
 ## [2.6.0] - 2026-10-22
 
 ### Added

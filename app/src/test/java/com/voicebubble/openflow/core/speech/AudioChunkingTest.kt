@@ -167,4 +167,99 @@ class AudioChunkingTest {
         assertEquals(20 * sr, s.maxChunkSamples)
         assertEquals(11 * sr, s.offlineMinChunkSamples)
     }
+
+    @Test
+    fun `smart pause accepts a shorter pause late in a long stretch but not early`() {
+        // 0.45 s gap: shorter than the configured 600 ms pause, accepted once the chunk is already 12 s long
+        val late = concat(tone(12.0, speech), tone(0.45, silence), tone(1.0, speech))
+        val lateCut = findStreamingCut(late, late.size, config)
+        assertNotNull("0.45 s gap after 12 s of speech should be used as a cut point", lateCut)
+        assertTrue(lateCut!!.index >= 12 * sr)
+
+        // The same gap right after the minimum length is still just a breath between phrases
+        val early = concat(tone(4.2, speech), tone(0.45, silence), tone(1.0, speech))
+        assertNull(findStreamingCut(early, early.size, config))
+
+        // With smart pause switched off the long-stretch gap no longer qualifies
+        val strict = config.copy(adaptivePause = false)
+        assertNull(findStreamingCut(late, late.size, strict))
+    }
+
+    @Test
+    fun `required pause shrinks monotonically from configured length down to the floor`() {
+        val base = config.pauseSamples / CHUNK_FRAME_SAMPLES
+        assertEquals(base, requiredPauseFrames(config.minLiveChunkSamples, config))
+        assertEquals(base, requiredPauseFrames(0, config))
+        var previous = base
+        var pending = config.minLiveChunkSamples
+        while (pending <= config.maxChunkSamples) {
+            val frames = requiredPauseFrames(pending, config)
+            assertTrue("required pause must never grow ($frames > $previous)", frames <= previous)
+            assertTrue("required pause must stay >= 2 frames and >= half the configured pause", frames >= 2 && frames * 2 >= base - 1)
+            previous = frames
+            pending += sr / 2
+        }
+        assertEquals(base, requiredPauseFrames(config.maxChunkSamples, config.copy(adaptivePause = false)))
+    }
+
+    @Test
+    fun `a click inside a pause does not split the pause but a real word does`() {
+        // 0.4 s silence + 20 ms click + 0.4 s silence: each half alone is shorter than the required pause
+        val withClick = concat(
+            tone(6.0, speech),
+            tone(0.4, silence), tone(0.02, 0.5f), tone(0.4, silence),
+            tone(1.0, speech)
+        )
+        val clickCut = findStreamingCut(withClick, withClick.size, config)
+        assertNotNull("a lone click must be ignored so the 0.82 s pause is detected", clickCut)
+        assertTrue(clickCut!!.index in (6 * sr)..(6 * sr + (0.82 * sr).toInt()))
+
+        // A 100 ms real word between the two short silences is speech and keeps them apart
+        val withWord = concat(
+            tone(6.0, speech),
+            tone(0.4, silence), tone(0.1, speech), tone(0.4, silence),
+            tone(1.0, speech)
+        )
+        assertNull(findStreamingCut(withWord, withWord.size, config))
+    }
+
+    @Test
+    fun `tuned defaults and master switch behave as documented`() {
+        val d = DictationChunkSettings()
+        assertTrue(d.chunkingEnabled)
+        assertTrue(d.liveActive)
+        assertEquals(500, d.pauseMs)
+        assertEquals(3f, d.minLiveChunkSeconds, 0.0001f)
+        assertEquals(20f, d.maxChunkSeconds, 0.0001f)
+        assertTrue(d.adaptivePause)
+        assertEquals(d, d.sanitized())
+
+        val off = d.copy(chunkingEnabled = false)
+        assertFalse("live transcription needs chunking", off.liveActive)
+        assertEquals("one piece up to the 60 s safety ceiling", 60 * sr, off.effectiveMaxChunkSamples)
+        assertEquals(20 * sr, off.maxChunkSamples)
+        assertEquals(20 * sr, d.effectiveMaxChunkSamples)
+    }
+
+    @Test
+    fun `disabled chunking keeps a 45 second dictation in one piece but still splits past the safety ceiling`() {
+        val off = DictationChunkSettings(chunkingEnabled = false).sanitized()
+        val clip45 = FloatArray(45 * sr) { speech }
+        val one = splitAudioIntoSmartChunks(
+            samples = clip45,
+            maxChunkSamples = off.effectiveMaxChunkSamples,
+            minChunkSamples = off.effectiveOfflineMinChunkSamples
+        )
+        assertEquals(1, one.size)
+
+        val clip90 = FloatArray(90 * sr) { speech }
+        val split = splitAudioIntoSmartChunks(
+            samples = clip90,
+            maxChunkSamples = off.effectiveMaxChunkSamples,
+            minChunkSamples = off.effectiveOfflineMinChunkSamples
+        )
+        assertTrue(split.size >= 2)
+        assertEquals(clip90.size, split.sumOf { it.size })
+        assertTrue(split.all { it.size <= off.effectiveMaxChunkSamples })
+    }
 }
