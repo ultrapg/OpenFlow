@@ -10,6 +10,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
+import android.view.WindowInsets
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -147,9 +149,13 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private fun isSoftKeyboardWindowVisible(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
         return try {
-            if (!isScreenInteractive.value) return false
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (pm != null && !pm.isInteractive) return false
+            val interactive = pm?.isInteractive ?: isScreenInteractive.value
+            if (isScreenInteractive.value != interactive) {
+                isScreenInteractive.value = interactive
+            }
+            if (!interactive) return false
+
             val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
             if (km != null && km.isDeviceLocked) {
                 val focusedOnLockscreen = findFocusedEditableNode(requireEditableFlag = false)
@@ -163,56 +169,69 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 }
             }
 
-            val allWindows = windows ?: return false
             val dm = resources.displayMetrics
             val screenHeight = dm.heightPixels
             val screenWidth = dm.widthPixels
-            // A real on-screen keyboard is at least 110dp tall and spans most of the screen width
-            val minKeyboardHeightPx = (110f * dm.density).toInt().coerceAtLeast(110)
-            val minKeyboardWidthPx = (screenWidth / 2).coerceAtLeast(120)
-            var imeVisible = false
-            val bounds = Rect()
+            // Allow standard, compact, one-handed, and split/floating keyboards (>= 64dp height, >= 1/3 width)
+            val minKeyboardHeightPx = (64f * dm.density).toInt().coerceAtLeast(64)
+            val minKeyboardWidthPx = (screenWidth / 3).coerceAtLeast(100)
 
-            for (window in allWindows) {
+            // Signal 1: Android 11+ (API 30+) WindowMetrics IME insets check
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 try {
-                    if (!imeVisible && window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
-                        window.getBoundsInScreen(bounds)
-                        val hasValidGeometry = bounds.height() >= minKeyboardHeightPx &&
-                            bounds.width() >= minKeyboardWidthPx &&
-                            bounds.bottom > (screenHeight * 2 / 3)
-
-                        if (hasValidGeometry) {
-                            val imeRoot = try {
-                                window.root
-                            } catch (_: Throwable) {
-                                null
-                            }
-                            val rootVisible = if (imeRoot != null) {
-                                val vis = imeRoot.isVisibleToUser
-                                try {
-                                    @Suppress("DEPRECATION")
-                                    imeRoot.recycle()
-                                } catch (_: Throwable) {
-                                }
-                                vis
-                            } else {
-                                true
-                            }
-                            if (rootVisible) {
-                                imeVisible = true
-                            }
+                    val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                    val metricsInsets = wm?.currentWindowMetrics?.windowInsets
+                    if (metricsInsets != null) {
+                        val imeInsets = metricsInsets.getInsets(WindowInsets.Type.ime())
+                        if (metricsInsets.isVisible(WindowInsets.Type.ime()) || imeInsets.bottom >= minKeyboardHeightPx) {
+                            return true
                         }
                     }
                 } catch (_: Throwable) {
-                } finally {
+                }
+            }
+
+            // Signal 2: Accessibility interactive windows list (TYPE_INPUT_METHOD)
+            // IMPORTANT: Never call window.recycle() on AccessibilityWindowInfo instances returned by `windows`!
+            // `AccessibilityService.getWindows()` returns cached instances from AccessibilityCache; recycling them
+            // resets `window.type = -1` and `bounds = (0,0,0,0)` in the cache, making the keyboard invisible to
+            // all subsequent polls while it stays open.
+            val allWindows = try {
+                windows
+            } catch (_: Throwable) {
+                null
+            }
+
+            if (!allWindows.isNullOrEmpty()) {
+                val bounds = Rect()
+                for (window in allWindows) {
                     try {
-                        @Suppress("DEPRECATION")
-                        window.recycle()
+                        if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                            window.getBoundsInScreen(bounds)
+                            val hasValidGeometry = bounds.height() >= minKeyboardHeightPx &&
+                                bounds.width() >= minKeyboardWidthPx &&
+                                bounds.bottom > (screenHeight / 2)
+                            if (hasValidGeometry) {
+                                return true
+                            }
+                        }
                     } catch (_: Throwable) {
                     }
                 }
+                return false
             }
-            imeVisible
+
+            // Fallback when `windows` is unavailable/empty on specific OEM ROMs: check if an editable input node holds focus
+            val focusedEditable = findFocusedEditableNode(requireEditableFlag = true)
+            if (focusedEditable != null) {
+                try {
+                    @Suppress("DEPRECATION")
+                    focusedEditable.recycle()
+                } catch (_: Throwable) {
+                }
+                return true
+            }
+            false
         } catch (_: Throwable) {
             false
         }
@@ -256,7 +275,11 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
                 for (window in allWindows) {
                     if (editableCandidate == null && window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
-                        val root = window.root
+                        val root = try {
+                            window.root
+                        } catch (_: Throwable) {
+                            null
+                        }
                         if (root != null) {
                             val candidate = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                             if (candidate != null) {
@@ -278,11 +301,6 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                             } catch (_: Throwable) {
                             }
                         }
-                    }
-                    try {
-                        @Suppress("DEPRECATION")
-                        window.recycle()
-                    } catch (_: Throwable) {
                     }
                 }
 

@@ -88,6 +88,7 @@ import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
+import com.voicebubble.openflow.settings.VozQuantization
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -144,8 +145,6 @@ fun SpeechRecognitionSettingsSection(
             ModelDownloadManager.cancelAutoEnable(model)
             val updated = when (model) {
                 DesertAntModel.EAR -> settings.copy(earEnabled = false)
-                DesertAntModel.CLEAR -> settings.copy(clearEnabled = false)
-                DesertAntModel.UHM -> settings.copy(uhmEnabled = false)
                 DesertAntModel.VOZ -> settings
             }
             persistAndReload(updated)
@@ -157,8 +156,6 @@ fun SpeechRecognitionSettingsSection(
                 if (alreadyDownloaded) {
                     val updated = when (model) {
                         DesertAntModel.EAR -> settings.copy(earEnabled = true)
-                        DesertAntModel.CLEAR -> settings.copy(clearEnabled = true)
-                        DesertAntModel.UHM -> settings.copy(uhmEnabled = true)
                         DesertAntModel.VOZ -> settings
                     }
                     persistAndReload(updated)
@@ -303,7 +300,7 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/4)",
+                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/2)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -477,38 +474,6 @@ fun SpeechRecognitionSettingsSection(
                     onCheckedChange = { handleOptionalToggle(DesertAntModel.EAR, it) }
                 )
 
-                HorizontalDivider()
-
-                // Clear
-                ModelToggleItem(
-                    title = "Clear — Noise Suppression (${DesertAntModel.CLEAR.sizeMb} MB)",
-                    subtitle = DesertAntModel.CLEAR.roleSummary,
-                    loadState = pipelineStatus.modelStates[DesertAntModel.CLEAR],
-                    checked = settings.clearEnabled || DesertAntModel.CLEAR in downloadState.pendingAutoEnableModels,
-                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.CLEAR),
-                    isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.CLEAR && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
-                    onPause = { ModelDownloadManager.pauseDownloads() },
-                    onResume = { handleOptionalToggle(DesertAntModel.CLEAR, true) },
-                    onCheckedChange = { handleOptionalToggle(DesertAntModel.CLEAR, it) }
-                )
-
-                HorizontalDivider()
-
-                // Uhm
-                ModelToggleItem(
-                    title = "Uhm — Filler Word Removal (${DesertAntModel.UHM.sizeMb} MB)",
-                    subtitle = DesertAntModel.UHM.roleSummary,
-                    loadState = pipelineStatus.modelStates[DesertAntModel.UHM],
-                    checked = settings.uhmEnabled || DesertAntModel.UHM in downloadState.pendingAutoEnableModels,
-                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.UHM),
-                    isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.UHM && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
-                    onPause = { ModelDownloadManager.pauseDownloads() },
-                    onResume = { handleOptionalToggle(DesertAntModel.UHM, true) },
-                    onCheckedChange = { handleOptionalToggle(DesertAntModel.UHM, it) }
-                )
-
                 if (downloadState.errorMessage != null) {
                     Text(
                         text = downloadState.errorMessage ?: "",
@@ -540,6 +505,90 @@ fun SpeechRecognitionSettingsSection(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text("Resume Download")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3b. Voz Model Quantization Selector (FP16 / INT8 Hybrid / INT8)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val isConvertingQuant = pipelineStatus.phase == PipelinePhase.LOADING ||
+                    pipelineStatus.phase == PipelinePhase.WARMING_UP ||
+                    pipelineStatus.phase == PipelinePhase.TRANSCRIBING
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Voz Model Quantization",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Active precision: ${settings.vozQuantization.displayName} (~${settings.vozQuantization.estimatedDiskMb} MB active • ~${settings.vozQuantization.estimatedRamMb} MB RAM)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Converts Voz TFLite weights on-device offline without re-downloading.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Icon(
+                        imageVector = Icons.Default.Memory,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                VozQuantization.entries.forEach { quant ->
+                    val selected = settings.vozQuantization == quant
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = !isConvertingQuant && !downloadState.isRunning) {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(vozQuantization = quant))
+                                }
+                            }
+                            .padding(vertical = 4.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = selected,
+                            enabled = !isConvertingQuant && !downloadState.isRunning,
+                            onClick = {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(vozQuantization = quant))
+                                }
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${quant.displayName} (~${quant.estimatedDiskMb} MB active • ~${quant.estimatedRamMb} MB RAM)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                            )
+                            Text(
+                                text = quant.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }

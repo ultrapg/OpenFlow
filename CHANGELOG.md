@@ -2,6 +2,26 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.5] - 2026-10-22
+
+### Added
+- **Selectable `Voz` Model Quantization (`FP16`, `INT8 Hybrid`, `INT8`) (`VozTfliteQuantizer`, `ModelSettings`, `SmartPipeline`, `OnboardingScreen`, `SpeechRecognitionSettingsSection`):**
+  - Added selectable weight quantization for the `Voz` Conformer-Transducer model in both Onboarding and Settings:
+    - **`FP16 (Original — Best Accuracy)`:** `~1,187 MB` active disk • `~1,400 MB` peak RAM.
+    - **`INT8 Hybrid (Recommended Low-RAM)`:** `~605 MB` active disk • `~800 MB` peak RAM (quantizes the 1.17 GB Conformer `encoder.tflite` to symmetric INT8 while keeping `decoder.tflite` and `joiner.tflite` in FP16).
+    - **`INT8 (Smallest Footprint)`:** `~598 MB` active disk • `~760 MB` peak RAM (quantizes both `encoder.tflite` and `decoder.tflite` to INT8).
+  - Implemented a streaming (< 2 MB heap) on-device TFLite FlatBuffer quantizer/dequantizer (`VozTfliteQuantizer`) that converts `FLOAT16` weight buffers to symmetric `INT8` (updating tensor `QuantizationParameters` scales in the FlatBuffer header) and restores exact `FP16` bit-for-bit offline without re-downloading.
+
+### Removed
+- **Removed `Clear` and `Uhm` Models (`app/build.gradle.kts`, `SmartPipeline`, `ModelSettings`, `ModelDownloadManager`, `OnboardingScreen`, `SpeechRecognitionSettingsSection`):**
+  - Completely removed the `Clear` neural denoiser and `Uhm` acoustic filler classifier dependencies, JNI libraries (`libClearAndroid.so`), and UI toggles, streamlining the pipeline to `Voz` (required speech recognition) and `Ear` (optional language detection) with lightweight zero-RAM speech conditioning (`conditionAudioWhenClearDisabled`) and lexical hesitation stripping (`reconcileTranscript`).
+  - Automatically cleans up any leftover `clear` or `uhm` model directories on disk to reclaim up to 70 MB of device storage.
+
+### Fixed
+- **Floating Bubble Visibility When On-Screen Keyboard Is Open (`TextInjectionAccessibilityService`, `FloatingBubbleService`):**
+  - Fixed a critical bug where calling `window.recycle()` on cached `AccessibilityWindowInfo` instances returned by `AccessibilityService.getWindows()` invalidated Android's internal `AccessibilityCache` (`window.type = -1`, `bounds = (0,0,0,0)`), causing `TYPE_INPUT_METHOD` keyboard detection to fail permanently after the first check.
+  - Removed the `window.root` (`imeRoot.isVisibleToUser`) requirement on `TYPE_INPUT_METHOD` windows (which returned `null` or `false` on Android 14/15 Gboard & Samsung Keyboard when `flagIncludeNotImportantViews` was active), added Android 11+ (`API 30+`) `WindowManager.currentWindowMetrics.windowInsets.isVisible(WindowInsets.Type.ime())` fallback detection, and restored `TextInjectionAccessibilityService.refreshNow()` inside `FloatingBubbleService`'s 200 ms screen-on heartbeat so the bubble reliably appears whenever a keyboard is open.
+
 ## [2.6.4] - 2026-10-22
 
 ### Improved & Fixed

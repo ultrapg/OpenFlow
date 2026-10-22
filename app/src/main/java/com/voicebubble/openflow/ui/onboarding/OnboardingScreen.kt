@@ -16,6 +16,7 @@
 
 package com.voicebubble.openflow.ui.onboarding
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,6 +29,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
@@ -48,6 +50,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -60,6 +63,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -70,6 +74,7 @@ import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelQueueStatus
 import com.voicebubble.openflow.settings.ModelSettings
+import com.voicebubble.openflow.settings.VozQuantization
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.max
@@ -89,8 +94,7 @@ fun OnboardingScreen(
     val sessionState by ModelDownloadManager.sessionState.collectAsState()
 
     var earSelected by remember { mutableStateOf(initialSettings.earEnabled) }
-    var clearSelected by remember { mutableStateOf(initialSettings.clearEnabled) }
-    var uhmSelected by remember { mutableStateOf(initialSettings.uhmEnabled) }
+    var vozQuantSelected by remember { mutableStateOf(initialSettings.vozQuantization) }
 
     var step by remember {
         mutableStateOf(
@@ -104,8 +108,7 @@ fun OnboardingScreen(
 
     val configuredSettings = initialSettings.copy(
         earEnabled = earSelected,
-        clearEnabled = clearSelected,
-        uhmEnabled = uhmSelected
+        vozQuantization = vozQuantSelected
     )
 
     val selectedModels = configuredSettings.enabledModels()
@@ -232,30 +235,58 @@ fun OnboardingScreen(
                             isLocked = false,
                             onCheckedChange = { earSelected = it }
                         )
+                    }
+                }
 
-                        HorizontalDivider()
-
-                        // Clear
-                        OnboardingModelRow(
-                            title = "Clear — Noise Suppression (${DesertAntModel.CLEAR.sizeMb} MB)",
-                            subtitle = DesertAntModel.CLEAR.roleSummary,
-                            checked = clearSelected,
-                            enabled = true,
-                            isLocked = false,
-                            onCheckedChange = { clearSelected = it }
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Voz Model Quantization",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
                         )
-
-                        HorizontalDivider()
-
-                        // Uhm
-                        OnboardingModelRow(
-                            title = "Uhm — Filler Word Removal (${DesertAntModel.UHM.sizeMb} MB)",
-                            subtitle = DesertAntModel.UHM.roleSummary,
-                            checked = uhmSelected,
-                            enabled = true,
-                            isLocked = false,
-                            onCheckedChange = { uhmSelected = it }
+                        Text(
+                            text = "Choose the weight precision for Voz on-device speech recognition. You can change this anytime in Settings.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        VozQuantization.entries.forEach { quant ->
+                            val selected = vozQuantSelected == quant
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { vozQuantSelected = quant }
+                                    .padding(vertical = 4.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = selected,
+                                    onClick = { vozQuantSelected = quant }
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "${quant.displayName} (~${quant.estimatedDiskMb} MB active • ~${quant.estimatedRamMb} MB RAM)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                                    )
+                                    Text(
+                                        text = quant.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 

@@ -386,9 +386,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     if (!isScreenInteractive.value) {
                         onScreenTurnedOn()
                     } else {
-                        // The accessibility poller already samples the IME window every 180 ms off the main
-                        // thread; only make sure it is still alive instead of re-enumerating windows here.
-                        TextInjectionAccessibilityService.getSharedInstance()?.ensurePollingActive()
+                        // Refresh IME window visibility on the main thread as well so devices that require
+                        // AccessibilityService.getWindows() on the main looper never miss a keyboard open event.
+                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
                         syncBubbleVisibility()
                     }
                     if (healDue) {
@@ -984,10 +984,23 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private fun checkWindowInsetsImeVisible(): Boolean {
         if (!checkScreenInteractive()) return false
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && ::windowManager.isInitialized) {
+                val metricsInsets = windowManager.currentWindowMetrics.windowInsets
+                val minHeight = (64f * resources.displayMetrics.density).toInt().coerceAtLeast(64)
+                val imeBottom = metricsInsets.getInsets(android.view.WindowInsets.Type.ime()).bottom
+                if (metricsInsets.isVisible(android.view.WindowInsets.Type.ime()) || imeBottom >= minHeight) {
+                    return true
+                }
+            }
+        } catch (_: Throwable) {
+        }
         if (!::composeView.isInitialized || !composeView.isAttachedToWindow) return false
         return try {
             val rootInsets = androidx.core.view.ViewCompat.getRootWindowInsets(composeView) ?: return false
-            rootInsets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+            val imeBottom = rootInsets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom
+            val minHeight = (64f * resources.displayMetrics.density).toInt().coerceAtLeast(64)
+            rootInsets.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) || imeBottom >= minHeight
         } catch (_: Throwable) {
             false
         }
@@ -1025,9 +1038,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         layoutParams.flags = newFlags
         layoutParams.alpha = newAlpha
         try {
+            if (visible && composeView.visibility != android.view.View.VISIBLE) {
+                composeView.visibility = android.view.View.VISIBLE
+            }
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)
                 if (visible) {
+                    composeView.requestLayout()
                     composeView.invalidate()
                 }
             }
