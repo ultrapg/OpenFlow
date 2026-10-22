@@ -92,8 +92,8 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
                 label = String.format(Locale.US, "Pause that ends a chunk: %.2fs", settings.pauseMs / 1000.0),
                 value = settings.pauseMs.toFloat(),
                 range = DictationChunkSettings.MIN_PAUSE_MS.toFloat()..DictationChunkSettings.MAX_PAUSE_MS.toFloat(),
-                steps = 6,
-                onChange = { apply(settings.copy(pauseMs = ((it / 250f).roundToInt() * 250)), persist = false) },
+                steps = 34,
+                onChange = { apply(settings.copy(pauseMs = ((it / 50f).roundToInt() * 50)), persist = false) },
                 onFinished = { apply(settings, persist = true) }
             )
             ChunkSlider(

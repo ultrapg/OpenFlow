@@ -107,11 +107,22 @@ class StreamingDictationSession(
 
     /**
      * Sends the final [tail] (audio recorded after the last live cut), waits for the ordered worker to drain
-     * the queue, retries failed chunks once and returns the joined transcript.
+     * the queue, retries failed chunks once and returns the seamlessly stitched transcript.
      */
     suspend fun finish(tail: FloatArray): String {
         stopPolling()
-        if (tail.isNotEmpty()) enqueue(tail)
+        if (tail.isNotEmpty()) {
+            val shouldEnqueueTail = liveChunkCount.get() == 0 ||
+                hasUsableSpeech(tail, config.silenceThreshold)
+            if (shouldEnqueueTail) {
+                enqueue(tail)
+            } else {
+                DebugLogManager.logInfo(
+                    TAG,
+                    "Skipping post-pause silent/tap tail (${tail.size * 1000L / DictationChunkSettings.SAMPLE_RATE} ms) after ${liveChunkCount.get()} live chunk(s)"
+                )
+            }
+        }
         queue.close()
         workerJob?.join()
 
@@ -128,12 +139,16 @@ class StreamingDictationSession(
         }
         failedChunkCount = stillFailed
 
-        val joined = results.entries
+        val orderedChunks = results.entries
             .sortedBy { it.key }
             .map { it.value }
             .filter { it.isNotBlank() }
-            .joinToString(" ")
-        return normalizeTranscriptText(rawText = joined, capitalizeLeadingWord = false)
+        val activeSettings = pipeline.currentSettings()
+        return stitchChunkTranscripts(
+            chunks = orderedChunks,
+            language = language ?: activeSettings.preferredLanguage,
+            customVocabulary = activeSettings.customVocabulary
+        )
     }
 
     /** Abandons the session (screen turned off, recording failed, service destroyed). */

@@ -228,8 +228,8 @@ class AudioChunkingTest {
         val d = DictationChunkSettings()
         assertTrue(d.chunkingEnabled)
         assertTrue(d.liveActive)
-        assertEquals(500, d.pauseMs)
-        assertEquals(3f, d.minLiveChunkSeconds, 0.0001f)
+        assertEquals(650, d.pauseMs)
+        assertEquals(5f, d.minLiveChunkSeconds, 0.0001f)
         assertEquals(20f, d.maxChunkSeconds, 0.0001f)
         assertTrue(d.adaptivePause)
         assertEquals(d, d.sanitized())
@@ -261,5 +261,51 @@ class AudioChunkingTest {
         assertTrue(split.size >= 2)
         assertEquals(clip90.size, split.sumOf { it.size })
         assertTrue(split.all { it.size <= off.effectiveMaxChunkSamples })
+    }
+
+    @Test
+    fun `live cut provides both-sided silence padding inside the pause without duplicating speech`() {
+        val pauseStart = 6 * sr
+        val pauseEnd = pauseStart + (0.65 * sr).toInt()
+        val audio = concat(tone(6.0, speech), tone(0.65, silence), tone(2.0, speech))
+        val cut = findStreamingCut(audio, audio.size, config)
+        assertNotNull(cut)
+        // Outgoing chunk ends inside the pause with trailing silence padding
+        assertTrue(cut!!.index in (pauseStart + 1_600)..pauseEnd)
+        // Remaining buffer resumes inside the pause before cut.index so next chunk also has leading silence
+        assertTrue(cut.resumeIndex in (pauseStart + CHUNK_FRAME_SAMPLES)..cut.index)
+        assertTrue("next chunk must retain at least 160 ms of leading silence", pauseEnd - cut.resumeIndex >= 2_560)
+    }
+
+    @Test
+    fun `speech hangover keeps soft trailing consonant frames attached to the spoken word`() {
+        // 5 frames of strong vowel (0.15) followed by 3 frames of soft consonant tail (0.0055, above 0.55 * 0.008)
+        // followed by true silence (0.001)
+        val rms = floatArrayOf(
+            0.001f, 0.006f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f,
+            0.0055f, 0.0052f, 0.0050f,
+            0.001f, 0.001f, 0.001f
+        )
+        val mask = buildSilenceMask(rms, 0.008f)
+        assertTrue("frame 0 is silence", mask[0])
+        assertFalse("frame 1 soft consonant onset is protected", mask[1])
+        for (f in 2..9) {
+            assertFalse("frame $f (word + soft consonant tail) must not be marked silent", mask[f])
+        }
+        assertTrue("frame 10 is true silence after hangover", mask[10])
+    }
+
+    @Test
+    fun `hasUsableSpeech rejects silent or button-tap-only tails and accepts real speech`() {
+        val silentTail = tone(0.4, silence)
+        assertFalse(hasUsableSpeech(silentTail))
+
+        // 40 ms finger-tap click surrounded by silence -> rejected by click suppression
+        val tapTail = concat(tone(0.15, silence), tone(0.04, 0.3f), tone(0.2, silence))
+        assertFalse(hasUsableSpeech(tapTail))
+
+        // 250 ms spoken syllable -> accepted
+        val spokenTail = concat(tone(0.1, silence), tone(0.25, speech), tone(0.1, silence))
+        assertTrue(hasUsableSpeech(spokenTail))
     }
 }

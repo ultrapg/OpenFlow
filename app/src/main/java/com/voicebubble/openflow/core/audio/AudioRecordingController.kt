@@ -222,10 +222,10 @@ class AudioRecordingController {
 
     /**
      * Live "transcribe while recording" support: asks the pause detector whether the audio captured so far
-     * contains a finished chunk (see [findStreamingCut]). If so, the chunk is **removed** from the live
-     * buffer and returned, so each sample is only ever held once (no extra RAM) and [stopRecording] later
-     * returns just the remaining tail. Chunks without usable speech (long leading silence) are discarded and
-     * `null` is returned.
+     * contains a finished chunk (see [findStreamingCut]). If so, the chunk `[0, cut.index)` is returned and
+     * the live buffer advances to `cut.resumeIndex` (which keeps natural leading silence inside the pause for
+     * the next chunk without duplicating any speech samples). Chunks without usable speech (long leading
+     * silence) are discarded and `null` is returned.
      */
     fun extractStreamingChunk(config: DictationChunkSettings): FloatArray? {
         synchronized(bufferLock) {
@@ -234,6 +234,7 @@ class AudioRecordingController {
             val cut = findStreamingCut(buf, size, config) ?: return null
             val index = cut.index.coerceIn(0, size)
             if (index <= 0) return null
+            val resumeAt = cut.resumeIndex.coerceIn(1, index)
             val chunk = if (cut.hasSpeech) {
                 try {
                     buf.copyOfRange(0, index)
@@ -244,8 +245,8 @@ class AudioRecordingController {
             } else {
                 null
             }
-            val remaining = size - index
-            System.arraycopy(buf, index, buf, 0, remaining)
+            val remaining = size - resumeAt
+            System.arraycopy(buf, resumeAt, buf, 0, remaining)
             pcmSize = remaining
             return chunk
         }

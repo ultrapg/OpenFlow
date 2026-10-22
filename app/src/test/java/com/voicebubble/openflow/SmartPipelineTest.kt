@@ -668,4 +668,110 @@ class SmartPipelineTest {
             )
         )
     }
+
+    @Test
+    fun `stitchChunkTranscripts repairs mid-sentence splits and hesitation artifacts in English`() {
+        val stitched = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "Optimize it so that, uh, uh, the.",
+                "Uh, like chunking doesn't mess up the text.",
+                "That is spoken.",
+                "Or at least make it as good as, uh, possible."
+            ),
+            language = "en"
+        )
+        assertEquals(
+            "Optimize it so that the like chunking doesn't mess up the text that is spoken or at least make it as good as possible.",
+            stitched
+        )
+
+        // Contrastive / relative connectors convert synthetic period to comma
+        val withRelative = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "When a pause is detected, send the finished chunk right away.",
+                "Which makes long dictations feel almost instant."
+            ),
+            language = "en"
+        )
+        assertEquals(
+            "When a pause is detected, send the finished chunk right away, which makes long dictations feel almost instant.",
+            withRelative
+        )
+
+        // Boundary 1-word and 2-word repetition deduplication
+        val deduplicated = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "I want to go to the.",
+                "To the store today.",
+                "Today and buy milk."
+            ),
+            language = "en"
+        )
+        assertEquals("I want to go to the store today and buy milk.", deduplicated)
+
+        // Legitimate separate sentences preserve their period and capitalization
+        val separateSentences = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "I finished testing the new version.",
+                "It works much better on my phone now."
+            ),
+            language = "en"
+        )
+        assertEquals("I finished testing the new version. It works much better on my phone now.", separateSentences)
+    }
+
+    @Test
+    fun `stitchChunkTranscripts reconciles German clauses while preserving German noun capitalization`() {
+        val germanSubordinate = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "Ich möchte heute ein neues Release machen.",
+                "Weil das Chunking jetzt viel besser funktioniert.",
+                "Und die Satzzeichen zwischen den Teilen angepasst werden."
+            ),
+            language = "de"
+        )
+        assertEquals(
+            "Ich möchte heute ein neues Release machen, weil das Chunking jetzt viel besser funktioniert und die Satzzeichen zwischen den Teilen angepasst werden.",
+            germanSubordinate
+        )
+
+        // Dangling German article before a German noun keeps the noun capitalized
+        val germanNounAfterArticle = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "Wir arbeiten an der.",
+                "Optimierung für das neue Update."
+            ),
+            language = "de"
+        )
+        assertEquals("Wir arbeiten an der Optimierung für das neue Update.", germanNounAfterArticle)
+
+        // Dangling German article before an attributive adjective + noun lowercases the adjective
+        val germanAdjectiveBeforeNoun = com.voicebubble.openflow.core.speech.stitchChunkTranscripts(
+            chunks = listOf(
+                "Wir arbeiten an der.",
+                "Neuen Version von OpenFlow."
+            ),
+            language = "de",
+            customVocabulary = listOf("OpenFlow")
+        )
+        assertEquals("Wir arbeiten an der neuen Version von OpenFlow.", germanAdjectiveBeforeNoun)
+    }
+
+    @Test
+    fun `prepareChunkForInference adds silence runway and tapers boundary edges`() {
+        val raw = FloatArray(8_000) { 0.2f }
+        val prepared = com.voicebubble.openflow.core.speech.prepareChunkForInference(
+            samples = raw,
+            minSilencePadSamples = 3_200,
+            edgeFadeSamples = 160
+        )
+        assertEquals(8_000 + 6_400, prepared.size)
+        // Leading and trailing 3,200 samples are pure zero silence runway
+        assertEquals(0.0f, prepared[0], 1e-6f)
+        assertEquals(0.0f, prepared[3_199], 1e-6f)
+        assertEquals(0.0f, prepared[prepared.lastIndex], 1e-6f)
+        // First sample after leading pad is tapered smoothly rather than a step jump to 0.2f
+        assertTrue(prepared[3_200] in 0.0005f..0.01f)
+        assertEquals(0.2f, prepared[3_200 + 200], 1e-5f)
+    }
 }

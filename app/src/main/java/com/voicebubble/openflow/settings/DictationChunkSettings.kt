@@ -77,27 +77,30 @@ data class DictationChunkSettings(
         const val KEY_DEFAULTS_VERSION = "chunk_defaults_version"
 
         /** Bumped whenever the shipped defaults change; see [migrateDefaults]. */
-        const val DEFAULTS_VERSION = 2
+        const val DEFAULTS_VERSION = 3
 
         const val DEFAULT_CHUNKING_ENABLED = true
         const val DEFAULT_LIVE_ENABLED = true
 
         /**
-         * 500 ms: natural sentence/clause boundaries are typically 400-800 ms while gaps between words are
-         * almost always under 300 ms, so 500 ms cuts at real phrase ends without chopping hesitant speech.
+         * 650 ms: brief mid-clause hesitations ("uh... like...") and word gaps are typically 200-500 ms,
+         * whereas natural clause/sentence boundaries are 600-900 ms. 650 ms avoids chopping active clauses
+         * in half while still triggering live transcription promptly at real phrase breaks.
          */
-        const val DEFAULT_PAUSE_MS = 500
+        const val DEFAULT_PAUSE_MS = 650
 
-        /** 3 s: enough acoustic context for accurate recognition, but starts working early. */
-        const val DEFAULT_MIN_LIVE_CHUNK_SECONDS = 3f
+        /** 5 s: gives Voz a full phrase/sentence of acoustic context before cutting a live chunk. */
+        const val DEFAULT_MIN_LIVE_CHUNK_SECONDS = 5f
         const val DEFAULT_MAX_CHUNK_SECONDS = 20f
         const val DEFAULT_SILENCE_THRESHOLD = 0.008f
         const val DEFAULT_REUSE_LANGUAGE = true
         const val DEFAULT_ADAPTIVE_PAUSE = true
 
-        /** Defaults shipped in v2.6.0 (before tuning); users still on exactly these values are migrated. */
+        /** Defaults shipped in v2.6.0 / v2.6.1; users still on these un-customised values are migrated. */
         private const val V1_PAUSE_MS = 600
         private const val V1_MIN_LIVE_CHUNK_SECONDS = 4f
+        private const val V2_PAUSE_MS = 500
+        private const val V2_MIN_LIVE_CHUNK_SECONDS = 3f
 
         const val MIN_PAUSE_MS = 250
         const val MAX_PAUSE_MS = 2_000
@@ -113,19 +116,23 @@ data class DictationChunkSettings(
 
         /**
          * One-time migration: users who never touched the pause / minimum-length sliders (their stored values
-         * are exactly the old v2.6.0 defaults) get the new tuned defaults; real customisations are kept.
+         * are still the v2.6.0 or v2.6.1 shipped defaults) get the new tuned defaults; customisations are kept.
          */
         private fun migrateDefaults(prefs: android.content.SharedPreferences) {
             try {
                 if (prefs.getInt(KEY_DEFAULTS_VERSION, 1) >= DEFAULTS_VERSION) return
                 val editor = prefs.edit()
-                if (prefs.contains(KEY_PAUSE_MS) && prefs.getInt(KEY_PAUSE_MS, -1) == V1_PAUSE_MS) {
-                    editor.remove(KEY_PAUSE_MS)
+                if (prefs.contains(KEY_PAUSE_MS)) {
+                    val storedPause = prefs.getInt(KEY_PAUSE_MS, -1)
+                    if (storedPause == V1_PAUSE_MS || storedPause == V2_PAUSE_MS) {
+                        editor.remove(KEY_PAUSE_MS)
+                    }
                 }
-                if (prefs.contains(KEY_MIN_LIVE_CHUNK_SECONDS) &&
-                    prefs.getFloat(KEY_MIN_LIVE_CHUNK_SECONDS, -1f) == V1_MIN_LIVE_CHUNK_SECONDS
-                ) {
-                    editor.remove(KEY_MIN_LIVE_CHUNK_SECONDS)
+                if (prefs.contains(KEY_MIN_LIVE_CHUNK_SECONDS)) {
+                    val storedMinLive = prefs.getFloat(KEY_MIN_LIVE_CHUNK_SECONDS, -1f)
+                    if (storedMinLive == V1_MIN_LIVE_CHUNK_SECONDS || storedMinLive == V2_MIN_LIVE_CHUNK_SECONDS) {
+                        editor.remove(KEY_MIN_LIVE_CHUNK_SECONDS)
+                    }
                 }
                 editor.putInt(KEY_DEFAULTS_VERSION, DEFAULTS_VERSION).apply()
             } catch (_: Throwable) {

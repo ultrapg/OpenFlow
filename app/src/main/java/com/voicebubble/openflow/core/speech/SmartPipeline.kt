@@ -363,6 +363,11 @@ class SmartPipeline(
     }
 
     /**
+     * Returns the current [ModelSettings] snapshot without locking.
+     */
+    fun currentSettings(): ModelSettings = settings
+
+    /**
      * Launches [reloadSettings] on the singleton's background scope.
      */
     fun reloadSettingsAsync(newSettings: ModelSettings) {
@@ -540,11 +545,12 @@ class SmartPipeline(
 
                 for ((chunkIdx, rawChunk) in audioChunks.withIndex()) {
                     val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
-                    ensureMemoryHeadroomForFfiLocked(rawChunk.size)
+                    val preparedChunk = prepareChunkForInference(rawChunk)
+                    ensureMemoryHeadroomForFfiLocked(preparedChunk.size)
 
                     // Stage 2A: Audio Enhancement (`Clear`)
                     val enhancedChunk = runClearStageLocked(
-                        rawSamples = rawChunk,
+                        rawSamples = preparedChunk,
                         activeSettings = activeSettings,
                         stageSuffix = chunkSuffix,
                         onStageProgress = onStageProgress
@@ -592,9 +598,10 @@ class SmartPipeline(
                     }
                 }
 
-                val finalTranscript = normalizeTranscriptText(
-                    rawText = segmentTranscripts.joinToString(" "),
-                    capitalizeLeadingWord = false
+                val finalTranscript = stitchChunkTranscripts(
+                    chunks = segmentTranscripts,
+                    language = resolvedLanguage,
+                    customVocabulary = activeSettings.customVocabulary
                 )
 
                 // Re-attach auxiliary models in ready state if memory is healthy
@@ -1010,11 +1017,15 @@ class SmartPipeline(
             }
             val retryVoz = voz ?: throw IllegalStateException("Voz unavailable on retry.", firstError)
 
-            // If the chunk is > 10s, split it in half on retry to halve peak native & FFI memory
+            // If the chunk is > 10s, split it at the best silence valley on retry to halve peak native & FFI memory
             if (samples.size > 10 * 16_000) {
-                val mid = samples.size / 2
-                val left = samples.copyOfRange(0, mid)
-                val right = samples.copyOfRange(mid, samples.size)
+                val mid = findBestSplitPoint(
+                    samples = samples,
+                    rangeStart = samples.size / 3,
+                    rangeEndExclusive = (samples.size * 2) / 3
+                ).coerceIn(samples.size / 3, (samples.size * 2) / 3)
+                val left = prepareChunkForInference(samples.copyOfRange(0, mid))
+                val right = prepareChunkForInference(samples.copyOfRange(mid, samples.size))
                 val t1 = retryVoz.transcribeWithContext(left, SAMPLE_RATE_HZ, language, customVocabulary)
                 System.gc()
                 val t2 = retryVoz.transcribeWithContext(right, SAMPLE_RATE_HZ, language, customVocabulary)
@@ -1024,7 +1035,11 @@ class SmartPipeline(
                 }
                 vozWarmedUp = true
                 Transcription(
-                    text = listOf(t1.text.trim(), t2.text.trim()).filter { it.isNotEmpty() }.joinToString(" "),
+                    text = stitchChunkTranscripts(
+                        chunks = listOf(t1.text, t2.text),
+                        language = language,
+                        customVocabulary = customVocabulary
+                    ),
                     words = t1.words + shiftedRightWords,
                     duration = t1.duration + t2.duration
                 )
@@ -1516,6 +1531,65 @@ fun splitAudioIntoSmartChunks(
 }
 
 /**
+ * Prepares an individual 16 kHz PCM chunk for native inference (`Clear`, `Uhm`, `Voz`):
+ * 1. Applies a smooth [edgeFadeSamples] (10 ms = 160 samples) linear fade-in/fade-out at the array boundaries
+ *    so slicing a buffer inside room noise or a vocal dip never creates a rectangular-window step click in
+ *    the STFT mel-spectrogram.
+ * 2. Guarantees at least [minSilencePadSamples] (200 ms = 3,200 samples) of quiet acoustic runway before the
+ *    first voiced sample and after the last voiced sample so `Clear`'s 2.0s STFT window and `Voz`'s Conformer
+ *    convolutional subsampling front-end never clip boundary phonemes.
+ */
+fun prepareChunkForInference(
+    samples: FloatArray,
+    minSilencePadSamples: Int = 3_200,
+    edgeFadeSamples: Int = 160,
+    silenceThreshold: Float = 0.004f
+): FloatArray {
+    if (samples.isEmpty()) return samples
+    val safePad = minSilencePadSamples.coerceAtLeast(0)
+    val safeFade = min(edgeFadeSamples.coerceAtLeast(0), samples.size / 4)
+
+    var firstVoice = -1
+    for (i in samples.indices) {
+        if (abs(samples[i]) >= silenceThreshold) {
+            firstVoice = i
+            break
+        }
+    }
+    if (firstVoice == -1) return samples
+
+    var lastVoice = firstVoice
+    for (i in samples.lastIndex downTo firstVoice) {
+        if (abs(samples[i]) >= silenceThreshold) {
+            lastVoice = i
+            break
+        }
+    }
+
+    val existingLeadSilence = firstVoice
+    val existingTailSilence = (samples.size - 1 - lastVoice).coerceAtLeast(0)
+    val extraLead = (safePad - existingLeadSilence).coerceAtLeast(0)
+    val extraTail = (safePad - existingTailSilence).coerceAtLeast(0)
+
+    if (extraLead == 0 && extraTail == 0 && safeFade == 0) {
+        return samples
+    }
+
+    val out = FloatArray(extraLead + samples.size + extraTail)
+    System.arraycopy(samples, 0, out, extraLead, samples.size)
+
+    if (safeFade > 0) {
+        for (i in 0 until safeFade) {
+            val scale = (i + 1).toFloat() / (safeFade + 1).toFloat()
+            out[extraLead + i] *= scale
+            out[extraLead + samples.size - 1 - i] *= scale
+        }
+    }
+
+    return out
+}
+
+/**
  * Trims leading and trailing dead silence below [threshold] while preserving up to [padSamples]
  * of natural speech margin on both ends. Returns an empty array if the entire buffer is silence.
  */
@@ -1575,8 +1649,62 @@ suspend fun Voz.transcribeWithContext(
 }
 
 /**
+ * Unambiguous vocal hesitation tokens across English and German that are never valid lexical words.
+ * (Language-ambiguous tokens like `"um"` or `"er"` are intentionally excluded here and only removed when
+ * the acoustic `Uhm` model flags their audio frames.)
+ */
+private val UNAMBIGUOUS_HESITATION_TOKENS = setOf(
+    "uh", "uhh", "uhhh",
+    "uhm", "uhmm",
+    "umm", "ummm",
+    "erm", "ermm",
+    "äh", "ähh",
+    "ähm", "ähmm",
+    "öhm",
+    "hm", "hmm", "hmmm",
+    "mhm", "mmh", "mmhm",
+    "uh-huh", "mm-hmm"
+)
+
+/**
+ * Function words after which a comma is never grammatically valid unless `Voz` inserted a parenthetical
+ * hesitation (`"so that, uh, the"` -> `"so that the"`).
+ */
+private val NO_COMMA_AFTER_WORDS = setOf(
+    // English determiners, prepositions, conjunctions, pronouns, auxiliaries
+    "the", "a", "an", "to", "of", "in", "on", "at", "for", "with", "from", "by", "into", "onto",
+    "and", "or", "but", "so", "that", "which", "who", "whose", "because", "if", "when", "while",
+    "as", "than", "like", "is", "are", "was", "were", "be", "been", "have", "has", "had",
+    "do", "does", "did", "will", "would", "can", "could", "should", "must", "may", "might",
+    "i", "you", "he", "she", "it", "we", "they", "my", "your", "his", "her", "its", "our", "their",
+    "this", "these", "those", "very", "really", "quite", "too",
+    // German articles, prepositions, conjunctions, pronouns, auxiliaries
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "eines",
+    "und", "oder", "aber", "denn", "sondern", "weil", "dass", "ob", "wenn", "als", "wie",
+    "in", "im", "ins", "an", "am", "auf", "für", "mit", "von", "vom", "zu", "zum", "zur",
+    "bei", "beim", "nach", "aus", "über", "unter", "vor", "durch", "gegen", "ohne", "um",
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "man", "mein", "meine", "dein", "deine",
+    "sein", "seine", "unser", "unsere", "kein", "keine", "ist", "sind", "war", "waren",
+    "wird", "werden", "hat", "haben", "kann", "können", "muss", "müssen", "soll", "sollen",
+    "will", "wollen", "sehr", "ganz", "ziemlich"
+)
+
+internal fun extractWordCore(token: String): String {
+    val start = token.indexOfFirst { it.isLetterOrDigit() }
+    if (start < 0) return ""
+    val end = token.indexOfLast { it.isLetterOrDigit() }
+    return token.substring(start, end + 1)
+}
+
+internal fun isUnambiguousHesitationToken(token: String): Boolean {
+    val core = extractWordCore(token).lowercase(Locale.ROOT)
+    return core.isNotEmpty() && core in UNAMBIGUOUS_HESITATION_TOKENS
+}
+
+/**
  * Stage 4: Reconciles `Voz` word-level timestamps with `Uhm` 20 ms filler frames using the
- * deterministic overlap formula from Specification Section 4.2.
+ * deterministic overlap formula from Specification Section 4.2, and removes unambiguous lexical
+ * hesitation noises (`"uh"`, `"uhm"`, `"äh"`, `"ähm"`, `"hm"`, `"hmm"`).
  */
 fun reconcileTranscript(
     transcription: Transcription,
@@ -1592,7 +1720,17 @@ fun reconcileTranscript(
         )
     }
 
-    if (!uhmEnabled || uhmFrames.isEmpty()) {
+    val fillerSpans = if (uhmEnabled && uhmFrames.isNotEmpty()) {
+        mergeFillerFrames(
+            frames = uhmFrames,
+            maxGapMs = SmartPipeline.FILLER_MERGE_MAX_GAP_MS
+        )
+    } else {
+        emptyList()
+    }
+
+    val hasUnambiguousLexicalFiller = words.any { isUnambiguousHesitationToken(it.text) }
+    if (fillerSpans.isEmpty() && !hasUnambiguousLexicalFiller) {
         val rawJoined = if (transcription.text.isNotBlank()) {
             transcription.text
         } else {
@@ -1604,25 +1742,7 @@ fun reconcileTranscript(
         )
     }
 
-    // 1. Merge contiguous/near-contiguous non-zero filler frames (classes 1..5) separated by <= 40 ms
-    val fillerSpans = mergeFillerFrames(
-        frames = uhmFrames,
-        maxGapMs = SmartPipeline.FILLER_MERGE_MAX_GAP_MS
-    )
-
-    if (fillerSpans.isEmpty()) {
-        val rawJoined = if (transcription.text.isNotBlank()) {
-            transcription.text
-        } else {
-            words.joinToString(" ") { it.text }
-        }
-        return normalizeTranscriptText(
-            rawText = applyCustomVocabulary(rawJoined, customVocabulary),
-            capitalizeLeadingWord = false
-        )
-    }
-
-    // 2. Filter word tokens using >= 50% overlap ratio with +/- 80 ms boundary tolerance
+    // Filter word tokens using >= 50% acoustic overlap ratio (+/- 80 ms tolerance) + unambiguous lexical hesitations
     val reconciliation = filterWordsByFillerOverlap(
         words = words,
         fillerSpans = fillerSpans,
@@ -1654,6 +1774,9 @@ data class WordReconciliationResult(
  * - $D_{\text{word}} = \max(1, E_{\text{word}} - S_{\text{word}})$
  * - $D_{\text{overlap}} = \max(0, \min(E_{\text{word}}, E_{\text{filler}} + \tau) - \max(S_{\text{word}}, S_{\text{filler}} - \tau))$
  * - $\text{OverlapRatio} = D_{\text{overlap}} / D_{\text{word}} \ge 0.50$
+ *
+ * Also cleans up filler-induced punctuation (such as commas attached to function words immediately before
+ * a removed mid-sentence `"uh"`, or terminal punctuation attached to a removed sentence-final `"uh."`).
  */
 fun filterWordsByFillerOverlap(
     words: List<Word>,
@@ -1661,7 +1784,15 @@ fun filterWordsByFillerOverlap(
     boundaryToleranceMs: Long = SmartPipeline.FILLER_BOUNDARY_TOLERANCE_MS,
     overlapThreshold: Double = SmartPipeline.FILLER_OVERLAP_THRESHOLD
 ): WordReconciliationResult {
-    if (words.isEmpty() || fillerSpans.isEmpty()) {
+    if (words.isEmpty()) {
+        return WordReconciliationResult(
+            keptWords = words,
+            removedWords = emptyList(),
+            removedLeadingCapitalizedWord = false
+        )
+    }
+    val hasLexicalFiller = words.any { isUnambiguousHesitationToken(it.text) }
+    if (fillerSpans.isEmpty() && !hasLexicalFiller) {
         return WordReconciliationResult(
             keptWords = words,
             removedWords = emptyList(),
@@ -1672,34 +1803,88 @@ fun filterWordsByFillerOverlap(
     val kept = ArrayList<Word>(words.size)
     val removed = ArrayList<Word>()
     var removedLeadingCapitalized = false
+    var lastRemovedFillerHadCommaOrPeriod = false
+    var trailingRemovedTerminalPunct: Char? = null
 
     for ((index, word) in words.withIndex()) {
         val sWordMs = (word.start * 1000.0).roundToLong()
         val eWordMs = max(sWordMs + 1L, (word.end * 1000.0).roundToLong())
         val dWordMs = max(1L, eWordMs - sWordMs)
 
-        var isFillerWord = false
-        for (span in fillerSpans) {
-            val expandedFillerStart = span.startMs - boundaryToleranceMs
-            val expandedFillerEnd = span.endMs + boundaryToleranceMs
-            val overlapMs = max(0L, min(eWordMs, expandedFillerEnd) - max(sWordMs, expandedFillerStart))
-            val overlapRatio = overlapMs.toDouble() / dWordMs.toDouble()
-            if (overlapRatio >= overlapThreshold) {
-                isFillerWord = true
-                break
+        var isFillerWord = isUnambiguousHesitationToken(word.text)
+        if (!isFillerWord && fillerSpans.isNotEmpty()) {
+            for (span in fillerSpans) {
+                val expandedFillerStart = span.startMs - boundaryToleranceMs
+                val expandedFillerEnd = span.endMs + boundaryToleranceMs
+                val overlapMs = max(0L, min(eWordMs, expandedFillerEnd) - max(sWordMs, expandedFillerStart))
+                val overlapRatio = overlapMs.toDouble() / dWordMs.toDouble()
+                if (overlapRatio >= overlapThreshold) {
+                    isFillerWord = true
+                    break
+                }
             }
         }
 
         if (isFillerWord) {
             removed.add(word)
-            if (kept.isEmpty() && index == 0) {
-                val firstLetter = word.text.firstOrNull { it.isLetter() }
+            val trimmedWord = word.text.trim()
+            if (kept.isEmpty()) {
+                val firstLetter = trimmedWord.firstOrNull { it.isLetter() }
                 if (firstLetter != null && firstLetter.isUpperCase()) {
                     removedLeadingCapitalized = true
                 }
+            } else {
+                // If a mid-sentence filler was preceded by a function word with a filler-induced comma
+                // (e.g. "so that, uh, the"), strip the comma from the preceding kept word.
+                val prevWord = kept.last()
+                val prevCore = extractWordCore(prevWord.text).lowercase(Locale.ROOT)
+                if (prevWord.text.endsWith(",") && prevCore in NO_COMMA_AFTER_WORDS) {
+                    kept[kept.lastIndex] = prevWord.copy(text = prevWord.text.dropLast(1))
+                }
+                if (trimmedWord.endsWith(",") || trimmedWord.endsWith(".")) {
+                    lastRemovedFillerHadCommaOrPeriod = true
+                }
+                val lastChar = trimmedWord.lastOrNull()
+                if (lastChar == '.' || lastChar == '!' || lastChar == '?') {
+                    trailingRemovedTerminalPunct = lastChar
+                }
             }
         } else {
-            kept.add(word)
+            var adjustedWord = word
+            if (lastRemovedFillerHadCommaOrPeriod && kept.isNotEmpty()) {
+                val prevCore = extractWordCore(kept.last().text).lowercase(Locale.ROOT)
+                val currCore = extractWordCore(word.text)
+                if (prevCore in NO_COMMA_AFTER_WORDS &&
+                    currCore.length >= 2 &&
+                    currCore[0].isUpperCase() &&
+                    currCore.substring(1).all { it.isLowerCase() } &&
+                    currCore != "I" &&
+                    currCore.lowercase(Locale.ROOT) in LOWERCASEABLE_CONTINUATION_WORDS
+                ) {
+                    val firstLetterIdx = word.text.indexOfFirst { it.isLetter() }
+                    if (firstLetterIdx >= 0) {
+                        val lowered = word.text.substring(0, firstLetterIdx) +
+                            word.text[firstLetterIdx].lowercaseChar() +
+                            word.text.substring(firstLetterIdx + 1)
+                        adjustedWord = word.copy(text = lowered)
+                    }
+                }
+            }
+            lastRemovedFillerHadCommaOrPeriod = false
+            trailingRemovedTerminalPunct = null
+            kept.add(adjustedWord)
+        }
+    }
+
+    // If the utterance ended with a removed filler that carried the terminal punctuation (e.g. "know, uh."),
+    // transfer that terminal punctuation to the last remaining kept word.
+    if (trailingRemovedTerminalPunct != null && kept.isNotEmpty()) {
+        val lastKept = kept.last()
+        val trimmed = lastKept.text.trimEnd()
+        if (trimmed.endsWith(",") || trimmed.endsWith(";") || trimmed.endsWith(":")) {
+            kept[kept.lastIndex] = lastKept.copy(text = trimmed.dropLast(1) + trailingRemovedTerminalPunct)
+        } else if (trimmed.isNotEmpty() && trimmed.last().isLetterOrDigit()) {
+            kept[kept.lastIndex] = lastKept.copy(text = trimmed + trailingRemovedTerminalPunct)
         }
     }
 
@@ -1716,8 +1901,59 @@ private val DUPLICATE_PUNCT_REGEX = Regex("([,;:])\\s*[,;:]+")
 private val MULTI_SPACE_REGEX = Regex("\\s+")
 
 /**
- * Cleans up orphaned punctuation, duplicate spaces, and re-capitalizes the new leading word
- * when a sentence-initial filler word was removed.
+ * Strips standalone unambiguous hesitation tokens (such as `"uh"`, `"uhm"`, `"erm"`, `"äh"`, `"ähm"`, `"hm"`,
+ * `"hmm"`) from a raw text line while preserving surrounding sentence structure and capitalization.
+ */
+private fun stripUnambiguousTextHesitations(rawText: String): Pair<String, Boolean> {
+    val tokens = rawText.trim().split(MULTI_SPACE_REGEX)
+    if (tokens.isEmpty() || tokens.none { isUnambiguousHesitationToken(it) }) {
+        return rawText to false
+    }
+    val kept = ArrayList<String>(tokens.size)
+    var removedLeadingCapital = false
+    var trailingTerminalPunct: Char? = null
+
+    for (token in tokens) {
+        if (isUnambiguousHesitationToken(token)) {
+            if (kept.isEmpty()) {
+                val firstLetter = token.firstOrNull { it.isLetter() }
+                if (firstLetter != null && firstLetter.isUpperCase()) {
+                    removedLeadingCapital = true
+                }
+            } else {
+                val prev = kept.last()
+                val prevCore = extractWordCore(prev).lowercase(Locale.ROOT)
+                if (prev.endsWith(",") && prevCore in NO_COMMA_AFTER_WORDS) {
+                    kept[kept.lastIndex] = prev.dropLast(1)
+                }
+                val lastChar = token.lastOrNull()
+                if (lastChar == '.' || lastChar == '!' || lastChar == '?') {
+                    trailingTerminalPunct = lastChar
+                }
+            }
+        } else {
+            trailingTerminalPunct = null
+            kept.add(token)
+        }
+    }
+
+    if (kept.isEmpty()) return "" to false
+
+    if (trailingTerminalPunct != null) {
+        val last = kept.last()
+        if (last.endsWith(",") || last.endsWith(";") || last.endsWith(":")) {
+            kept[kept.lastIndex] = last.dropLast(1) + trailingTerminalPunct
+        } else if (last.last().isLetterOrDigit()) {
+            kept[kept.lastIndex] = last + trailingTerminalPunct
+        }
+    }
+
+    return kept.joinToString(" ") to removedLeadingCapital
+}
+
+/**
+ * Cleans up orphaned punctuation, duplicate spaces, unambiguous vocal hesitation tokens, and
+ * re-capitalizes the new leading word when a sentence-initial filler word was removed.
  */
 fun normalizeTranscriptText(
     rawText: String,
@@ -1725,7 +1961,10 @@ fun normalizeTranscriptText(
 ): String {
     if (rawText.isBlank()) return ""
 
-    var cleaned = rawText
+    val (withoutHesitations, removedLeadingCap) = stripUnambiguousTextHesitations(rawText)
+    if (withoutHesitations.isBlank()) return ""
+
+    var cleaned = withoutHesitations
         .trim()
         // Strip leading orphaned punctuation left behind after a leading filler removal (e.g. ", ich...")
         .replace(LEADING_ORPHAN_PUNCT_REGEX, "")
@@ -1739,7 +1978,7 @@ fun normalizeTranscriptText(
 
     if (cleaned.isEmpty()) return ""
 
-    if (capitalizeLeadingWord) {
+    if (capitalizeLeadingWord || removedLeadingCap) {
         val firstLetterIdx = cleaned.indexOfFirst { it.isLetter() }
         if (firstLetterIdx >= 0 && cleaned[firstLetterIdx].isLowerCase()) {
             val ch = cleaned[firstLetterIdx].titlecase(Locale.getDefault())
@@ -1748,6 +1987,557 @@ fun normalizeTranscriptText(
     }
 
     return cleaned
+}
+
+/**
+ * Words that cannot grammatically end a standalone sentence when another spoken chunk immediately follows.
+ * If `Voz` placed a synthetic `.` or `,` at the end of a chunk after one of these words because of a
+ * mid-clause pause, [stitchChunkTranscripts] strips the synthetic punctuation and continues the clause.
+ */
+private val DANGLING_CHUNK_END_WORDS = setOf(
+    // English articles, determiners, prepositions, conjunctions, auxiliaries, degree adverbs
+    "the", "a", "an", "my", "your", "our", "their", "his", "its", "every",
+    "to", "of", "in", "into", "onto", "for", "with", "without", "from", "by", "at",
+    "between", "among", "through", "during", "including", "against", "towards", "toward", "upon", "within",
+    "and", "or", "nor", "but", "so", "because", "since", "if", "when", "while", "although", "though",
+    "unless", "until", "whether", "that", "which", "who", "whom", "whose", "as", "than", "like",
+    "very", "really", "quite", "extremely",
+    // German articles, determiners, prepositions, conjunctions, degree adverbs
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "eines",
+    "mein", "meine", "meinen", "meinem", "meiner", "dein", "deine", "sein", "seine", "unser", "unsere",
+    "kein", "keine", "keinen", "keinem", "keiner",
+    "und", "oder", "aber", "denn", "sondern", "weil", "dass", "sodass", "ob", "wenn", "als", "falls",
+    "damit", "obwohl", "obgleich", "während", "indem", "bevor", "nachdem", "sobald", "solange",
+    "in", "im", "ins", "an", "am", "ans", "auf", "aufs", "für", "fürs", "mit", "von", "vom",
+    "zu", "zum", "zur", "bei", "beim", "nach", "aus", "über", "unter", "vor", "hinter", "neben",
+    "zwischen", "durch", "gegen", "ohne", "um", "ums", "seit", "trotz", "wegen", "statt", "anstatt",
+    "sehr", "ganz", "ziemlich", "besonders",
+    // Romance / Dutch common articles, prepositions & conjunctions
+    "le", "la", "les", "un", "une", "des", "du", "au", "aux", "et", "ou", "mais", "que", "pour", "dans", "avec",
+    "el", "los", "las", "una", "unos", "unas", "y", "o", "pero", "porque", "para", "con", "por",
+    "il", "lo", "gli", "uno", "e", "ma", "perché", "per", "con", "nel", "nella",
+    "os", "as", "um", "uma", "mas", "para", "com",
+    "het", "een", "en", "maar", "omdat", "voor", "met", "van"
+)
+
+/**
+ * Clause-continuation connectors at the start of Chunk $N+1$ that join directly onto Chunk $N$ without
+ * a preceding comma (stripping any synthetic `.` that `Voz` placed at the end of Chunk $N$).
+ */
+private val NO_COMMA_CONTINUATION_CONNECTORS = setOf(
+    "and", "or", "nor", "because", "since", "unless", "until", "whether", "than", "as", "like",
+    "with", "without", "into", "onto", "from", "between", "through", "about", "of", "by", "via",
+    "und", "oder", "sowie",
+    "et", "ou", "y", "e", "en", "of"
+)
+
+/**
+ * Clause-continuation connectors (subordinating, contrastive, or relative) at the start of Chunk $N+1$
+ * that join onto Chunk $N$ with a comma `,` instead of a synthetic full stop `.`.
+ */
+private val COMMA_CONTINUATION_CONNECTORS = setOf(
+    "but", "yet", "although", "though", "whereas", "while", "which", "who", "whom", "whose", "whereby",
+    "especially", "particularly", "including",
+    "aber", "denn", "sondern", "weil", "dass", "sodass", "ob", "obwohl", "obgleich",
+    "während", "indem", "damit", "bevor", "nachdem", "sobald", "solange", "falls", "sofern",
+    "insbesondere", "zumal",
+    "mais", "car", "parce", "puisque", "quoique",
+    "pero", "sino", "porque", "aunque",
+    "ma", "perché", "sebbene",
+    "mas", "embora",
+    "maar", "want", "omdat", "hoewel"
+)
+
+/**
+ * Words that can follow `"that"` at the start of Chunk $N+1$ when `"that"` is a relative/complementizer
+ * continuation of Chunk $N$ (e.g. `"the text. That is spoken"` -> `"the text that is spoken"`).
+ */
+private val THAT_CLAUSE_FOLLOWERS = setOf(
+    "is", "are", "was", "were", "be", "been", "has", "have", "had", "does", "do", "did",
+    "doesn't", "don't", "didn't", "isn't", "aren't", "wasn't", "weren't", "won't", "wouldn't",
+    "can't", "cannot", "couldn't", "shouldn't", "mustn't",
+    "will", "would", "can", "could", "should", "must", "may", "might",
+    "makes", "made", "works", "worked", "happens", "happened", "means", "meant", "needs", "needed",
+    "looks", "looked", "feels", "felt", "seems", "seemed", "stays", "stayed", "comes", "came",
+    "goes", "went", "takes", "took", "gives", "gave", "gets", "got", "keeps", "kept",
+    "i", "you", "we", "they", "he", "she", "it", "there", "the", "a", "an", "this", "these", "those",
+    "my", "your", "our", "their", "his", "her", "its"
+)
+
+/**
+ * Infinitive verbs that follow `"to"` at the start of Chunk $N+1$ when `"to ..."` continues Chunk $N$.
+ */
+private val TO_INFINITIVE_FOLLOWERS = setOf(
+    "be", "have", "do", "make", "get", "take", "go", "come", "see", "know", "think", "look",
+    "want", "give", "use", "find", "tell", "ask", "work", "seem", "feel", "try", "leave", "call",
+    "keep", "let", "begin", "help", "talk", "turn", "start", "show", "hear", "play", "run",
+    "move", "like", "live", "believe", "hold", "bring", "happen", "write", "provide", "sit",
+    "stand", "lose", "pay", "meet", "include", "continue", "set", "learn", "change", "lead",
+    "understand", "watch", "follow", "stop", "create", "speak", "read", "allow", "add", "spend",
+    "grow", "open", "walk", "win", "offer", "remember", "love", "consider", "appear", "buy",
+    "wait", "serve", "die", "send", "expect", "build", "stay", "fall", "cut", "reach", "kill",
+    "remain", "suggest", "raise", "pass", "sell", "require", "report", "decide", "pull",
+    "test", "fix", "update", "optimize", "improve", "prevent", "avoid", "ensure", "check", "enable",
+    "disable", "configure", "transcribe", "record", "split", "process", "release", "publish"
+)
+
+private val GERMAN_DA_SUBORDINATE_FOLLOWERS = setOf(
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "man", "sich",
+    "der", "die", "das", "den", "dem", "ein", "eine", "einen", "einem", "kein", "keine",
+    "dies", "diese", "dieser", "dieses", "mein", "meine", "dein", "deine", "sein", "seine", "unser", "unsere"
+)
+
+private val GERMAN_ARTICLE_OR_POSSESSIVE_WORDS = setOf(
+    "der", "die", "das", "den", "dem", "des",
+    "ein", "eine", "einen", "einem", "einer", "eines",
+    "kein", "keine", "keinen", "keinem", "keiner", "keines",
+    "mein", "meine", "meinen", "meinem", "meiner", "meines",
+    "dein", "deine", "deinen", "deinem", "deiner", "deines",
+    "sein", "seine", "seinen", "seinem", "seiner", "seines",
+    "unser", "unsere", "unseren", "unserem", "unserer", "unseres",
+    "euer", "eure", "euren", "eurem", "eurer",
+    "dieser", "diese", "dieses", "diesen", "diesem",
+    "jeder", "jede", "jedes", "jeden", "jedem",
+    "welcher", "welche", "welches", "welchen", "welchem",
+    "im", "ins", "am", "ans", "vom", "zum", "zur", "beim", "fürs", "aufs", "ums"
+)
+
+/**
+ * Words across English, German, and supported European languages that are always lowercase when they
+ * appear mid-sentence (excludes German nouns and English `"I"`).
+ */
+private val LOWERCASEABLE_CONTINUATION_WORDS = setOf(
+    // English function words, pronouns (except I), auxiliaries, modals, common verbs, adverbs, adjectives
+    "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "my", "your", "his", "its", "our", "their", "mine", "yours", "ours", "theirs",
+    "myself", "yourself", "himself", "herself", "itself", "ourselves", "themselves",
+    "this", "that", "these", "those", "who", "whom", "whose", "which", "what", "where", "when", "why", "how",
+    "there", "here", "whereby", "wherein", "wherever", "whenever", "whatever", "whichever", "whoever",
+    "the", "a", "an", "some", "any", "no", "none", "every", "each", "all", "both", "either", "neither",
+    "another", "other", "others", "such", "many", "much", "more", "most", "few", "fewer", "fewest",
+    "little", "less", "least", "several", "enough", "own", "same", "different", "next", "last",
+    "first", "second", "third", "new", "old", "good", "better", "best", "bad", "worse", "worst",
+    "big", "small", "long", "short", "high", "low", "great", "little", "right", "wrong", "able",
+    "available", "possible", "impossible", "sure", "certain", "clear", "free", "full", "empty",
+    "ready", "easy", "hard", "fast", "slow", "early", "late", "important", "whole", "true", "false",
+    "and", "or", "nor", "but", "so", "yet", "for", "because", "although", "though", "while", "whereas",
+    "if", "unless", "until", "since", "whether", "as", "than", "like", "once",
+    "in", "on", "at", "to", "of", "off", "from", "by", "with", "without", "into", "onto", "upon",
+    "out", "up", "down", "over", "under", "above", "below", "between", "among", "through", "during",
+    "before", "after", "around", "about", "against", "across", "behind", "beyond", "within", "along",
+    "towards", "toward", "despite", "except", "plus", "via", "including", "excluding",
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "having", "do", "does", "did", "doing", "done",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must", "need", "needs", "needed",
+    "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't",
+    "don't", "doesn't", "didn't", "won't", "wouldn't", "shan't", "shouldn't", "can't", "cannot", "couldn't", "mustn't",
+    "you're", "you've", "you'll", "you'd", "he's", "he'll", "he'd", "she's", "she'll", "she'd",
+    "it's", "it'll", "we're", "we've", "we'll", "we'd", "they're", "they've", "they'll", "they'd",
+    "that's", "that'll", "that'd", "there's", "here's", "what's", "who's", "where's", "how's", "let's",
+    "not", "no", "yes", "just", "only", "also", "too", "very", "really", "quite", "rather", "almost",
+    "nearly", "still", "already", "even", "ever", "never", "always", "often", "sometimes", "usually",
+    "maybe", "perhaps", "probably", "actually", "basically", "especially", "particularly", "specifically",
+    "currently", "recently", "finally", "immediately", "directly", "completely", "totally", "exactly",
+    "simply", "quickly", "slowly", "easily", "automatically", "properly", "correctly",
+    "now", "then", "today", "tomorrow", "yesterday", "soon", "later", "again", "back", "away", "together",
+    "well", "far", "near", "ahead", "instead", "otherwise", "however", "therefore", "thus", "furthermore",
+    "go", "goes", "going", "went", "gone", "get", "gets", "getting", "got", "gotten",
+    "make", "makes", "making", "made", "take", "takes", "taking", "took", "taken",
+    "see", "sees", "seeing", "saw", "seen", "know", "knows", "knowing", "knew", "known",
+    "think", "thinks", "thinking", "thought", "come", "comes", "coming", "came",
+    "want", "wants", "wanted", "wanting", "use", "uses", "using", "used",
+    "find", "finds", "finding", "found", "give", "gives", "giving", "gave", "given",
+    "tell", "tells", "telling", "told", "work", "works", "working", "worked",
+    "call", "calls", "calling", "called", "try", "tries", "trying", "tried",
+    "ask", "asks", "asking", "asked", "feel", "feels", "feeling", "felt",
+    "become", "becomes", "becoming", "became", "leave", "leaves", "leaving", "left",
+    "put", "puts", "putting", "mean", "means", "meaning", "meant",
+    "keep", "keeps", "keeping", "kept", "let", "lets", "letting",
+    "begin", "begins", "beginning", "began", "begun", "seem", "seems", "seeming", "seemed",
+    "help", "helps", "helping", "helped", "talk", "talks", "talking", "talked",
+    "turn", "turns", "turning", "turned", "start", "starts", "starting", "started",
+    "show", "shows", "showing", "showed", "shown", "hear", "hears", "hearing", "heard",
+    "play", "plays", "playing", "played", "run", "runs", "running", "ran",
+    "move", "moves", "moving", "moved", "live", "lives", "living", "lived",
+    "believe", "believes", "believing", "believed", "bring", "brings", "bringing", "brought",
+    "happen", "happens", "happening", "happened", "write", "writes", "writing", "wrote", "written",
+    "sit", "sits", "sitting", "sat", "stand", "stands", "standing", "stood",
+    "lose", "loses", "losing", "lost", "pay", "pays", "paying", "paid",
+    "meet", "meets", "meeting", "met", "include", "includes", "including", "included",
+    "continue", "continues", "continuing", "continued", "set", "sets", "setting",
+    "learn", "learns", "learning", "learned", "change", "changes", "changing", "changed",
+    "lead", "leads", "leading", "led", "understand", "understands", "understanding", "understood",
+    "watch", "watches", "watching", "watched", "follow", "follows", "following", "followed",
+    "stop", "stops", "stopping", "stopped", "create", "creates", "creating", "created",
+    "speak", "speaks", "speaking", "spoke", "spoken", "read", "reads", "reading",
+    "allow", "allows", "allowing", "allowed", "add", "adds", "adding", "added",
+    "spend", "spends", "spending", "spent", "grow", "grows", "growing", "grew", "grown",
+    "open", "opens", "opening", "opened", "walk", "walks", "walking", "walked",
+    "win", "wins", "winning", "won", "offer", "offers", "offering", "offered",
+    "remember", "remembers", "remembering", "remembered", "consider", "considers", "considering", "considered",
+    "appear", "appears", "appearing", "appeared", "buy", "buys", "buying", "bought",
+    "wait", "waits", "waiting", "waited", "send", "sends", "sending", "sent",
+    "build", "builds", "building", "built", "stay", "stays", "staying", "stayed",
+    "cut", "cuts", "cutting", "reach", "reaches", "reaching", "reached",
+    "remain", "remains", "remaining", "remained", "suggest", "suggests", "suggesting", "suggested",
+    "update", "updates", "updating", "updated", "fix", "fixes", "fixing", "fixed",
+    "optimize", "optimizes", "optimizing", "optimized", "mess", "messes", "messing", "messed",
+    // German function words, pronouns, articles, prepositions, conjunctions, auxiliaries, modals, verbs, adverbs, adjectives
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "mich", "dich", "sich", "uns", "euch", "mir", "dir", "ihm", "ihnen",
+    "mein", "meine", "meinen", "meinem", "meiner", "meines",
+    "dein", "deine", "deinen", "deinem", "deiner", "deines",
+    "sein", "seine", "seinen", "seinem", "seiner", "seines",
+    "unser", "unsere", "unseren", "unserem", "unserer", "unseres",
+    "euer", "eure", "euren", "eurem", "eurer",
+    "dies", "diese", "dieser", "dieses", "diesen", "diesem",
+    "jener", "jene", "jenes", "jenen", "jenem",
+    "welche", "welcher", "welches", "welchen", "welchem",
+    "jeder", "jede", "jedes", "jeden", "jedem",
+    "wer", "was", "wo", "wann", "warum", "wie", "wohin", "woher", "womit", "wofür", "worüber", "wodurch", "woran", "worauf",
+    "man", "jemand", "niemand", "etwas", "nichts", "alles", "alle", "allen", "aller", "allem",
+    "viele", "vielen", "vieler", "viel", "wenig", "wenige", "wenigen", "einige", "einigen", "manche", "manchen",
+    "andere", "anderen", "anderer", "anderem", "anderes", "beide", "beiden",
+    "kein", "keine", "keinen", "keinem", "keiner", "keines",
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "eines",
+    "und", "oder", "aber", "denn", "sondern", "doch", "jedoch", "weil", "da", "dass", "sodass",
+    "ob", "wenn", "als", "falls", "sofern", "sobald", "solange", "bevor", "ehe", "nachdem", "während",
+    "indem", "damit", "obwohl", "obgleich", "trotzdem", "deshalb", "deswegen", "darum", "daher",
+    "sonst", "außerdem", "zudem", "sowie", "weder", "noch", "entweder", "je", "desto", "umso", "zumal",
+    "in", "im", "ins", "an", "am", "ans", "auf", "aufs", "für", "fürs", "mit", "von", "vom",
+    "zu", "zum", "zur", "bei", "beim", "nach", "aus", "über", "unter", "vor", "hinter", "neben",
+    "zwischen", "durch", "gegen", "ohne", "um", "ums", "wider", "seit", "trotz", "wegen",
+    "statt", "anstatt", "außer", "entlang", "gegenüber", "gemäß", "laut", "zufolge", "ab", "bis", "pro", "per",
+    "ist", "sind", "war", "waren", "gewesen", "bin", "bist", "seid", "sei", "seien", "wäre", "wären",
+    "wird", "werden", "wurde", "wurden", "geworden", "würde", "würden",
+    "hat", "haben", "hatte", "hatten", "gehabt", "habe", "hast", "habt", "hätte", "hätten",
+    "kann", "können", "konnte", "konnten", "gekonnt", "ре", "kanst", "kannst", "könnt", "könnte", "könnten",
+    "muss", "müssen", "musste", "mussten", "gemusst", "musst", "müsst", "müsste", "müssten",
+    "soll", "sollen", "sollte", "sollten", "gesollt", "sollst", "sollt",
+    "will", "wollen", "wollte", "wollten", "gewollt", "willst", "wollt",
+    "darf", "dürfen", "durfte", "durften", "gedurft", "darfst", "dürft", "dürfte", "dürften",
+    "mag", "mögen", "mochte", "mochten", "gemocht", "möchte", "möchten", "möchtest",
+    "nicht", "auch", "noch", "schon", "erst", "nur", "sehr", "ganz", "recht", "ziemlich", "etwa",
+    "fast", "kaum", "vielleicht", "wahrscheinlich", "natürlich", "eigentlich", "wirklich", "immer",
+    "nie", "niemals", "oft", "manchmal", "meistens", "heute", "morgen", "gestern", "jetzt", "nun",
+    "dann", "danach", "dabei", "dafür", "dagegen", "dahin", "damit", "daneben", "darauf", "daran",
+    "darin", "darüber", "darunter", "davon", "davor", "dazu", "dazwischen", "hier", "dort", "gerade",
+    "gleich", "eben", "mal", "ja", "nein", "wohl", "ebenfalls", "besonders", "insbesondere",
+    "vorbei", "weiter", "wieder", "zurück", "zusammen", "allein", "alleine", "bereit", "fertig",
+    "gut", "besser", "besten", "schlecht", "schlechter", "neu", "neue", "neuen", "neuer", "neues", "neuem",
+    "alt", "alte", "alten", "alter", "altes", "groß", "große", "großen", "großer", "großes",
+    "klein", "kleine", "kleinen", "kleiner", "kleines", "lang", "lange", "langen", "kurz", "kurze", "kurzen",
+    "erste", "ersten", "erster", "erstes", "letzte", "letzten", "letzter", "letztes",
+    "nächste", "nächsten", "nächster", "nächstes", "eigene", "eigenen", "eigener", "eigenes",
+    "gleiche", "gleichen", "ganze", "ganzen", "aktuelle", "aktuellen", "wichtig", "wichtige", "wichtigen",
+    "möglich", "mögliche", "möglichen", "schnell", "schneller", "langsam", "einfach", "automatisch", "sofort",
+    "mache", "machst", "macht", "machen", "gemacht", "gehe", "gehst", "geht", "gehen", "gegangen",
+    "komme", "kommst", "kommt", "kommen", "gekommen", "sehe", "siehst", "sieht", "sehen", "gesehen",
+    "sage", "sagst", "sagt", "sagen", "gesagt", "gebe", "gibst", "gibt", "geben", "gegeben",
+    "nehme", "nimmst", "nimmt", "nehmen", "genommen", "finde", "findest", "findet", "finden", "gefunden",
+    "bleibe", "bleibst", "bleibt", "bleiben", "geblieben", "lasse", "lässt", "lassen", "gelassen",
+    "stehe", "stehst", "steht", "stehen", "gestanden", "liege", "liegst", "liegt", "liegen", "gelegen",
+    "fahre", "fährst", "fährt", "fahren", "gefahren", "arbeite", "arbeitest", "arbeitet", "arbeiten", "gearbeitet",
+    "spreche", "sprichst", "spricht", "sprechen", "gesprochen", "laufe", "läufst", "läuft", "laufen", "gelaufen",
+    "versuche", "versuchst", "versucht", "versuchen", "funktioniere", "funktioniert", "funktionieren",
+    "teste", "testest", "testet", "testen", "getestet", "nutze", "nutzt", "nutzen", "genutzt",
+    "brauche", "brauchst", "braucht", "brauchen", "gebraucht", "denke", "denkst", "denkt", "denken", "gedacht",
+    "glaube", "glaubst", "glaubt", "glauben", "weiß", "weißt", "wissen", "gewusst",
+    // Romance / Dutch common continuation words
+    "et", "ou", "mais", "donc", "car", "ni", "que", "qui", "quoi", "dont", "où", "si", "comme", "quand",
+    "parce", "puisque", "lorsque", "quoique", "pour", "dans", "sur", "sous", "avec", "sans", "chez",
+    "vers", "contre", "entre", "par", "de", "du", "des", "au", "aux", "le", "la", "les", "un", "une",
+    "ce", "cet", "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses",
+    "notre", "nos", "votre", "vos", "leur", "leurs", "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+    "est", "sont", "pas", "plus", "très", "bien", "aussi", "encore", "déjà", "toujours", "jamais",
+    "y", "e", "o", "u", "pero", "sino", "porque", "pues", "aunque", "cuando", "donde", "como",
+    "para", "por", "con", "sin", "sobre", "hacia", "hasta", "desde", "según", "durante", "mediante",
+    "el", "los", "las", "una", "unos", "unas", "este", "esta", "estos", "estas", "ese", "esa", "esos", "esas",
+    "mi", "mis", "tus", "su", "sus", "también", "ya", "muy", "más", "menos",
+    "ma", "perché", "sebbene", "quando", "dove", "anche", "non", "più", "molto", "il", "lo", "gli", "uno",
+    "mas", "embora", "onde", "não", "também", "muito", "mais", "os", "as", "um", "uma",
+    "en", "maar", "want", "omdat", "hoewel", "dat", "dit", "deze", "het", "een", "voor", "met", "van", "aan", "op", "uit", "niet", "ook"
+)
+
+/**
+ * Common proper nouns in English/European languages that must stay capitalized even mid-sentence when
+ * `!isGerman` allows general mid-sentence lowercasing.
+ */
+private val PROPER_NOUNS_KEEP_CAPITALIZED = setOf(
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "june", "july", "august", "september", "october", "november", "december",
+    "english", "german", "french", "spanish", "italian", "portuguese", "dutch", "russian", "polish",
+    "chinese", "japanese", "korean", "arabic", "hindi", "turkish",
+    "america", "american", "europe", "european", "germany", "france", "spain", "italy", "england", "britain", "british",
+    "google", "android", "apple", "microsoft", "windows", "linux", "github", "openflow", "voz", "litert", "qualcomm", "snapdragon", "samsung", "pixel"
+)
+
+private fun shouldLowercaseMidSentenceToken(
+    firstToken: String,
+    secondToken: String?,
+    lastPrevWord: String,
+    isGerman: Boolean,
+    allowGeneralEnglishLowercase: Boolean,
+    customVocabLower: Set<String>
+): Boolean {
+    val core = extractWordCore(firstToken)
+    if (core.isEmpty()) return false
+    val lower = core.lowercase(Locale.ROOT)
+    if (lower in customVocabLower) return false
+    // Never lowercase English "I" or contractions "I'm", "I've", "I'll", "I'd"
+    if (core == "I" || core.startsWith("I'") || core.startsWith("I’")) return false
+    // Never lowercase acronyms or CamelCase words (uppercase letter after index 0)
+    for (idx in 1 until core.length) {
+        if (core[idx].isUpperCase()) return false
+    }
+    if (!core[0].isUpperCase()) return false
+
+    if (lower in LOWERCASEABLE_CONTINUATION_WORDS) return true
+
+    if (isGerman) {
+        // In German, if the previous chunk ended with an article/possessive ("der", "die", "das", "ein", "im")
+        // and this word has an inflected adjective ending ("-en", "-em", "-er", "-es", "-e") followed by a
+        // capitalized German noun, then this word is an attributive adjective and should be lowercase.
+        if (lastPrevWord in GERMAN_ARTICLE_OR_POSSESSIVE_WORDS && secondToken != null) {
+            val secondCore = extractWordCore(secondToken)
+            val hasAdjectiveSuffix = lower.endsWith("en") || lower.endsWith("em") ||
+                lower.endsWith("er") || lower.endsWith("es") || lower.endsWith("e")
+            if (hasAdjectiveSuffix && secondCore.isNotEmpty() && secondCore[0].isUpperCase()) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // In non-German languages (e.g. English), ordinary nouns/gerunds/verbs ("chunking", "text", "bubble")
+    // are lowercase mid-sentence unless they are proper nouns.
+    if (allowGeneralEnglishLowercase && lower !in PROPER_NOUNS_KEEP_CAPITALIZED) {
+        return true
+    }
+    return false
+}
+
+private fun lowercaseFirstLetterOfToken(token: String): String {
+    val idx = token.indexOfFirst { it.isLetter() }
+    if (idx < 0 || !token[idx].isUpperCase()) return token
+    return token.substring(0, idx) + token[idx].lowercaseChar() + token.substring(idx + 1)
+}
+
+/**
+ * Stitches the transcripts of sequential audio chunks (from either live pause-chunking or offline
+ * auto-chunking) into a single, grammatically continuous transcript.
+ *
+ * Solves the root causes of chunked text degradation:
+ * 1. **Boundary Word Deduplication:** Deduplicates 1- or 2-word stutters/overlaps across chunk cuts
+ *    (e.g. `"so that."` + `"That the chunking"` -> `"so that the chunking"`).
+ * 2. **Dangling Non-Terminal Word Repair:** When Chunk $N$ ends on an article, preposition, conjunction,
+ *    or auxiliary (`"the."`, `"to."`, `"that."`, `"and."`, `"der."`, `"die."`, `"weil."`), strips the
+ *    synthetic period `.` added by `Voz` and lowercases the continuation in Chunk $N+1$.
+ * 3. **Clause-Continuation Punctuation & Casing Reconciliation:** When Chunk $N$ ends with `.` and
+ *    Chunk $N+1$ begins with a coordinating or subordinating continuation (`"And ..."`, `"Because ..."`,
+ *    `"Or ..."`, `"Which ..."`, `"But ..."`, `"Und ..."`, `"Weil ..."`, `"Dass ..."`), removes or converts
+ *    the synthetic `.` to `,` and lowercases the connector while preserving legitimate multi-sentence
+ *    boundaries and German noun capitalization.
+ */
+fun stitchChunkTranscripts(
+    chunks: List<String>,
+    language: String? = null,
+    customVocabulary: List<String> = emptyList()
+): String {
+    if (chunks.isEmpty()) return ""
+    val isGerman = language?.lowercase(Locale.ROOT)?.startsWith("de") == true
+    val customVocabLower = if (customVocabulary.isEmpty()) {
+        emptySet()
+    } else {
+        customVocabulary.mapNotNull { term ->
+            val clean = extractWordCore(term.trim()).lowercase(Locale.ROOT)
+            clean.ifEmpty { null }
+        }.toSet()
+    }
+
+    val cleanedChunks = ArrayList<String>(chunks.size)
+    for (raw in chunks) {
+        val norm = normalizeTranscriptText(raw, capitalizeLeadingWord = false)
+        if (norm.any { it.isLetterOrDigit() }) {
+            cleanedChunks.add(norm)
+        }
+    }
+    if (cleanedChunks.isEmpty()) return ""
+    if (cleanedChunks.size == 1) {
+        val single = normalizeTranscriptText(cleanedChunks[0], capitalizeLeadingWord = true)
+        return applyCustomVocabulary(single, customVocabulary)
+    }
+
+    var accumulated = normalizeTranscriptText(cleanedChunks[0], capitalizeLeadingWord = true)
+    for (idx in 1 until cleanedChunks.size) {
+        accumulated = mergeTwoChunkTranscripts(
+            prev = accumulated,
+            next = cleanedChunks[idx],
+            isGerman = isGerman,
+            customVocabLower = customVocabLower
+        )
+    }
+
+    val finalNormalized = normalizeTranscriptText(accumulated, capitalizeLeadingWord = true)
+    return applyCustomVocabulary(finalNormalized, customVocabulary)
+}
+
+private fun mergeTwoChunkTranscripts(
+    prev: String,
+    next: String,
+    isGerman: Boolean,
+    customVocabLower: Set<String>
+): String {
+    var prevTrimmed = prev.trim()
+    val nextTrimmed = next.trim()
+    if (prevTrimmed.isEmpty()) return nextTrimmed
+    if (nextTrimmed.isEmpty()) return prevTrimmed
+
+    val prevTokens = prevTrimmed.split(MULTI_SPACE_REGEX).toMutableList()
+    val nextTokens = nextTrimmed.split(MULTI_SPACE_REGEX).toMutableList()
+    if (prevTokens.isEmpty()) return nextTrimmed
+    if (nextTokens.isEmpty()) return prevTrimmed
+
+    // 1. Check 2-word boundary repetition (e.g. "... to the." + "To the store.")
+    if (prevTokens.size >= 2 && nextTokens.size >= 2) {
+        val prevCore1 = extractWordCore(prevTokens[prevTokens.size - 2]).lowercase(Locale.ROOT)
+        val prevCore2 = extractWordCore(prevTokens[prevTokens.size - 1]).lowercase(Locale.ROOT)
+        val nextCore1 = extractWordCore(nextTokens[0]).lowercase(Locale.ROOT)
+        val nextCore2 = extractWordCore(nextTokens[1]).lowercase(Locale.ROOT)
+        if (prevCore1.isNotEmpty() && prevCore2.isNotEmpty() &&
+            prevCore1 == nextCore1 && prevCore2 == nextCore2
+        ) {
+            val secondNextTrailingPunct = nextTokens[1].takeLastWhile { !it.isLetterOrDigit() }
+            nextTokens.removeAt(0)
+            nextTokens.removeAt(0)
+            val strippedLastPrev = prevTokens.last().dropLastWhile { it in ".,!?;:-–—" }
+            prevTokens[prevTokens.lastIndex] = if (nextTokens.isEmpty() && secondNextTrailingPunct.isNotEmpty()) {
+                strippedLastPrev + secondNextTrailingPunct
+            } else {
+                strippedLastPrev
+            }
+            if (nextTokens.isEmpty()) {
+                return prevTokens.joinToString(" ")
+            }
+            prevTrimmed = prevTokens.joinToString(" ")
+        }
+    }
+
+    // 2. Check 1-word boundary repetition (e.g. "... so that." + "That the chunking...")
+    val lastPrevCore = extractWordCore(prevTokens.last()).lowercase(Locale.ROOT)
+    val firstNextCore = extractWordCore(nextTokens.first()).lowercase(Locale.ROOT)
+    if (lastPrevCore.isNotEmpty() && lastPrevCore == firstNextCore) {
+        val dupNextTrailingPunct = nextTokens.first().takeLastWhile { !it.isLetterOrDigit() }
+        nextTokens.removeAt(0)
+        val strippedLastPrev = prevTokens.last().dropLastWhile { it in ".,!?;:-–—" }
+        prevTokens[prevTokens.lastIndex] = if (nextTokens.isEmpty() && dupNextTrailingPunct.isNotEmpty()) {
+            strippedLastPrev + dupNextTrailingPunct
+        } else {
+            strippedLastPrev
+        }
+        if (nextTokens.isEmpty()) {
+            return prevTokens.joinToString(" ")
+        }
+        prevTrimmed = prevTokens.joinToString(" ")
+    }
+
+    val updatedLastPrevCore = extractWordCore(prevTokens.last()).lowercase(Locale.ROOT)
+    val firstNextToken = nextTokens[0]
+    val firstNextWord = extractWordCore(firstNextToken).lowercase(Locale.ROOT)
+    val secondNextToken = nextTokens.getOrNull(1)
+    val secondNextWord = secondNextToken?.let { extractWordCore(it).lowercase(Locale.ROOT) } ?: ""
+
+    val prevEndsWithPeriod = prevTrimmed.endsWith(".") && !prevTrimmed.endsWith("...")
+    val prevEndsWithTerminal = prevEndsWithPeriod ||
+        prevTrimmed.endsWith("!") ||
+        prevTrimmed.endsWith("?") ||
+        prevTrimmed.endsWith("…") ||
+        prevTrimmed.endsWith("...")
+
+    // Case A: Previous chunk ends on a dangling word ("the.", "to.", "that.", "and.", "der.", "weil.")
+    if (updatedLastPrevCore in DANGLING_CHUNK_END_WORDS) {
+        val cleanedPrev = prevTrimmed.dropLastWhile { it in ".,!?;:-–—" }
+        if (shouldLowercaseMidSentenceToken(
+                firstToken = firstNextToken,
+                secondToken = secondNextToken,
+                lastPrevWord = updatedLastPrevCore,
+                isGerman = isGerman,
+                allowGeneralEnglishLowercase = true,
+                customVocabLower = customVocabLower
+            )
+        ) {
+            nextTokens[0] = lowercaseFirstLetterOfToken(firstNextToken)
+        }
+        return "$cleanedPrev ${nextTokens.joinToString(" ")}"
+    }
+
+    // Case B: Previous chunk does NOT end with terminal sentence punctuation (ends with bare word or `,`, `;`, `:`, `-`)
+    if (!prevEndsWithTerminal) {
+        val cleanedPrev = if (prevTrimmed.endsWith(",") && updatedLastPrevCore in NO_COMMA_AFTER_WORDS) {
+            prevTrimmed.dropLast(1)
+        } else {
+            prevTrimmed
+        }
+        if (shouldLowercaseMidSentenceToken(
+                firstToken = firstNextToken,
+                secondToken = secondNextToken,
+                lastPrevWord = updatedLastPrevCore,
+                isGerman = isGerman,
+                allowGeneralEnglishLowercase = true,
+                customVocabLower = customVocabLower
+            )
+        ) {
+            nextTokens[0] = lowercaseFirstLetterOfToken(firstNextToken)
+        }
+        return "$cleanedPrev ${nextTokens.joinToString(" ")}"
+    }
+
+    // Case C: Previous chunk ends with a synthetic `.` and next chunk begins with a clause-continuation connector
+    if (prevEndsWithPeriod && firstNextWord !in customVocabLower) {
+        val isTwoWordNoCommaConnector =
+            (firstNextWord == "so" && secondNextWord == "that") ||
+                (firstNextWord == "as" && secondNextWord == "well") ||
+                (firstNextWord == "in" && secondNextWord == "order") ||
+                (firstNextWord == "or" && secondNextWord == "at")
+        val isThatContinuation = firstNextWord == "that" && secondNextWord in THAT_CLAUSE_FOLLOWERS
+        val isToInfinitiveContinuation = firstNextWord == "to" && secondNextWord in TO_INFINITIVE_FOLLOWERS
+        val isForContinuation = firstNextWord == "for" &&
+            secondNextWord.isNotEmpty() &&
+            secondNextWord != "example" &&
+            secondNextWord != "instance" &&
+            !firstNextToken.endsWith(",")
+
+        val isNoCommaContinuation = firstNextWord in NO_COMMA_CONTINUATION_CONNECTORS ||
+            isTwoWordNoCommaConnector ||
+            isThatContinuation ||
+            isToInfinitiveContinuation ||
+            isForContinuation
+
+        val isTwoWordCommaConnector =
+            (firstNextWord == "even" && secondNextWord == "though") ||
+                (firstNextWord == "such" && secondNextWord == "as") ||
+                (firstNextWord == "vor" && secondNextWord == "allem")
+        val isGermanDaSubordinate = isGerman && firstNextWord == "da" && secondNextWord in GERMAN_DA_SUBORDINATE_FOLLOWERS
+
+        val isCommaContinuation = !isNoCommaContinuation && (
+            firstNextWord in COMMA_CONTINUATION_CONNECTORS ||
+                isTwoWordCommaConnector ||
+                isGermanDaSubordinate
+            )
+
+        if (isNoCommaContinuation) {
+            val prevWithoutPeriod = prevTrimmed.dropLast(1)
+            nextTokens[0] = lowercaseFirstLetterOfToken(firstNextToken)
+            return "$prevWithoutPeriod ${nextTokens.joinToString(" ")}"
+        }
+
+        if (isCommaContinuation) {
+            val prevWithComma = prevTrimmed.dropLast(1) + ","
+            nextTokens[0] = lowercaseFirstLetterOfToken(firstNextToken)
+            return "$prevWithComma ${nextTokens.joinToString(" ")}"
+        }
+    }
+
+    return "$prevTrimmed ${nextTokens.joinToString(" ")}"
 }
 
 /**

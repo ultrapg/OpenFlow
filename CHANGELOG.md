@@ -2,6 +2,22 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.2] - 2026-10-22
+
+### Improved
+- **Seamless Cross-Chunk Transcript Stitching (`stitchChunkTranscripts` in `SmartPipeline`, `StreamingDictationSession`):**
+  - Reconciles synthetic periods (`.`) and mid-sentence capitalization that `Voz` inserts when a single spoken sentence is split across multiple live or offline chunks.
+  - Repairs dangling non-terminal chunk endings (articles, prepositions, conjunctions, and degree adverbs such as `"the."`, `"to."`, `"that."`, `"and."`, `"der."`, `"die."`, `"weil."`) and reconnects coordinating, subordinating, and relative clause continuations (`and`, `or`, `because`, `which`, `but`, `that`, `und`, `weil`, `dass`, `aber`, etc.) while preserving German noun capitalization and genuine multi-sentence boundaries.
+  - Deduplicates 1- and 2-word stutters/overlaps across chunk boundaries.
+- **Hesitation & Filler Cleanup (`reconcileTranscript`, `normalizeTranscriptText`):**
+  - Automatically removes unambiguous vocal hesitation tokens (`"uh"`, `"uhm"`, `"erm"`, `"äh"`, `"ähm"`, `"hm"`, `"hmm"`) and cleans up filler-induced commas on preceding function words (`"so that, uh, the"` -> `"so that the"`), even when the optional `Uhm` model is disabled.
+- **Acoustic Boundary Protection (`AudioChunking`, `AudioRecordingController`, `SmartPipeline`):**
+  - Added dual-threshold hysteresis speech hangover in `buildSilenceMask` so soft word-initial consonants and word-final fricative/nasal tails (`s`, `t`, `f`, `k`, `n`, `m`) are never classified as silence or clipped by a split.
+  - Added both-sided silence cushioning on live cuts (`240 ms` trailing silence on the outgoing chunk and `200 ms` leading silence retained inside the pause for the next chunk without duplicating any speech samples), plus `prepareChunkForInference` (`200 ms` silence runway and `10 ms` linear edge tapers) to eliminate STFT window boundary clicks.
+  - Skips post-pause silent or button-tap-only tail buffers in `StreamingDictationSession.finish()` (`hasUsableSpeech`), eliminating stop-tap hallucinations and post-stop delay.
+- **Tuned Default Chunking Settings (`DictationChunkSettings`):**
+  - Updated default pause to **650 ms** (with fine 50 ms slider steps) and minimum live chunk length to **5 s** so brief mid-clause hesitations stay inside a single phrase window.
+
 ## [2.6.1] - 2026-10-22
 
 ### Added
