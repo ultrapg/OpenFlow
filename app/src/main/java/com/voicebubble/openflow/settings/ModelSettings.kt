@@ -115,7 +115,6 @@ enum class HardwareAccelerator(
  */
 data class ModelSettings(
     val earEnabled: Boolean = true,
-    val vozQuantization: VozQuantization = VozQuantization.FP16,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -126,19 +125,21 @@ data class ModelSettings(
     val vozEnabled: Boolean = true
 
     /**
-     * Active disk footprint in MB based on currently enabled models and `Voz` quantization.
+     * Active disk footprint in MB based on currently enabled models:
+     * - `Voz`: 1,187 MB
+     * - `Ear`: +10 MB
      */
     val activeDiskFootprintMb: Int
-        get() = vozQuantization.diskSizeMb +
+        get() = DesertAntModel.VOZ.sizeMb +
             (if (earEnabled) DesertAntModel.EAR.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on loaded LiteRT model weights (`Voz` quantization + `Ear`) + runtime buffers:
-     * - `Voz` (`FP16`: 1,400 MB, `INT8_HYBRID`: 860 MB, `INT8`: 820 MB)
+     * Estimated peak RAM in MB based on loaded LiteRT model weights (`Voz` + `Ear`) + runtime buffers:
+     * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      */
     val estimatedPeakRamMb: Int
-        get() = vozQuantization.estimatedVozRamMb + (if (earEnabled) 50 else 0)
+        get() = 1400 + (if (earEnabled) 50 else 0)
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
         DesertAntModel.VOZ -> true
@@ -153,7 +154,6 @@ data class ModelSettings(
     companion object {
         const val PREFS_NAME = "openflow_model_settings"
         const val KEY_EAR_ENABLED = "ear_enabled"
-        const val KEY_VOZ_QUANTIZATION = "voz_quantization"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -179,13 +179,9 @@ data class ModelSettings(
             val accel = HardwareAccelerator.fromId(
                 prefs.getString(KEY_HARDWARE_ACCELERATOR, HardwareAccelerator.AUTO.id)
             )
-            val quant = VozQuantization.fromId(
-                prefs.getString(KEY_VOZ_QUANTIZATION, VozQuantization.FP16.id)
-            )
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
-                vozQuantization = quant,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel
@@ -209,7 +205,6 @@ data class ModelSettings(
 
             getPreferences(context).edit()
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
-                .putString(KEY_VOZ_QUANTIZATION, settings.vozQuantization.id)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
@@ -313,19 +308,6 @@ object DesertAntModelStorage {
     }
 
     /**
-     * Returns `true` if [actualLength] matches either the original FP16 size of [artifact]
-     * or the valid INT8 quantized size for `encoder.tflite` / `decoder.tflite`.
-     */
-    fun isValidArtifactSize(artifact: ModelFileArtifact, actualLength: Long): Boolean {
-        if (actualLength == artifact.sizeBytes) return true
-        return when (artifact.relativePath) {
-            "encoder.tflite" -> actualLength == VozQuantization.INT8.encoderSizeBytes
-            "decoder.tflite" -> actualLength == VozQuantization.INT8.decoderSizeBytes
-            else -> false
-        }
-    }
-
-    /**
      * If this APK is the Offline-Bundled build containing pre-packaged model files under
      * `assets/desert-ant-models/`, extracts any missing model files and `.dal-meta/manifest`
      * into `context.cacheDir/desert-ant-models/<id>/<revision>` automatically.
@@ -395,7 +377,7 @@ object DesertAntModelStorage {
 
     /**
      * Fast, non-blocking O(1) check that verifies whether all required model artifacts exist
-     * on disk with their exact expected byte sizes (FP16 or INT8 quantized) and no incomplete `.part` files.
+     * on disk with their exact expected byte sizes and no incomplete `.part` files.
      *
      * Critically, this does NOT instantiate native `Voz`/`Ear` JNI objects, avoiding
      * `ModelStore`'s 1.2 GB pure-Swift `SoftwareSHA256` memory spike on UI/background threads.
@@ -430,7 +412,6 @@ object DesertAntModelStorage {
 
     /**
      * Pure directory completeness check testable without Android Context.
-     * Accepts both original FP16 and quantized INT8 sizes for `encoder.tflite` / `decoder.tflite`.
      */
     fun isModelDirectoryComplete(targetDir: File, artifacts: List<ModelFileArtifact>): Boolean {
         if (!targetDir.exists() || !targetDir.isDirectory || artifacts.isEmpty()) {
@@ -439,33 +420,28 @@ object DesertAntModelStorage {
         }
         val manifestFile = File(File(targetDir, ".dal-meta"), "manifest")
         val dirKey = targetDir.absolutePath
-        val cached = directoryCompleteCache[dirKey]
-        if (cached != null) {
-            val dirLastMod = targetDir.lastModified()
-            if (dirLastMod > 0L && dirLastMod == cached.first && artifacts.size.toLong() == cached.second) {
-                return true
+        if (manifestFile.exists() && manifestFile.length() > 0L) {
+            val cached = directoryCompleteCache[dirKey]
+            if (cached != null) {
+                val dirLastMod = targetDir.lastModified()
+                if (dirLastMod > 0L && dirLastMod == cached.first && artifacts.size.toLong() == cached.second) {
+                    return true
+                }
             }
         }
-
-        var hasQuantizedArtifact = false
         for (artifact in artifacts) {
             val finalFile = File(targetDir, artifact.relativePath)
             val partFile = File(targetDir, "${artifact.relativePath}.part")
-            val quantPartFile = File(targetDir, "${artifact.relativePath}.quant.part")
-            val dequantPartFile = File(targetDir, "${artifact.relativePath}.dequant.part")
-            if (partFile.exists() || quantPartFile.exists() || dequantPartFile.exists()) {
+            if (partFile.exists()) {
                 directoryCompleteCache.remove(dirKey)
                 return false
             }
-            if (!finalFile.exists() || !finalFile.isFile || !isValidArtifactSize(artifact, finalFile.length())) {
+            if (!finalFile.exists() || !finalFile.isFile || finalFile.length() != artifact.sizeBytes) {
                 directoryCompleteCache.remove(dirKey)
                 return false
-            }
-            if (finalFile.length() != artifact.sizeBytes) {
-                hasQuantizedArtifact = true
             }
         }
-        if (!hasQuantizedArtifact && !manifestFile.exists()) {
+        if (!manifestFile.exists()) {
             try {
                 writeModelManifest(targetDir, artifacts)
             } catch (_: Throwable) {
@@ -494,7 +470,7 @@ object DesertAntModelStorage {
         val finalFile = File(targetDir, artifact.relativePath)
         val partFile = File(targetDir, "${artifact.relativePath}.part")
         if (partFile.exists()) return false
-        if (!finalFile.exists() || !finalFile.isFile || !isValidArtifactSize(artifact, finalFile.length())) {
+        if (!finalFile.exists() || !finalFile.isFile || finalFile.length() != artifact.sizeBytes) {
             return false
         }
         val stampFile = File(targetDir, VERIFIED_STAMP_FILE)
@@ -513,7 +489,7 @@ object DesertAntModelStorage {
     @Synchronized
     fun markArtifactVerified(targetDir: File, artifact: ModelFileArtifact) {
         val finalFile = File(targetDir, artifact.relativePath)
-        if (!finalFile.exists()) return
+        if (!finalFile.exists() || finalFile.length() != artifact.sizeBytes) return
         try {
             val stampFile = File(targetDir, VERIFIED_STAMP_FILE)
             val prefix = "${artifact.relativePath}\t"
@@ -544,23 +520,15 @@ object DesertAntModelStorage {
     }
 
     /**
-     * Writes `.dal-meta/manifest` (when unquantized) and `.openflow_verified` for all [artifacts] in [targetDir].
+     * Writes `.dal-meta/manifest` and `.openflow_verified` for all [artifacts] in [targetDir]
+     * after their SHA-256 hashes have been verified.
      */
     @Synchronized
     fun writeModelManifestAndStamp(targetDir: File, artifacts: List<ModelFileArtifact>) {
-        val anyQuantized = artifacts.any { artifact ->
-            val f = File(targetDir, artifact.relativePath)
-            f.exists() && f.length() != artifact.sizeBytes && isValidArtifactSize(artifact, f.length())
-        }
-        if (anyQuantized) {
-            val metaDir = File(targetDir, ".dal-meta")
-            if (metaDir.exists()) metaDir.deleteRecursively()
-        } else {
-            writeModelManifest(targetDir, artifacts)
-        }
+        writeModelManifest(targetDir, artifacts)
         val stampLines = artifacts.mapNotNull { artifact ->
             val f = File(targetDir, artifact.relativePath)
-            if (f.exists() && isValidArtifactSize(artifact, f.length())) {
+            if (f.exists() && f.length() == artifact.sizeBytes) {
                 artifactStampLine(f, artifact)
             } else {
                 null

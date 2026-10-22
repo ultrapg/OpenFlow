@@ -256,7 +256,7 @@ object ModelDownloadManager {
             val finalFile = File(modelDir, artifact.relativePath)
             val partFile = File(modelDir, "${artifact.relativePath}.part")
             sum += when {
-                finalFile.exists() && DesertAntModelStorage.isValidArtifactSize(artifact, finalFile.length()) -> artifact.sizeBytes
+                finalFile.exists() && finalFile.length() == artifact.sizeBytes -> artifact.sizeBytes
                 partFile.exists() -> min(partFile.length(), artifact.sizeBytes)
                 else -> 0L
             }
@@ -563,9 +563,9 @@ object ModelDownloadManager {
             val finalFile = File(targetDir, artifact.relativePath)
             val partFile = File(targetDir, "${artifact.relativePath}.part")
 
-            if (finalFile.exists() && DesertAntModelStorage.isValidArtifactSize(artifact, finalFile.length())) {
+            if (finalFile.exists() && finalFile.length() == artifact.sizeBytes) {
                 if (DesertAntModelStorage.isArtifactAlreadyVerified(targetDir, artifact) ||
-                    (finalFile.length() == artifact.sizeBytes && verifySha256Incremental(finalFile, artifact.sha256))
+                    verifySha256Incremental(finalFile, artifact.sha256)
                 ) {
                     DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
                     completedArtifactBytes += artifact.sizeBytes
@@ -599,10 +599,6 @@ object ModelDownloadManager {
             completedArtifactBytes += artifact.sizeBytes
         }
 
-        if (model == DesertAntModel.VOZ) {
-            val targetQuant = ModelSettings.load(context).vozQuantization
-            VozTfliteQuantizer.ensureVozDirectoryQuantization(targetDir, targetQuant)
-        }
         DesertAntModelStorage.writeModelManifestAndStamp(targetDir, artifacts)
         onProgress(1.0f)
     }
@@ -630,30 +626,28 @@ object ModelDownloadManager {
             val partFile = File(targetDir, "${artifact.relativePath}.part")
 
             // Fast path: if finalFile already exists with matching size and verified stamp, skip in 0ms
-            if (finalFile.exists() && DesertAntModelStorage.isValidArtifactSize(artifact, finalFile.length())) {
+            if (finalFile.exists() && finalFile.length() == artifact.sizeBytes) {
                 if (DesertAntModelStorage.isArtifactAlreadyVerified(targetDir, artifact)) {
                     completedBytesInModel += artifact.sizeBytes
                     continue
                 }
-                if (finalFile.length() == artifact.sizeBytes) {
-                    val isValid = verifySha256Incremental(
-                        file = finalFile,
-                        expectedHex = artifact.sha256,
-                        onVerifyProgress = { pct ->
-                            updateState {
-                                copy(
-                                    activeModel = model,
-                                    currentFileName = artifact.relativePath,
-                                    statusNote = "Verifying cached ${artifact.relativePath} ($pct%)..."
-                                )
-                            }
+                val isValid = verifySha256Incremental(
+                    file = finalFile,
+                    expectedHex = artifact.sha256,
+                    onVerifyProgress = { pct ->
+                        updateState {
+                            copy(
+                                activeModel = model,
+                                currentFileName = artifact.relativePath,
+                                statusNote = "Verifying cached ${artifact.relativePath} ($pct%)..."
+                            )
                         }
-                    )
-                    if (isValid) {
-                        DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
-                        completedBytesInModel += artifact.sizeBytes
-                        continue
                     }
+                )
+                if (isValid) {
+                    DesertAntModelStorage.markArtifactVerified(targetDir, artifact)
+                    completedBytesInModel += artifact.sizeBytes
+                    continue
                 }
                 finalFile.delete()
             }
@@ -714,24 +708,7 @@ object ModelDownloadManager {
             statuses[model] = ModelQueueStatus.DOWNLOADING
         }
 
-        if (model == DesertAntModel.VOZ) {
-            val targetQuant = ModelSettings.load(context).vozQuantization
-            if (targetQuant != VozQuantization.FP16) {
-                statuses[model] = ModelQueueStatus.VERIFYING
-                VozTfliteQuantizer.ensureVozDirectoryQuantization(targetDir, targetQuant) { note ->
-                    updateState {
-                        copy(
-                            activeModel = model,
-                            currentFileName = "encoder.tflite",
-                            statusNote = note,
-                            modelStatuses = statuses.toMap()
-                        )
-                    }
-                }
-            }
-        }
-
-        // Write DAL1 manifest (when unquantized) and .openflow_verified stamp
+        // Write DAL1 manifest and .openflow_verified stamp
         DesertAntModelStorage.writeModelManifestAndStamp(targetDir, artifacts)
 
         if (!DesertAntModelStorage.isModelDownloaded(context, model)) {

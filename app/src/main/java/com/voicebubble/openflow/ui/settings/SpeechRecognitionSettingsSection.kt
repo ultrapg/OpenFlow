@@ -88,7 +88,6 @@ import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
-import com.voicebubble.openflow.settings.VozQuantization
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -505,90 +504,6 @@ fun SpeechRecognitionSettingsSection(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text("Resume Download")
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3b. Voz Model Quantization Selector (FP16 / INT8 Hybrid / INT8)
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant
-            )
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                val isConvertingQuant = pipelineStatus.phase == PipelinePhase.LOADING ||
-                    pipelineStatus.phase == PipelinePhase.WARMING_UP ||
-                    pipelineStatus.phase == PipelinePhase.TRANSCRIBING
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Voz Model Quantization",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = "Active precision: ${settings.vozQuantization.displayName} (~${settings.vozQuantization.estimatedDiskMb} MB active • ~${settings.vozQuantization.estimatedRamMb} MB RAM)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Text(
-                            text = "Converts Voz TFLite weights on-device offline without re-downloading.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Icon(
-                        imageVector = Icons.Default.Memory,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                VozQuantization.entries.forEach { quant ->
-                    val selected = settings.vozQuantization == quant
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable(enabled = !isConvertingQuant && !downloadState.isRunning) {
-                                if (!selected) {
-                                    persistAndReload(settings.copy(vozQuantization = quant))
-                                }
-                            }
-                            .padding(vertical = 4.dp, horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = selected,
-                            enabled = !isConvertingQuant && !downloadState.isRunning,
-                            onClick = {
-                                if (!selected) {
-                                    persistAndReload(settings.copy(vozQuantization = quant))
-                                }
-                            }
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "${quant.displayName} (~${quant.estimatedDiskMb} MB active • ~${quant.estimatedRamMb} MB RAM)",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-                            )
-                            Text(
-                                text = quant.description,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
                         }
                     }
                 }

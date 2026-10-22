@@ -2,6 +2,12 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.6] - 2026-10-22
+
+### Removed
+- **Removed Experimental `Voz` Quantization (`VozTfliteQuantizer`, `ModelSettings`, `SmartPipeline`, `OnboardingScreen`, `SpeechRecognitionSettingsSection`):**
+  - Removed the `Voz` quantization selector (`FP16` / `INT8 Hybrid` / `INT8`) and `VozTfliteQuantizer`, keeping the native original `Voz` FP16 model weights for maximum transcription accuracy and native `DAL1` manifest integrity.
+
 ## [2.6.5] - 2026-10-22
 
 ### Added

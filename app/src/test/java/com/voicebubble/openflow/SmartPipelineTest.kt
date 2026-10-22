@@ -20,8 +20,6 @@ import ai.desertant.voz.Transcription
 import ai.desertant.voz.Word
 import com.voicebubble.openflow.core.speech.reconcileTranscript
 import com.voicebubble.openflow.settings.ModelSettings
-import com.voicebubble.openflow.settings.VozQuantization
-import com.voicebubble.openflow.settings.VozTfliteQuantizer
 import com.voicebubble.openflow.settings.supportedLanguages
 import ai.desertant.voz.Voz
 import org.junit.Assert.assertEquals
@@ -96,29 +94,16 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `ModelSettings toggle and VozQuantization state matrix calculates RAM and disk accurately`() {
-        assertEquals(1450, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.FP16).estimatedPeakRamMb)
-        assertEquals(1197, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.FP16).activeDiskFootprintMb)
+    fun `ModelSettings toggle state matrix calculates RAM and disk accurately`() {
+        assertEquals(1450, ModelSettings(earEnabled = true).estimatedPeakRamMb)
+        assertEquals(1197, ModelSettings(earEnabled = true).activeDiskFootprintMb)
 
-        assertEquals(1400, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.FP16).estimatedPeakRamMb)
-        assertEquals(1187, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.FP16).activeDiskFootprintMb)
-
-        assertEquals(910, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.INT8_HYBRID).estimatedPeakRamMb)
-        assertEquals(640, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.INT8_HYBRID).activeDiskFootprintMb)
-
-        assertEquals(860, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.INT8_HYBRID).estimatedPeakRamMb)
-        assertEquals(630, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.INT8_HYBRID).activeDiskFootprintMb)
-
-        assertEquals(870, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.INT8).estimatedPeakRamMb)
-        assertEquals(628, ModelSettings(earEnabled = true, vozQuantization = VozQuantization.INT8).activeDiskFootprintMb)
-
-        assertEquals(820, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.INT8).estimatedPeakRamMb)
-        assertEquals(618, ModelSettings(earEnabled = false, vozQuantization = VozQuantization.INT8).activeDiskFootprintMb)
+        assertEquals(1400, ModelSettings(earEnabled = false).estimatedPeakRamMb)
+        assertEquals(1187, ModelSettings(earEnabled = false).activeDiskFootprintMb)
 
         val defaultSettings = ModelSettings()
         assertTrue(defaultSettings.vozEnabled)
         assertTrue(defaultSettings.earEnabled)
-        assertEquals(VozQuantization.FP16, defaultSettings.vozQuantization)
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
 
@@ -132,22 +117,6 @@ class SmartPipelineTest {
 
         assertEquals(25, Voz.supportedLanguages.size)
         assertTrue("de" in Voz.supportedLanguages && "en" in Voz.supportedLanguages)
-    }
-
-    @Test
-    fun `VozQuantization and VozTfliteQuantizer FP16 conversions work accurately`() {
-        assertEquals(VozQuantization.FP16, VozQuantization.fromId("fp16"))
-        assertEquals(VozQuantization.INT8_HYBRID, VozQuantization.fromId("int8_hybrid"))
-        assertEquals(VozQuantization.INT8, VozQuantization.fromId("int8"))
-        assertEquals(VozQuantization.FP16, VozQuantization.fromId("unknown"))
-        assertEquals(VozQuantization.FP16, VozQuantization.fromId(null))
-
-        val testFloats = floatArrayOf(0.0f, -0.0f, 1.0f, -1.0f, 0.25f, -0.125f, 3.5f, -12.75f)
-        for (value in testFloats) {
-            val bits = VozTfliteQuantizer.floatToHalf(value)
-            val roundTrip = VozTfliteQuantizer.halfToFloat(bits)
-            assertEquals(value, roundTrip, 1e-3f)
-        }
     }
 
     @Test

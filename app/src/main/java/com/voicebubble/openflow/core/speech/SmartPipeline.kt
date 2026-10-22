@@ -31,10 +31,7 @@ import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DictationChunkSettings
 import com.voicebubble.openflow.settings.HardwareAccelerator
-import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
-import com.voicebubble.openflow.settings.VozQuantization
-import com.voicebubble.openflow.settings.VozTfliteQuantizer
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -134,7 +131,6 @@ data class MemoryPressureReport(
 data class PipelineStatus(
     val phase: PipelinePhase = PipelinePhase.UNINITIALIZED,
     val configuredAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
-    val configuredQuantization: VozQuantization = VozQuantization.FP16,
     val activeAcceleratorLabel: String = "Auto (NPU / GPU / CPU)",
     val detectedNpuSummary: String = NpuHardwareManager.detectHardwareProfile().summaryLabel,
     val dynamicLoadingMode: String = "Adaptive Stage Management",
@@ -158,7 +154,7 @@ data class PipelineStatus(
 /**
  * Orchestrates the Desert Ant Labs on-device audio AI pipeline:
  * 1. `Ear` — Spoken language identification (optional)
- * 2. `Voz` — Multilingual speech-to-text across 25 European languages (`FP16`, `INT8_HYBRID`, or `INT8`)
+ * 2. `Voz` — Multilingual speech-to-text across 25 European languages
  * 3. Cross-chunk stitching & custom vocabulary normalization
  */
 class SmartPipeline(
@@ -202,7 +198,6 @@ class SmartPipeline(
         private set
 
     private var appliedAccelerator: HardwareAccelerator? = null
-    private var appliedQuantization: VozQuantization? = null
     private var appliedLowMemoryMode: Boolean? = null
     private var appliedSettingsSnapshot: ModelSettings? = null
     private var lastForcedGcAtMs: Long = 0L
@@ -221,7 +216,6 @@ class SmartPipeline(
     private val _pipelineStatus = MutableStateFlow(
         PipelineStatus(
             configuredAccelerator = initialSettings.hardwareAccelerator,
-            configuredQuantization = initialSettings.vozQuantization,
             activeAcceleratorLabel = activeAcceleratorDescription,
             detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             enabledCount = initialSettings.enabledModels().size
@@ -249,17 +243,15 @@ class SmartPipeline(
         pipelineMutex.withLock {
             val currentSettings = settings
             val accelUnchanged = appliedAccelerator == currentSettings.hardwareAccelerator
-            val quantUnchanged = appliedQuantization == currentSettings.vozQuantization
             val alreadyReady = !forceReload &&
                 accelUnchanged &&
-                quantUnchanged &&
                 voz != null &&
                 (!warmUp || vozWarmedUp) &&
                 areEnabledModelsReadyOrStandbyLocked(currentSettings)
 
             if (alreadyReady) {
                 val count = countLoadedModelsLocked(currentSettings)
-                val msg = "$count/${currentSettings.enabledModels().size} models ready in RAM (${currentSettings.vozQuantization.shortLabel} • $activeAcceleratorDescription)"
+                val msg = "$count/${currentSettings.enabledModels().size} models ready in RAM ($activeAcceleratorDescription)"
                 updateStatusSnapshot(
                     activeSettings = currentSettings,
                     phaseOverride = PipelinePhase.READY,
@@ -269,11 +261,6 @@ class SmartPipeline(
                 return@withLock true
             }
 
-            if (!quantUnchanged && voz != null) {
-                closeVozLocked()
-                System.gc()
-            }
-
             val startMs = SystemClock.elapsedRealtime()
             val memReport = evaluateMemoryPressure()
             applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator, memReport.isAnyMemoryTight)
@@ -281,15 +268,14 @@ class SmartPipeline(
             DebugLogManager.logInfo(
                 TAG,
                 "initialize(warmUp=$warmUp) start • enabled=${currentSettings.enabledModels().map { it.id }} • " +
-                    "quant=${currentSettings.vozQuantization.id} • accel=$activeAcceleratorDescription • " +
-                    "npu=${NpuHardwareManager.detectHardwareProfile().summaryLabel}",
+                    "accel=$activeAcceleratorDescription • npu=${NpuHardwareManager.detectHardwareProfile().summaryLabel}",
                 includeMemory = true
             )
 
             updateStatusSnapshot(
                 activeSettings = currentSettings,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Loading enabled models (${currentSettings.vozQuantization.shortLabel} on $activeAcceleratorDescription)..."
+                messageOverride = "Loading enabled models ($activeAcceleratorDescription)..."
             )
 
             val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
@@ -308,7 +294,7 @@ class SmartPipeline(
             val finalMsg = when (finalPhase) {
                 PipelinePhase.READY -> {
                     val count = countLoadedModelsLocked(currentSettings)
-                    "$count/${currentSettings.enabledModels().size} models ready (${currentSettings.vozQuantization.shortLabel} • $activeAcceleratorDescription)"
+                    "$count/${currentSettings.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 }
                 PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
                 else -> "Failed to load Voz speech model"
@@ -357,22 +343,20 @@ class SmartPipeline(
     }
 
     /**
-     * Updates [settings] immediately and synchronizes loaded models, quantization & hardware accelerator under [pipelineMutex].
+     * Updates [settings] immediately and synchronizes loaded models & hardware accelerator under [pipelineMutex].
      */
     suspend fun reloadSettings(newSettings: ModelSettings) = withContext(Dispatchers.Default) {
         settings = newSettings
         pipelineMutex.withLock {
             val snapshot = settings
             val accelChanged = appliedAccelerator != null && appliedAccelerator != snapshot.hardwareAccelerator
-            val quantChanged = appliedQuantization != null && appliedQuantization != snapshot.vozQuantization
             if (!accelChanged &&
-                !quantChanged &&
                 appliedSettingsSnapshot == snapshot &&
                 voz != null &&
                 areEnabledModelsReadyOrStandbyLocked(snapshot)
             ) {
                 val count = countLoadedModelsLocked(snapshot)
-                val msg = "$count/${snapshot.enabledModels().size} models ready (${snapshot.vozQuantization.shortLabel} • $activeAcceleratorDescription)"
+                val msg = "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 updateStatusSnapshot(
                     activeSettings = snapshot,
                     phaseOverride = PipelinePhase.READY,
@@ -385,19 +369,14 @@ class SmartPipeline(
             val memReport = evaluateMemoryPressure()
             applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
 
-            if (accelChanged || quantChanged) {
-                Log.i(
-                    TAG,
-                    "Pipeline config changed (accel=${snapshot.hardwareAccelerator.displayName}, quant=${snapshot.vozQuantization.displayName}); reloading sessions."
-                )
+            if (accelChanged) {
+                Log.i(TAG, "Hardware accelerator changed to ${snapshot.hardwareAccelerator.displayName}; reloading sessions.")
                 DebugLogManager.logInfo(
                     TAG,
-                    "Pipeline config changed (accel=${snapshot.hardwareAccelerator.id}, quant=${snapshot.vozQuantization.id}); closing active sessions",
+                    "Hardware accelerator changed to ${snapshot.hardwareAccelerator.id}; closing active sessions",
                     includeMemory = true
                 )
-                if (accelChanged) {
-                    closeEarLocked()
-                }
+                closeEarLocked()
                 closeVozLocked()
                 System.gc()
             } else {
@@ -407,7 +386,7 @@ class SmartPipeline(
             updateStatusSnapshot(
                 activeSettings = snapshot,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Updating model pipeline (${snapshot.vozQuantization.shortLabel} • $activeAcceleratorDescription)..."
+                messageOverride = "Updating model pipeline ($activeAcceleratorDescription)..."
             )
 
             val vozOk = ensureVozLocked(snapshot, warmUp = true)
@@ -418,7 +397,7 @@ class SmartPipeline(
             val phase = if (vozOk) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
             val count = countLoadedModelsLocked(snapshot)
             val msg = if (vozOk) {
-                "$count/${snapshot.enabledModels().size} models ready (${snapshot.vozQuantization.shortLabel} • $activeAcceleratorDescription)"
+                "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
             } else {
                 "Waiting for model download"
             }
@@ -498,7 +477,7 @@ class SmartPipeline(
                 DebugLogManager.logInfo(
                     TAG,
                     "transcribe() start • raw=${samples.size}, trimmed=${trimmedSamples.size} (${audioDurationMs}ms), " +
-                        "chunks=${audioChunks.size}, quant=${activeSettings.vozQuantization.id}, criticalStaging=$dynamicStageRelease, " +
+                        "chunks=${audioChunks.size}, criticalStaging=$dynamicStageRelease, " +
                         "jvmFree=${initialMem.jvmFreeHeadroomMb}MB, sysAvail=${initialMem.systemAvailMb}MB",
                     includeMemory = true
                 )
@@ -605,7 +584,7 @@ class SmartPipeline(
                 updateStatusSnapshot(
                     activeSettings = snap,
                     phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models ready (${snap.vozQuantization.shortLabel} • $activeAcceleratorDescription)"
+                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 )
                 resetIdleEvictionTimerLocked()
             }
@@ -790,11 +769,9 @@ class SmartPipeline(
         }
 
         val earInstance = ear ?: run {
-            val earDirFile = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR)
-            val legacyDalMeta = File(earDirFile, ".dal-meta")
-            if (legacyDalMeta.exists()) legacyDalMeta.deleteRecursively()
+            val earDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR).absolutePath
             try {
-                Ear(appContext, earDirFile.absolutePath).also { ear = it }
+                Ear(appContext, earDir).also { ear = it }
             } catch (t: Throwable) {
                 DebugLogManager.logWarn(TAG, "Failed to dynamically load Ear: ${t.message}")
                 return fallbackLanguage
@@ -936,48 +913,17 @@ class SmartPipeline(
                 if (mem.isJvmHeapTight) {
                     System.gc()
                 }
-                val vozDirFile = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.VOZ)
-                VozTfliteQuantizer.ensureVozDirectoryQuantization(
-                    vozDir = vozDirFile,
-                    targetQuantization = activeSettings.vozQuantization
-                ) { statusNote ->
-                    updateSingleModelStateLocked(
-                        activeSettings = activeSettings,
-                        model = DesertAntModel.VOZ,
-                        state = ModelLoadState.LOADING,
-                        message = statusNote
-                    )
-                }
-                val vozArtifacts = ModelDownloadManager.MODEL_SPECS[DesertAntModel.VOZ]?.second
-                if (vozArtifacts != null) {
-                    DesertAntModelStorage.writeModelManifestAndStamp(vozDirFile, vozArtifacts)
-                }
-                // Remove .dal-meta before Voz(appContext, vozDir) so native ModelDistribution.userPlacedFiles
-                // loads immediately in 0ms without allocating a 1.2 GB Swift SoftwareSHA256 buffer.
-                val legacyDalMeta = File(vozDirFile, ".dal-meta")
-                if (legacyDalMeta.exists()) {
-                    legacyDalMeta.deleteRecursively()
-                }
-
                 updateSingleModelStateLocked(
                     activeSettings = activeSettings,
                     model = DesertAntModel.VOZ,
                     state = ModelLoadState.LOADING,
-                    message = "Loading Voz (${activeSettings.vozQuantization.shortLabel}) speech model..."
+                    message = "Loading Voz speech recognition model..."
                 )
-                DebugLogManager.logInfo(
-                    TAG,
-                    "Loading Voz (${activeSettings.vozQuantization.id}) native model into RAM...",
-                    includeMemory = true
-                )
-                voz = Voz(appContext, vozDirFile.absolutePath)
-                appliedQuantization = activeSettings.vozQuantization
+                DebugLogManager.logInfo(TAG, "Loading Voz native model into RAM...", includeMemory = true)
+                val vozDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.VOZ).absolutePath
+                voz = Voz(appContext, vozDir)
                 vozWarmedUp = false
-                DebugLogManager.logInfo(
-                    TAG,
-                    "Voz (${activeSettings.vozQuantization.id}) native model loaded into RAM",
-                    includeMemory = true
-                )
+                DebugLogManager.logInfo(TAG, "Voz native model loaded into RAM", includeMemory = true)
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to initialize Voz: ${t.message}", t)
                 DebugLogManager.logError(TAG, "Failed to initialize Voz native model", t)
@@ -993,7 +939,7 @@ class SmartPipeline(
                     activeSettings = activeSettings,
                     model = DesertAntModel.VOZ,
                     state = ModelLoadState.LOADING,
-                    message = "Warming up Voz (${activeSettings.vozQuantization.shortLabel}) on $activeAcceleratorDescription..."
+                    message = "Warming up Voz on $activeAcceleratorDescription..."
                 )
                 val warmupSilence = FloatArray(3_200) // 200 ms silent frame
                 currentVoz.transcribe(samples = warmupSilence, sampleRate = SAMPLE_RATE_HZ)
@@ -1028,10 +974,8 @@ class SmartPipeline(
                         state = ModelLoadState.LOADING,
                         message = "Loading Ear language detector..."
                     )
-                    val earDirFile = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR)
-                    val legacyDalMeta = File(earDirFile, ".dal-meta")
-                    if (legacyDalMeta.exists()) legacyDalMeta.deleteRecursively()
-                    ear = Ear(appContext, earDirFile.absolutePath)
+                    val earDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.EAR).absolutePath
+                    ear = Ear(appContext, earDir)
                     earWarmedUp = false
                     DebugLogManager.logInfo(TAG, "Ear model loaded into RAM", includeMemory = true)
                 } catch (t: Throwable) {
@@ -1117,7 +1061,6 @@ class SmartPipeline(
         _pipelineStatus.value = _pipelineStatus.value.copy(
             phase = if (state == ModelLoadState.ACTIVE) PipelinePhase.TRANSCRIBING else PipelinePhase.LOADING,
             configuredAccelerator = activeSettings.hardwareAccelerator,
-            configuredQuantization = activeSettings.vozQuantization,
             activeAcceleratorLabel = activeAcceleratorDescription,
             detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             modelStates = map,
@@ -1157,7 +1100,6 @@ class SmartPipeline(
         _pipelineStatus.value = _pipelineStatus.value.copy(
             phase = resolvedPhase,
             configuredAccelerator = activeSettings.hardwareAccelerator,
-            configuredQuantization = activeSettings.vozQuantization,
             activeAcceleratorLabel = activeAcceleratorDescription,
             detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
             modelStates = states,
@@ -1179,7 +1121,6 @@ class SmartPipeline(
         val instance = voz
         voz = null
         vozWarmedUp = false
-        appliedQuantization = null
         if (instance != null) {
             try {
                 instance.close()
