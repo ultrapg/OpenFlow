@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.0] - 2026-10-22
+
+### Added
+- **Transcribe while still recording (`StreamingDictationSession`, `AudioChunking`, `AudioRecordingController`):** a live pause detector watches the microphone buffer; as soon as a pause is detected the finished chunk is cut out of the recording buffer and sent to the pipeline right away. After you stop, only the final chunk is left to process, so long dictations feel almost instant. Chunks are transcribed strictly in order by a single worker, finished audio is removed from the live buffer (no extra RAM, and recordings are no longer capped by the 5-minute buffer), language identification runs once per dictation, and a chunk that fails is retried once after the tail instead of being lost.
+- **Dictation Chunking settings (`DictationChunkingSettings`, Settings screen):** toggle live transcription, pause length (0.25-2 s), minimum live chunk length (2-15 s), maximum chunk length (8-30 s, also used by offline auto-chunking), silence level, and "detect language once per dictation". Takes effect on the next dictation, with a reset-to-defaults button.
+
+### Improved
+- **Better auto-chunking (`splitAudioIntoSmartChunks`):** cuts now use an adaptive noise-floor silence threshold, prefer the longest real pause (latest of the comparably long ones for bigger chunks) and cut at the centre of the pause; previously the first quietest 80 ms window was used, which on digital silence always cut at the start of the pause. Falls back to the quietest window only when no pause exists.
+- Wake lock for a dictation raised from 3 to 10 minutes to match long live dictations.
+
 ## [2.5.9] - 2026-10-22
 
 ### Fixed

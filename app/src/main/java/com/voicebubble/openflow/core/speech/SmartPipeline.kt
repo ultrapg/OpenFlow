@@ -36,6 +36,7 @@ import android.util.Log
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
+import com.voicebubble.openflow.settings.DictationChunkSettings
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
@@ -457,7 +458,9 @@ class SmartPipeline(
      */
     suspend fun transcribe(
         samples: FloatArray,
-        onStageProgress: ((String) -> Unit)? = null
+        onStageProgress: ((String) -> Unit)? = null,
+        languageHint: String? = null,
+        onLanguageResolved: ((String) -> Unit)? = null
     ): String = withContext(Dispatchers.Default) {
         if (samples.isEmpty()) return@withContext ""
 
@@ -481,21 +484,24 @@ class SmartPipeline(
                 )
 
                 val dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, initialMem)
+                // User-configurable chunk limit (default 20 s); low-memory devices are additionally capped.
+                val chunkSettings = DictationChunkSettings.load(appContext)
                 val maxChunkSamples = if (initialMem.isAnyMemoryTight) {
-                    LOW_MEM_MAX_CHUNK_SAMPLES
+                    min(chunkSettings.maxChunkSamples, LOW_MEM_MAX_CHUNK_SAMPLES)
                 } else {
-                    DEFAULT_MAX_CHUNK_SAMPLES
+                    chunkSettings.maxChunkSamples
                 }
                 val minChunkSamples = if (initialMem.isAnyMemoryTight) {
-                    LOW_MEM_MIN_CHUNK_SAMPLES
+                    min(chunkSettings.offlineMinChunkSamples, LOW_MEM_MIN_CHUNK_SAMPLES)
                 } else {
-                    DEFAULT_MIN_CHUNK_SAMPLES
+                    chunkSettings.offlineMinChunkSamples
                 }
 
                 val audioChunks = splitAudioIntoSmartChunks(
                     samples = trimmedSamples,
                     maxChunkSamples = maxChunkSamples,
-                    minChunkSamples = minChunkSamples
+                    minChunkSamples = minChunkSamples,
+                    silenceThreshold = chunkSettings.silenceThreshold
                 )
 
                 DebugLogManager.logInfo(
@@ -513,11 +519,13 @@ class SmartPipeline(
                 // =========================================================================
                 // Stage 1: Spoken Language Identification (`Ear`) on a bounded 5.5s slice
                 // =========================================================================
-                val resolvedLanguage = resolveLanguageLocked(
-                    samples = audioChunks.first(),
-                    activeSettings = activeSettings,
-                    onStageProgress = onStageProgress
-                )
+                val resolvedLanguage = languageHint?.takeIf { it in Voz.supportedLanguages }
+                    ?: resolveLanguageLocked(
+                        samples = audioChunks.first(),
+                        activeSettings = activeSettings,
+                        onStageProgress = onStageProgress
+                    )
+                onLanguageResolved?.invoke(resolvedLanguage)
                 if (dynamicStageRelease && ear != null) {
                     DebugLogManager.logInfo(TAG, "Critical memory staging: releasing Ear session before heavy stages")
                     closeEarLocked()
@@ -1454,8 +1462,12 @@ inline fun enhanceAudioInSingleWindowSlices(
 }
 
 /**
- * Splits a long 16 kHz PCM [samples] buffer into natural speech segments of at most [maxChunkSamples]
- * by locating the lowest-energy 80 ms pause window within `minChunkSamples..maxChunkSamples`.
+ * Splits a long 16 kHz PCM [samples] buffer into natural speech segments of at most [maxChunkSamples].
+ *
+ * Each cut is placed by [findBestSplitPoint] inside `minChunkSamples..maxChunkSamples`: it prefers the
+ * longest real pause (adaptive noise-floor threshold, cut at the centre of the pause, latest of the
+ * comparably long pauses) and only falls back to the quietest 80 ms window if no pause exists. A minimum
+ * 0.5 s tail is always preserved so no orphan chunk is produced.
  *
  * This prevents quadratic Conformer attention memory blowups and JNI/FFI array OOMs on long dictations
  * while ensuring splits never cut through the middle of a spoken syllable.
@@ -1464,17 +1476,17 @@ fun splitAudioIntoSmartChunks(
     samples: FloatArray,
     maxChunkSamples: Int = SmartPipeline.DEFAULT_MAX_CHUNK_SAMPLES,
     minChunkSamples: Int = SmartPipeline.DEFAULT_MIN_CHUNK_SAMPLES,
-    pauseWindowSamples: Int = 1_280 // 80 ms @ 16 kHz
+    pauseWindowSamples: Int = 1_280, // minimum pause length (80 ms @ 16 kHz)
+    silenceThreshold: Float = DEFAULT_SILENCE_RMS
 ): List<FloatArray> {
     if (samples.isEmpty()) return emptyList()
     val safeMax = max(3_200, maxChunkSamples)
     if (samples.size <= safeMax) return listOf(samples)
 
     val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
-    val window = pauseWindowSamples.coerceIn(320, 3_200)
-    val step = max(160, window / 4)
+    val minPauseFrames = max(2, pauseWindowSamples.coerceIn(320, 16_000) / CHUNK_FRAME_SAMPLES)
     // Never leave a sub-second orphan tail: a few hundred samples fed to Clear/Voz yields hallucinated or empty text.
-    // Bounded by (safeMax - safeMin) so the split window below can never become empty.
+    // Bounded by (safeMax - safeMin) so the split range below can never become empty.
     val minTailSamples = min(8_000, safeMax - safeMin)
     val chunks = mutableListOf<FloatArray>()
 
@@ -1488,22 +1500,10 @@ fun splitAudioIntoSmartChunks(
 
         val searchStart = cursor + safeMin
         val latestSplit = min(cursor + safeMax, samples.size - minTailSamples)
-        val searchEnd = min(samples.size - window, latestSplit)
-        var bestSplitIndex = latestSplit
-        var lowestEnergy = Double.MAX_VALUE
-
-        var pos = searchStart
-        while (pos <= searchEnd) {
-            var energy = 0.0
-            for (i in 0 until window) {
-                val s = samples[pos + i].toDouble()
-                energy += s * s
-            }
-            if (energy < lowestEnergy) {
-                lowestEnergy = energy
-                bestSplitIndex = pos + (window / 2)
-            }
-            pos += step
+        val bestSplitIndex = if (searchStart < latestSplit) {
+            findBestSplitPoint(samples, searchStart, latestSplit, silenceThreshold, minPauseFrames)
+        } else {
+            latestSplit
         }
 
         val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, latestSplit)

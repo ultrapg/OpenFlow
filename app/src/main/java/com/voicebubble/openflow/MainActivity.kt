@@ -52,6 +52,7 @@ import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.ui.onboarding.OnboardingScreen
 import com.voicebubble.openflow.ui.settings.DeveloperModeSection
+import com.voicebubble.openflow.ui.settings.DictationChunkingSettingsSection
 import com.voicebubble.openflow.ui.settings.SpeechRecognitionSettingsSection
 import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 
@@ -184,9 +185,9 @@ class MainActivity : ComponentActivity() {
                             val isDeveloperModeUnlocked by DebugLogManager.isUnlocked.collectAsState()
                             val appVersionName = remember {
                                 try {
-                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.5.9"
+                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.6.0"
                                 } catch (_: Throwable) {
-                                    "2.5.9"
+                                    "2.6.0"
                                 }
                             }
                             var versionTapCount by remember { mutableIntStateOf(0) }
@@ -380,6 +381,10 @@ class MainActivity : ComponentActivity() {
                                     modelSettings = updated
                                 }
                             )
+
+                            Spacer(modifier = Modifier.height(24.dp))
+
+                            DictationChunkingSettingsSection()
 
                             Spacer(modifier = Modifier.height(24.dp))
 

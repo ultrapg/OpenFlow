@@ -7,6 +7,8 @@ import android.media.MediaRecorder
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import com.voicebubble.openflow.core.debug.DebugLogManager
+import com.voicebubble.openflow.core.speech.findStreamingCut
+import com.voicebubble.openflow.settings.DictationChunkSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -215,6 +217,37 @@ class AudioRecordingController {
                 }
             }
             true
+        }
+    }
+
+    /**
+     * Live "transcribe while recording" support: asks the pause detector whether the audio captured so far
+     * contains a finished chunk (see [findStreamingCut]). If so, the chunk is **removed** from the live
+     * buffer and returned, so each sample is only ever held once (no extra RAM) and [stopRecording] later
+     * returns just the remaining tail. Chunks without usable speech (long leading silence) are discarded and
+     * `null` is returned.
+     */
+    fun extractStreamingChunk(config: DictationChunkSettings): FloatArray? {
+        synchronized(bufferLock) {
+            val buf = pcmBuffer ?: return null
+            val size = pcmSize
+            val cut = findStreamingCut(buf, size, config) ?: return null
+            val index = cut.index.coerceIn(0, size)
+            if (index <= 0) return null
+            val chunk = if (cut.hasSpeech) {
+                try {
+                    buf.copyOfRange(0, index)
+                } catch (_: OutOfMemoryError) {
+                    // Leave the audio in the live buffer; the tail/offline chunker still handles it at stop
+                    return null
+                }
+            } else {
+                null
+            }
+            val remaining = size - index
+            System.arraycopy(buf, index, buf, 0, remaining)
+            pcmSize = remaining
+            return chunk
         }
     }
 

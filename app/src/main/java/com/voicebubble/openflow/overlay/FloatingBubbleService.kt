@@ -65,6 +65,8 @@ import com.voicebubble.openflow.core.database.TranscriptionRecord
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.PipelineStatus
 import com.voicebubble.openflow.core.speech.SmartPipeline
+import com.voicebubble.openflow.core.speech.StreamingDictationSession
+import com.voicebubble.openflow.settings.DictationChunkSettings
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.ui.theme.OpenFlowTheme
 import kotlinx.coroutines.CoroutineScope
@@ -265,6 +267,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var dictationWakeLock: PowerManager.WakeLock? = null
+
+    /** Active "transcribe while recording" session, or `null` when live transcription is off / not recording. */
+    private var streamingSession: StreamingDictationSession? = null
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
@@ -498,6 +503,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             bubbleState.value = OverlayBubbleState.IDLE
             setKeepScreenOn(false)
             releaseDictationWakeLock()
+            streamingSession?.cancel()
+            streamingSession = null
             serviceScope.launch {
                 try {
                     audioController.stopRecording()
@@ -906,9 +913,31 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             setKeepScreenOn(true)
+
+                            // "Transcribe while recording": create the session now, start it before the mic so a very
+                            // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
+                            streamingSession?.cancel()
+                            val chunkSettings = DictationChunkSettings.load(this@FloatingBubbleService)
+                            val session = if (chunkSettings.liveTranscriptionEnabled) {
+                                StreamingDictationSession(
+                                    scope = serviceScope,
+                                    audio = audioController,
+                                    pipeline = smartPipeline,
+                                    config = chunkSettings,
+                                    onStageProgress = { stageLabel -> processingProgress.value = stageLabel }
+                                ).also {
+                                    streamingSession = it
+                                    it.start()
+                                }
+                            } else {
+                                streamingSession = null
+                                null
+                            }
                             serviceScope.launch {
                                 val started = audioController.startRecording(this)
                                 if (!started) {
+                                    session?.cancel()
+                                    if (streamingSession === session) streamingSession = null
                                     bubbleState.value = OverlayBubbleState.IDLE
                                     setKeepScreenOn(false)
                                     releaseDictationWakeLock()
@@ -925,9 +954,18 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         onStopRecording = {
                             bubbleState.value = OverlayBubbleState.PROCESSING
                             setKeepScreenOn(false)
+                            val session = streamingSession
+                            streamingSession = null
                             serviceScope.launch {
-                                val samples = audioController.stopRecording()
-                                processAudio(samples)
+                                if (session != null) {
+                                    // Stop looking for new pauses first so the tail below is the very last piece
+                                    session.stopPolling()
+                                    val tail = audioController.stopRecording()
+                                    processAudio(tail, session)
+                                } else {
+                                    val samples = audioController.stopRecording()
+                                    processAudio(samples)
+                                }
                             }
                         }
                     )
@@ -1006,7 +1044,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 "OpenFlow::DictationWakeLock"
             ).apply {
                 setReferenceCounted(false)
-                acquire(3 * 60 * 1000L) // 3-minute safety timeout per dictation
+                acquire(10 * 60 * 1000L) // 10-minute safety timeout per dictation (live chunking allows long dictations)
             }
         } catch (_: Throwable) {
         }
@@ -1036,16 +1074,38 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
-    private fun processAudio(samples: FloatArray) {
+    /**
+     * Transcribes and injects the dictation. With a live [session] the earlier chunks were already transcribed
+     * while recording, so [samples] is just the final tail and only that remains to process.
+     */
+    private fun processAudio(samples: FloatArray, session: StreamingDictationSession? = null) {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         serviceScope.launch {
             try {
                 processingProgress.value = ""
 
-                val chunkText = smartPipeline.transcribe(samples) { stageLabel ->
-                    processingProgress.value = stageLabel
+                val chunkText = if (session != null) {
+                    session.finish(samples).also {
+                        if (session.failedChunkCount > 0) {
+                            if (it.isBlank()) {
+                                throw IllegalStateException("${session.failedChunkCount} audio segment(s) could not be transcribed")
+                            }
+                            withContext(Dispatchers.Main) {
+                                android.widget.Toast.makeText(
+                                    this@FloatingBubbleService,
+                                    "${session.failedChunkCount} segment(s) could not be transcribed",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    }
+                } else {
+                    smartPipeline.transcribe(samples) { stageLabel ->
+                        processingProgress.value = stageLabel
+                    }
                 }
+                val totalSamples = session?.totalSamples ?: samples.size.toLong()
 
                 val finalText = chunkText.trim()
                     .replace(SPACE_BEFORE_PUNCT_REGEX, "$1")
@@ -1081,8 +1141,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         dao.insert(
                             TranscriptionRecord(
                                 transcribedText = finalText,
-                                durationMs = (samples.size / 16f).toLong(),
-                                audioSamplesCount = samples.size,
+                                durationMs = totalSamples / 16L,
+                                audioSamplesCount = totalSamples.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                                 modelIdentifier = "desert-ant-voz-4.0.0",
                                 wasInjectedSuccessfully = injected
                             )
@@ -1121,6 +1181,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             includeMemory = true
         )
         _isRunning.value = false
+        streamingSession?.cancel()
+        streamingSession = null
         unregisterScreenStateReceiver()
         releaseDictationWakeLock()
         try {
