@@ -308,4 +308,35 @@ class AudioChunkingTest {
         val spokenTail = concat(tone(0.1, silence), tone(0.25, speech), tone(0.1, silence))
         assertTrue(hasUsableSpeech(spokenTail))
     }
+
+    @Test
+    fun `stop closure and plosive release burst at the end of a word are bridged and never erased as a click`() {
+        // Word vowel (5 frames @ 0.16) + 3-frame stop closure (60 ms @ 0.001) + 1-frame -t/-k release burst (0.04)
+        // followed by true silence
+        val rms = floatArrayOf(
+            0.001f,
+            0.16f, 0.16f, 0.16f, 0.16f, 0.16f, // vowel core (frames 1..5)
+            0.001f, 0.001f, 0.001f,             // 60 ms stop closure (frames 6..8)
+            0.04f,                              // 20 ms plosive release burst -t / -k (frame 9)
+            0.0045f, 0.0040f,                   // soft aspirate tail (frames 10..11)
+            0.0005f, 0.0005f, 0.0005f           // true pause (frames 12..14)
+        )
+        val mask = buildSilenceMask(rms, 0.008f)
+        assertTrue("frame 0 is leading silence", mask[0])
+        for (f in 1..11) {
+            assertFalse("frame $f (vowel + stop closure + plosive release + aspirate tail) must be speech", mask[f])
+        }
+        assertTrue("pause must only begin at frame 12 after the plosive release and aspirate tail", mask[12])
+    }
+
+    @Test
+    fun `hasAnyTailSpeech accepts a short quiet final word while rejecting pure silence and single tap`() {
+        assertFalse(hasAnyTailSpeech(tone(0.4, silence)))
+        // 40 ms isolated tap in silence (even straddling frame boundaries at 0.15s) -> rejected
+        val tap = concat(tone(0.15, silence), tone(0.04, 0.25f), tone(0.2, silence))
+        assertFalse(hasAnyTailSpeech(tap))
+        // 90 ms quiet spoken final word ("it", "on", "ok") -> accepted so end of dictation is never dropped
+        val quietFinalWord = concat(tone(0.1, silence), tone(0.09, 0.005f), tone(0.15, silence))
+        assertTrue(hasAnyTailSpeech(quietFinalWord))
+    }
 }

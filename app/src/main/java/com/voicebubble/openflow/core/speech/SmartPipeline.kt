@@ -469,8 +469,13 @@ class SmartPipeline(
     ): String = withContext(Dispatchers.Default) {
         if (samples.isEmpty()) return@withContext ""
 
-        // Fast silence trim before acquiring native sessions
-        val trimmedSamples = trimLeadingAndTrailingSilence(samples)
+        // Fast silence trim before acquiring native sessions (uses a whisper-sensitive 0.0020f floor and 400 ms
+        // margin so soft trailing fricatives/plosives at the end of a dictation are never clipped).
+        val trimmedSamples = trimLeadingAndTrailingSilence(
+            samples = samples,
+            threshold = 0.0020f,
+            padSamples = 6_400
+        )
         if (trimmedSamples.isEmpty()) return@withContext ""
 
         val audioDurationMs = ((trimmedSamples.size.toDouble() / SAMPLE_RATE_HZ) * 1000.0).roundToLong()
@@ -545,10 +550,17 @@ class SmartPipeline(
 
                 for ((chunkIdx, rawChunk) in audioChunks.withIndex()) {
                     val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
-                    val preparedChunk = prepareChunkForInference(rawChunk)
+                    val preparedChunk = prepareChunkForInference(
+                        samples = rawChunk,
+                        minLeadSilencePadSamples = 5_120,
+                        minTailSilencePadSamples = 10_240,
+                        minTotalSamples = 25_600,
+                        edgeFadeSamples = 160,
+                        silenceThreshold = 0.0020f
+                    )
                     ensureMemoryHeadroomForFfiLocked(preparedChunk.size)
 
-                    // Stage 2A: Audio Enhancement (`Clear`)
+                    // Stage 2A: Audio Enhancement (`Clear` when enabled, or lightweight speech leveling when disabled)
                     val enhancedChunk = runClearStageLocked(
                         rawSamples = preparedChunk,
                         activeSettings = activeSettings,
@@ -801,9 +813,11 @@ class SmartPipeline(
         stageSuffix: String = "",
         onStageProgress: ((String) -> Unit)?
     ): FloatArray {
-        if (!activeSettings.clearEnabled) return rawSamples
+        if (!activeSettings.clearEnabled) {
+            return conditionAudioWhenClearDisabled(rawSamples)
+        }
         if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.CLEAR)) {
-            return rawSamples
+            return conditionAudioWhenClearDisabled(rawSamples)
         }
 
         val mem = evaluateMemoryPressure()
@@ -814,7 +828,7 @@ class SmartPipeline(
                 "Skipping Clear stage due to critical memory pressure (jvmFree=${mem.jvmFreeHeadroomMb}MB, sysAvail=${mem.systemAvailMb}MB)"
             )
             closeClearLocked()
-            return rawSamples
+            return conditionAudioWhenClearDisabled(rawSamples)
         }
 
         val clearInstance = clear ?: run {
@@ -824,7 +838,7 @@ class SmartPipeline(
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to create Clear instance: ${t.message}")
                 DebugLogManager.logWarn(TAG, "Failed to create Clear instance", t)
-                return rawSamples
+                return conditionAudioWhenClearDisabled(rawSamples)
             }
         }
 
@@ -857,13 +871,13 @@ class SmartPipeline(
             }
             clearWarmedUp = true
             DebugLogManager.logMemorySnapshot("After Clear.enhance$stageSuffix (${enhanced.size} samples)")
-            if (enhanced.isNotEmpty()) enhanced else rawSamples
+            if (enhanced.isNotEmpty()) enhanced else conditionAudioWhenClearDisabled(rawSamples)
         } catch (t: Throwable) {
-            Log.w(TAG, "Clear enhancement failed, falling back to raw PCM audio: ${t.message}")
-            DebugLogManager.logWarn(TAG, "Clear enhancement failed, falling back to raw PCM audio", t)
+            Log.w(TAG, "Clear enhancement failed, falling back to conditioned PCM audio: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Clear enhancement failed, falling back to conditioned PCM audio", t)
             closeClearLocked()
             System.gc()
-            rawSamples
+            conditionAudioWhenClearDisabled(rawSamples)
         }
     }
 
@@ -909,10 +923,15 @@ class SmartPipeline(
         return try {
             setModelActiveStatusLocked(activeSettings, DesertAntModel.EAR, "Detecting language with Ear...")
             onStageProgress?.invoke("Ear")
-            val earInput = if (samples.size > MAX_EAR_WINDOW_SAMPLES) {
+            val rawEarInput = if (samples.size > MAX_EAR_WINDOW_SAMPLES) {
                 samples.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
             } else {
                 samples
+            }
+            val earInput = if (!activeSettings.clearEnabled) {
+                conditionAudioWhenClearDisabled(rawEarInput)
+            } else {
+                rawEarInput
             }
             val detection = earInstance.identify(
                 samples = earInput,
@@ -1024,8 +1043,18 @@ class SmartPipeline(
                     rangeStart = samples.size / 3,
                     rangeEndExclusive = (samples.size * 2) / 3
                 ).coerceIn(samples.size / 3, (samples.size * 2) / 3)
-                val left = prepareChunkForInference(samples.copyOfRange(0, mid))
-                val right = prepareChunkForInference(samples.copyOfRange(mid, samples.size))
+                val left = prepareChunkForInference(
+                    samples = samples.copyOfRange(0, mid),
+                    minLeadSilencePadSamples = 5_120,
+                    minTailSilencePadSamples = 10_240,
+                    minTotalSamples = 25_600
+                )
+                val right = prepareChunkForInference(
+                    samples = samples.copyOfRange(mid, samples.size),
+                    minLeadSilencePadSamples = 5_120,
+                    minTailSilencePadSamples = 10_240,
+                    minTotalSamples = 25_600
+                )
                 val t1 = retryVoz.transcribeWithContext(left, SAMPLE_RATE_HZ, language, customVocabulary)
                 System.gc()
                 val t2 = retryVoz.transcribeWithContext(right, SAMPLE_RATE_HZ, language, customVocabulary)
@@ -1545,8 +1574,39 @@ fun prepareChunkForInference(
     edgeFadeSamples: Int = 160,
     silenceThreshold: Float = 0.004f
 ): FloatArray {
+    return prepareChunkForInference(
+        samples = samples,
+        minLeadSilencePadSamples = minSilencePadSamples,
+        minTailSilencePadSamples = minSilencePadSamples,
+        minTotalSamples = 0,
+        edgeFadeSamples = edgeFadeSamples,
+        silenceThreshold = silenceThreshold
+    )
+}
+
+/**
+ * Full Conformer-Transducer chunk preparation with asymmetric leading/trailing silence runway and minimum
+ * total length:
+ * - [minLeadSilencePadSamples] (`5,120` = `320 ms` = 4 Conformer frames) ensures the first word onset is
+ *   never clipped by convolutional subsampling.
+ * - [minTailSilencePadSamples] (`10,240` = `640 ms` = 8 Conformer frames) gives `Voz`'s Token-and-Duration
+ *   Transducer (TDT / RNN-T) full right-context lookahead after the final consonant so the last word of a
+ *   chunk or dictation is never truncated before emission.
+ * - [minTotalSamples] (`25,600` = `1.60 s` = 20 Conformer frames) pads short post-pause tail chunks with
+ *   extra trailing silence so the Conformer depthwise convolution kernel (`31 * 80 ms`) never starves on
+ *   short 1–2 word utterances.
+ */
+fun prepareChunkForInference(
+    samples: FloatArray,
+    minLeadSilencePadSamples: Int,
+    minTailSilencePadSamples: Int,
+    minTotalSamples: Int = 0,
+    edgeFadeSamples: Int = 160,
+    silenceThreshold: Float = 0.0020f
+): FloatArray {
     if (samples.isEmpty()) return samples
-    val safePad = minSilencePadSamples.coerceAtLeast(0)
+    val safeLeadPad = minLeadSilencePadSamples.coerceAtLeast(0)
+    val safeTailPad = minTailSilencePadSamples.coerceAtLeast(0)
     val safeFade = min(edgeFadeSamples.coerceAtLeast(0), samples.size / 4)
 
     var firstVoice = -1
@@ -1568,8 +1628,11 @@ fun prepareChunkForInference(
 
     val existingLeadSilence = firstVoice
     val existingTailSilence = (samples.size - 1 - lastVoice).coerceAtLeast(0)
-    val extraLead = (safePad - existingLeadSilence).coerceAtLeast(0)
-    val extraTail = (safePad - existingTailSilence).coerceAtLeast(0)
+    val extraLead = (safeLeadPad - existingLeadSilence).coerceAtLeast(0)
+    val baseExtraTail = (safeTailPad - existingTailSilence).coerceAtLeast(0)
+    val baseTotal = extraLead + samples.size + baseExtraTail
+    val extraMinLenTail = (minTotalSamples - baseTotal).coerceAtLeast(0)
+    val extraTail = baseExtraTail + extraMinLenTail
 
     if (extraLead == 0 && extraTail == 0 && safeFade == 0) {
         return samples
@@ -1587,6 +1650,164 @@ fun prepareChunkForInference(
     }
 
     return out
+}
+
+/**
+ * Fast (< 0.4 ms), zero-native-RAM speech conditioner used whenever the `Clear` neural enhancer is disabled
+ * (the default configuration!).
+ *
+ * Solves the root cause of sentence-final and chunk-final word dropouts when `Clear` is off:
+ * 1. **DC Offset Removal:** Centers raw microphone PCM around `0.0f` while preserving existing zero-padded
+ *    silence runways.
+ * 2. **Prosodic Declination & Trailing-Word Leveling:** Human speakers naturally drop 8–14 dB in volume on
+ *    the last 1–3 words of a clause or dictation. Computes a smooth 400 ms windowed speech envelope over
+ *    voiced frames (plus 100 ms trailing hangover so soft final consonants `/t/`, `/k/`, `/s/`, `/f/`, `/n/`
+ *    receive the same boost as their vowel) and gently boosts quiet phrases up to `3.0x` toward a consistent
+ *    target speech RMS (`0.14f`) while leaving background silence at unity gain (`1.0x`).
+ * 3. **Soft-Knee Limiting:** Smoothly limits peaks above `0.85f` into `[0.85f, 0.96f]` so boosted speech
+ *    never hard-clips.
+ */
+fun conditionAudioWhenClearDisabled(samples: FloatArray): FloatArray {
+    if (samples.isEmpty()) return samples
+    val frameLen = CHUNK_FRAME_SAMPLES // 320 samples = 20 ms @ 16 kHz
+    val numFrames = samples.size / frameLen
+    if (numFrames < 3) return samples
+
+    // 1. Estimate DC offset over non-zero active samples
+    var dcSum = 0.0
+    var dcCount = 0
+    for (s in samples) {
+        if (s.isFinite() && abs(s) > 1e-6f) {
+            dcSum += s.toDouble()
+            dcCount++
+        }
+    }
+    val dcOffset = if (dcCount > 0) (dcSum / dcCount).toFloat().coerceIn(-0.05f, 0.05f) else 0f
+
+    // 2. Compute per-frame RMS after DC removal
+    val frameRms = FloatArray(numFrames)
+    for (f in 0 until numFrames) {
+        val base = f * frameLen
+        var sumSq = 0.0
+        for (i in 0 until frameLen) {
+            val s = samples[base + i]
+            val centered = if (s.isFinite() && abs(s) > 1e-6f) s - dcOffset else 0f
+            sumSq += centered * centered
+        }
+        frameRms[f] = kotlin.math.sqrt(sumSq / frameLen).toFloat()
+    }
+
+    // 3. Identify voiced frames vs background noise floor
+    val nonZeroRms = frameRms.filter { it > 0.0005f }.sorted()
+    if (nonZeroRms.isEmpty()) return samples
+    val noiseFloor = nonZeroRms[(nonZeroRms.size * 0.08f).toInt().coerceIn(0, nonZeroRms.size - 1)]
+    val voiceGate = max(noiseFloor * 2.2f, 0.0025f).coerceAtMost(0.018f)
+
+    val voiced = BooleanArray(numFrames) { frameRms[it] >= voiceGate }
+    // Extend voiced mask by 3 pre-onset frames (60 ms) and 5 hangover frames (100 ms) so soft initial and
+    // trailing consonants (/t/, /k/, /s/, /f/, /n/, /m/) ride the exact same gain envelope as their word
+    val baseVoiced = voiced.copyOf()
+    for (f in 0 until numFrames) {
+        if (baseVoiced[f]) {
+            for (pre in 1..3) {
+                if (f - pre >= 0 && frameRms[f - pre] >= 0.0012f) voiced[f - pre] = true
+            }
+            for (post in 1..5) {
+                if (f + post < numFrames && frameRms[f + post] >= 0.0012f) voiced[f + post] = true
+            }
+        }
+    }
+
+    val voicedLevels = ArrayList<Float>(numFrames)
+    for (f in 0 until numFrames) {
+        if (voiced[f] && frameRms[f] >= voiceGate) {
+            voicedLevels.add(frameRms[f])
+        }
+    }
+    if (voicedLevels.isEmpty()) return samples
+    voicedLevels.sort()
+    val p80Speech = voicedLevels[(voicedLevels.size * 0.80f).toInt().coerceIn(0, voicedLevels.size - 1)]
+    val targetRms = p80Speech.coerceIn(0.13f, 0.17f)
+
+    // 4. Compute local 400 ms (+/- 10 frame) voiced RMS envelope and per-frame target gain
+    val desiredGain = FloatArray(numFrames) { 1.0f }
+    val halfWin = 10
+    for (f in 0 until numFrames) {
+        if (!voiced[f]) {
+            desiredGain[f] = 1.0f
+            continue
+        }
+        var sumSq = 0.0
+        var count = 0
+        val wStart = max(0, f - halfWin)
+        val wEnd = min(numFrames - 1, f + halfWin)
+        for (k in wStart..wEnd) {
+            if (voiced[k] && frameRms[k] >= voiceGate * 0.7f) {
+                val r = frameRms[k].toDouble()
+                sumSq += r * r
+                count++
+            }
+        }
+        val localRms = if (count > 0) {
+            kotlin.math.sqrt(sumSq / count).toFloat()
+        } else {
+            max(frameRms[f], voiceGate)
+        }
+        if (localRms > 0.002f) {
+            desiredGain[f] = (targetRms / localRms).coerceIn(1.0f, 3.0f)
+        }
+    }
+
+    // 5. Bidirectional envelope smoothing so gain transitions across word boundaries are completely seamless
+    val smoothedGain = desiredGain.copyOf()
+    for (f in 1 until numFrames) {
+        smoothedGain[f] = smoothedGain[f - 1] * 0.72f + smoothedGain[f] * 0.28f
+    }
+    for (f in (numFrames - 2) downTo 0) {
+        smoothedGain[f] = max(smoothedGain[f], smoothedGain[f + 1] * 0.82f)
+            .coerceIn(1.0f, 3.0f)
+    }
+    // Keep pure zero-padded runway frames at 1.0f
+    for (f in 0 until numFrames) {
+        if (frameRms[f] < 0.0005f) smoothedGain[f] = 1.0f
+    }
+
+    // 6. Apply linearly interpolated gain + soft-knee limiter above 0.85f
+    val out = FloatArray(samples.size)
+    for (f in 0 until numFrames) {
+        val g0 = smoothedGain[f]
+        val g1 = if (f + 1 < numFrames) smoothedGain[f + 1] else g0
+        val base = f * frameLen
+        for (i in 0 until frameLen) {
+            val idx = base + i
+            val raw = samples[idx]
+            if (!raw.isFinite() || abs(raw) <= 1e-6f) {
+                out[idx] = 0f
+                continue
+            }
+            val g = g0 + (g1 - g0) * (i.toFloat() / frameLen.toFloat())
+            val y = (raw - dcOffset) * g
+            out[idx] = softLimitSample(y)
+        }
+    }
+    for (idx in (numFrames * frameLen) until samples.size) {
+        val raw = samples[idx]
+        if (!raw.isFinite() || abs(raw) <= 1e-6f) {
+            out[idx] = 0f
+        } else {
+            val g = smoothedGain[numFrames - 1]
+            out[idx] = softLimitSample((raw - dcOffset) * g)
+        }
+    }
+    return out
+}
+
+private fun softLimitSample(x: Float): Float {
+    val ax = abs(x)
+    if (ax <= 0.85f) return x
+    val excess = ax - 0.85f
+    val compressed = 0.85f + 0.12f * (excess / (excess + 0.12f))
+    return if (x >= 0f) compressed else -compressed
 }
 
 /**
@@ -1729,8 +1950,11 @@ fun reconcileTranscript(
         emptyList()
     }
 
-    val hasUnambiguousLexicalFiller = words.any { isUnambiguousHesitationToken(it.text) }
-    if (fillerSpans.isEmpty() && !hasUnambiguousLexicalFiller) {
+    // When Uhm filler removal is disabled (or Uhm found no acoustic filler spans), prefer Voz's full
+    // detokenized `transcription.text` directly so any boundary word omitted from `transcription.words`
+    // timestamp alignment is never lost. `normalizeTranscriptText` below still cleans up unambiguous
+    // lexical hesitations ("uh", "uhm", "äh", "ähm", "hm", "hmm") and punctuation.
+    if (fillerSpans.isEmpty()) {
         val rawJoined = if (transcription.text.isNotBlank()) {
             transcription.text
         } else {
@@ -1911,12 +2135,14 @@ private fun stripUnambiguousTextHesitations(rawText: String): Pair<String, Boole
     }
     val kept = ArrayList<String>(tokens.size)
     var removedLeadingCapital = false
+    var lastRemovedFillerHadCommaOrPeriod = false
     var trailingTerminalPunct: Char? = null
 
     for (token in tokens) {
         if (isUnambiguousHesitationToken(token)) {
+            val trimmedToken = token.trim()
             if (kept.isEmpty()) {
-                val firstLetter = token.firstOrNull { it.isLetter() }
+                val firstLetter = trimmedToken.firstOrNull { it.isLetter() }
                 if (firstLetter != null && firstLetter.isUpperCase()) {
                     removedLeadingCapital = true
                 }
@@ -1926,14 +2152,32 @@ private fun stripUnambiguousTextHesitations(rawText: String): Pair<String, Boole
                 if (prev.endsWith(",") && prevCore in NO_COMMA_AFTER_WORDS) {
                     kept[kept.lastIndex] = prev.dropLast(1)
                 }
-                val lastChar = token.lastOrNull()
+                if (trimmedToken.endsWith(",") || trimmedToken.endsWith(".")) {
+                    lastRemovedFillerHadCommaOrPeriod = true
+                }
+                val lastChar = trimmedToken.lastOrNull()
                 if (lastChar == '.' || lastChar == '!' || lastChar == '?') {
                     trailingTerminalPunct = lastChar
                 }
             }
         } else {
+            var adjustedToken = token
+            if (lastRemovedFillerHadCommaOrPeriod && kept.isNotEmpty()) {
+                val prevCore = extractWordCore(kept.last()).lowercase(Locale.ROOT)
+                val currCore = extractWordCore(token)
+                if (prevCore in NO_COMMA_AFTER_WORDS &&
+                    currCore.length >= 2 &&
+                    currCore[0].isUpperCase() &&
+                    currCore.substring(1).all { it.isLowerCase() } &&
+                    currCore != "I" &&
+                    currCore.lowercase(Locale.ROOT) in LOWERCASEABLE_CONTINUATION_WORDS
+                ) {
+                    adjustedToken = lowercaseFirstLetterOfToken(token)
+                }
+            }
+            lastRemovedFillerHadCommaOrPeriod = false
             trailingTerminalPunct = null
-            kept.add(token)
+            kept.add(adjustedToken)
         }
     }
 

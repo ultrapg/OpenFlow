@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 27
-        versionName = "2.6.2"
+        versionCode = 28
+        versionName = "2.6.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -65,6 +65,8 @@ android {
         create("release") {
             val candidateKeystores = listOfNotNull(
                 System.getenv("RELEASE_KEYSTORE")?.let { file(it) },
+                file("/home/coder/release.jks"),
+                file("/home/coder/.android/release.jks"),
                 file("../../release.jks"),
                 file("../release.jks"),
                 file("${System.getProperty("user.home")}/release.jks"),
@@ -76,6 +78,9 @@ android {
                 storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "password"
                 keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "key0"
                 keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "password"
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
@@ -88,6 +93,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        debug {
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile?.exists() == true) {
+                signingConfig = releaseSigning
+            }
         }
     }
     compileOptions {

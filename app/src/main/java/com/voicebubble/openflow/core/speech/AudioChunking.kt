@@ -31,16 +31,23 @@ internal const val MIN_TAIL_SPEECH_FRAMES = 5
 private const val MIN_SPEECH_RUN_FRAMES = 3
 
 /**
+ * Maximum vocal-tract occlusion (100 ms = 5 frames) inside a stop consonant (`/p/`, `/t/`, `/k/`, `/b/`,
+ * `/d/`, `/g/`) or affricate before its plosive release burst or final unstressed syllable. Short bursts
+ * within this distance of a confirmed speech run are bridged into the word rather than erased as clicks.
+ */
+private const val MAX_STOP_CLOSURE_FRAMES = 5
+
+/**
  * Dual-threshold hysteresis ratio for word edges: frames immediately adjacent to a confirmed speech run
  * that stay above `threshold * SPEECH_HANGOVER_RATIO` are soft consonant onsets/tails (`s`, `t`, `f`, `k`,
  * `n`, `m`) and remain attached to the word so cuts never clip trailing or leading phonemes.
  */
-private const val SPEECH_HANGOVER_RATIO = 0.55f
-private const val SPEECH_PRE_ONSET_FRAMES = 2
-private const val SPEECH_HANGOVER_FRAMES = 3
+private const val SPEECH_HANGOVER_RATIO = 0.45f
+private const val SPEECH_PRE_ONSET_FRAMES = 3
+private const val SPEECH_HANGOVER_FRAMES = 5
 
-/** Natural-sounding trailing silence kept after the last word of a live chunk (240 ms). */
-internal const val LIVE_CUT_PAD_SAMPLES = 3_840
+/** Natural-sounding trailing silence kept after the last word of a live chunk (320 ms). */
+internal const val LIVE_CUT_PAD_SAMPLES = 5_120
 
 /**
  * Natural-sounding leading silence retained at the start of the remaining live buffer when cutting at a pause
@@ -83,39 +90,96 @@ internal fun computeFrameRms(
 
 /**
  * Silence threshold that adapts to the recording's noise floor: never below the user's [userThreshold],
- * but raised to ~3x the 10th-percentile frame level so constant background noise (fans, traffic) is not
- * mistaken for speech. Capped so loud rooms cannot push it above typical quiet speech.
+ * but raised to ~3x the 5th-percentile frame level so constant background noise (fans, traffic) is not
+ * mistaken for speech. Bounded by both 0.03f and 25% of the 80th-percentile speech level so quiet speakers
+ * or trailing phrase declination (especially when `Clear` is disabled) are never misclassified as silence.
  */
 internal fun adaptiveSilenceThreshold(frameRms: FloatArray, userThreshold: Float): Float {
     if (frameRms.isEmpty()) return userThreshold
     val sorted = frameRms.copyOf()
     sorted.sort()
-    val noiseFloor = sorted[(sorted.size * 0.10f).toInt().coerceIn(0, sorted.size - 1)]
+    val noiseFloor = sorted[(sorted.size * 0.05f).toInt().coerceIn(0, sorted.size - 1)]
+    val speechLevel = sorted[(sorted.size * 0.80f).toInt().coerceIn(0, sorted.size - 1)]
     val adaptive = noiseFloor * 3f
-    return max(userThreshold, adaptive).coerceAtMost(max(userThreshold, 0.03f))
+    val ceiling = max(userThreshold, min(0.03f, speechLevel * 0.25f))
+    return max(userThreshold, adaptive).coerceAtMost(ceiling)
 }
 
 /**
  * Per-frame silence classification (`true` = silent) with:
- * 1. **Click suppression:** a run of loud frames shorter than [MIN_SPEECH_RUN_FRAMES] that has silence on
- *    both sides is treated as silence, so a single tap or lip smack in the middle of a pause no longer
- *    splits the pause in two.
- * 2. **Dual-threshold speech hangover:** frames immediately before ([SPEECH_PRE_ONSET_FRAMES]) or after
- *    ([SPEECH_HANGOVER_FRAMES]) a confirmed speech run that remain above `threshold * SPEECH_HANGOVER_RATIO`
- *    are soft consonant onsets/tails (`s`, `t`, `f`, `k`, `n`, `m`) and are kept as speech (`silent = false`)
- *    so a split never clips the beginning or end of a spoken word.
+ * 1. **Stop-closure & plosive-release bridging:** Words ending or containing stop consonants (`/p/`, `/t/`,
+ *    `/k/`, `/b/`, `/d/`, `/g/`) have a 2–5 frame (`40–100 ms`) silent vocal-tract occlusion followed by a
+ *    1–2 frame (`20–40 ms`) plosive release burst or short unstressed syllable. Any short burst within
+ *    [MAX_STOP_CLOSURE_FRAMES] of a confirmed speech run (`>= [MIN_SPEECH_RUN_FRAMES]`) is bridged across
+ *    the stop closure so the final consonant or syllable is never clipped or mistaken for a pause start.
+ * 2. **Isolated click suppression:** A run of loud frames shorter than [MIN_SPEECH_RUN_FRAMES] that is
+ *    separated from all confirmed speech runs by more than [MAX_STOP_CLOSURE_FRAMES] of silence on both
+ *    sides is a lone tap or lip smack and is suppressed to silence so it does not split a pause in two.
+ * 3. **Dual-threshold speech hangover:** Frames immediately before ([SPEECH_PRE_ONSET_FRAMES]) or after
+ *    ([SPEECH_HANGOVER_FRAMES]) a speech run that remain above `threshold * SPEECH_HANGOVER_RATIO` are soft
+ *    consonant onsets/tails (`s`, `t`, `f`, `k`, `n`, `m`, `l`) and are kept as speech (`silent = false`).
  */
 internal fun buildSilenceMask(frameRms: FloatArray, threshold: Float): BooleanArray {
     val n = frameRms.size
+    if (n == 0) return BooleanArray(0)
     val silent = BooleanArray(n) { frameRms[it] < threshold }
+
+    // Identify confirmed core speech runs (>= MIN_SPEECH_RUN_FRAMES = 60 ms)
+    val hasCoreSpeech = BooleanArray(n)
     var i = 0
     while (i < n) {
         if (!silent[i]) {
             var j = i
             while (j < n && !silent[j]) j++
-            val boundedBySilence = i > 0 && j < n
-            if (boundedBySilence && (j - i) < MIN_SPEECH_RUN_FRAMES) {
-                for (k in i until j) silent[k] = true
+            if (j - i >= MIN_SPEECH_RUN_FRAMES) {
+                for (k in i until j) hasCoreSpeech[k] = true
+            }
+            i = j
+        } else {
+            i++
+        }
+    }
+
+    // Bridge short bursts (< MIN_SPEECH_RUN_FRAMES) that lie within MAX_STOP_CLOSURE_FRAMES (100 ms)
+    // of a confirmed speech run (plosive release bursts like -t/-k/-p or short unstressed syllables),
+    // and suppress only truly isolated clicks surrounded by > 100 ms of silence on both sides.
+    i = 0
+    while (i < n) {
+        if (!silent[i]) {
+            var j = i
+            while (j < n && !silent[j]) j++
+            if (j - i < MIN_SPEECH_RUN_FRAMES) {
+                var prevCore = -1
+                for (k in (i - 1) downTo max(0, i - MAX_STOP_CLOSURE_FRAMES)) {
+                    if (hasCoreSpeech[k]) {
+                        prevCore = k
+                        break
+                    }
+                }
+                var nextCore = -1
+                for (k in j until min(n, j + MAX_STOP_CLOSURE_FRAMES)) {
+                    if (hasCoreSpeech[k]) {
+                        nextCore = k
+                        break
+                    }
+                }
+                if (prevCore >= 0 || nextCore >= 0) {
+                    if (prevCore >= 0) {
+                        for (k in (prevCore + 1) until j) {
+                            silent[k] = false
+                            hasCoreSpeech[k] = true
+                        }
+                    }
+                    if (nextCore >= 0) {
+                        for (k in i until nextCore) {
+                            silent[k] = false
+                            hasCoreSpeech[k] = true
+                        }
+                    }
+                } else if (i > 0 && j < n) {
+                    // Isolated click far from any speech -> suppress to silence
+                    for (k in i until j) silent[k] = true
+                }
             }
             i = j
         } else {
@@ -181,6 +245,35 @@ internal fun hasUsableSpeech(
         if (!isSilent) {
             speechFrames++
             if (speechFrames >= minSpeechFrames) return true
+        }
+    }
+    return false
+}
+
+/**
+ * Sensitive speech check for the final post-cut `tail` when the user stops recording:
+ * returns `true` if [samples] holds even a single short spoken syllable (`>= 4` frames / `80 ms` of
+ * voiced energy above a sensitive floor), ensuring a soft final word at the end of a dictation
+ * (`"now"`, `"off"`, `"it"`, `"ok"`) is never dropped while still skipping pure dead air or a
+ * `<= 40 ms` finger-tap click (which can straddle at most 3 frames when unaligned).
+ */
+internal fun hasAnyTailSpeech(
+    samples: FloatArray,
+    silenceThreshold: Float = DEFAULT_SILENCE_RMS
+): Boolean {
+    val minFrames = 4
+    if (samples.size < minFrames * CHUNK_FRAME_SAMPLES) return false
+    if (hasUsableSpeech(samples, silenceThreshold, minSpeechFrames = minFrames)) return true
+    val rms = computeFrameRms(samples, 0, samples.size, CHUNK_FRAME_SAMPLES)
+    if (rms.size < minFrames) return false
+    val floor = min(max(silenceThreshold * 0.30f, 0.0025f), 0.0045f)
+    var consecutive = 0
+    for (r in rms) {
+        if (r >= floor) {
+            consecutive++
+            if (consecutive >= minFrames) return true
+        } else {
+            consecutive = 0
         }
     }
     return false
@@ -371,7 +464,7 @@ internal fun findStreamingCut(
         while (j < n && silent[j]) j++
         val runLen = j - i
         if (i > 0 && runLen >= requiredPauseFrames(i * frame, config)) {
-            val cut = i * frame + min(runLen * frame / 2, LIVE_CUT_PAD_SAMPLES)
+            val cut = i * frame + min((runLen * frame * 2) / 3, LIVE_CUT_PAD_SAMPLES)
             if (cut >= minChunk && cut <= usable) {
                 var speechBefore = 0
                 for (f in 0 until min(n, cut / frame)) if (!silent[f]) speechBefore++

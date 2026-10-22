@@ -773,5 +773,80 @@ class SmartPipelineTest {
         // First sample after leading pad is tapered smoothly rather than a step jump to 0.2f
         assertTrue(prepared[3_200] in 0.0005f..0.01f)
         assertEquals(0.2f, prepared[3_200 + 200], 1e-5f)
+
+        // Asymmetric Conformer-Transducer runway + minimum 1.60s (25,600 sample) length for short final tails
+        val shortTail = FloatArray(4_800) { 0.05f } // 300 ms single-word tail
+        val fullPrepared = com.voicebubble.openflow.core.speech.prepareChunkForInference(
+            samples = shortTail,
+            minLeadSilencePadSamples = 5_120,
+            minTailSilencePadSamples = 10_240,
+            minTotalSamples = 25_600
+        )
+        assertEquals(25_600, fullPrepared.size)
+        // At least 640 ms (10,240 samples) of trailing silence after the word so TDT lookahead flushes the last word
+        for (i in (5_120 + 4_800) until fullPrepared.size) {
+            assertEquals(0.0f, fullPrepared[i], 1e-6f)
+        }
+    }
+
+    @Test
+    fun `conditionAudioWhenClearDisabled boosts quiet trailing words without amplifying silence or clipping`() {
+        // Simulate 1.0s normal speech (0.14) + 0.6s quiet trailing words at end of sentence (0.03) + 0.5s silence
+        val sr = 16_000
+        val raw = FloatArray((2.1 * sr).toInt()) { idx ->
+            val sign = if (idx % 2 == 0) 1f else -1f
+            when {
+                idx < sr -> 0.14f * sign + 0.004f // normal start with slight DC offset
+                idx < (1.6 * sr).toInt() -> 0.03f * sign + 0.004f // quiet sentence-final words (-13 dB drop)
+                else -> 0.0f // trailing silence runway
+            }
+        }
+        val conditioned = com.voicebubble.openflow.core.speech.conditionAudioWhenClearDisabled(raw)
+        assertEquals(raw.size, conditioned.size)
+        assertTrue(conditioned.all { it.isFinite() && kotlin.math.abs(it) <= 0.97f })
+
+        // Quiet trailing word region (1.2s..1.5s) must be significantly boosted (> 2x) toward normal speech level
+        var rawTrailingSumSq = 0.0
+        var condTrailingSumSq = 0.0
+        val checkStart = (1.2 * sr).toInt()
+        val checkEnd = (1.5 * sr).toInt()
+        for (i in checkStart until checkEnd) {
+            rawTrailingSumSq += (raw[i] - 0.004f) * (raw[i] - 0.004f)
+            condTrailingSumSq += conditioned[i] * conditioned[i]
+        }
+        val rawRms = kotlin.math.sqrt(rawTrailingSumSq / (checkEnd - checkStart))
+        val condRms = kotlin.math.sqrt(condTrailingSumSq / (checkEnd - checkStart))
+        assertTrue("Expected quiet trailing words to be boosted >= 2.2x (raw=$rawRms, cond=$condRms)", condRms >= rawRms * 2.2)
+
+        // Trailing zero-padded silence runway remains pure zero
+        assertEquals(0.0f, conditioned.last(), 1e-6f)
+    }
+
+    @Test
+    fun `reconcileTranscript with uhmEnabled false preserves full detokenized text even if words timestamps omit last token`() {
+        // Simulate Voz returning complete sentence in `text` while `words` timestamp alignment missed the final word
+        val transcription = Transcription(
+            text = "Optimize it so that, uh, the end never gets cut off.",
+            words = listOf(
+                Word("Optimize", 0.0, 0.4),
+                Word("it", 0.4, 0.5),
+                Word("so", 0.5, 0.6),
+                Word("that,", 0.6, 0.8),
+                Word("uh,", 0.8, 1.0),
+                Word("the", 1.0, 1.1),
+                Word("end", 1.1, 1.3),
+                Word("never", 1.3, 1.5),
+                Word("gets", 1.5, 1.7),
+                Word("cut", 1.7, 1.9)
+                // "off." omitted from timestamped words list
+            ),
+            duration = 2.0
+        )
+        val result = reconcileTranscript(
+            transcription = transcription,
+            uhmFrames = emptyList(),
+            uhmEnabled = false
+        )
+        assertEquals("Optimize it so that the end never gets cut off.", result)
     }
 }

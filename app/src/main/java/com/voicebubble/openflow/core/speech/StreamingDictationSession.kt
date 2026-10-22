@@ -113,7 +113,7 @@ class StreamingDictationSession(
         stopPolling()
         if (tail.isNotEmpty()) {
             val shouldEnqueueTail = liveChunkCount.get() == 0 ||
-                hasUsableSpeech(tail, config.silenceThreshold)
+                hasAnyTailSpeech(tail, config.silenceThreshold)
             if (shouldEnqueueTail) {
                 enqueue(tail)
             } else {

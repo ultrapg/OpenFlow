@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.3] - 2026-10-22
+
+### Fixed & Improved
+- **Eliminated End-of-Dictation & End-of-Chunk Word Cutoffs (`AudioRecordingController`, `AudioChunking`, `SmartPipeline`, `StreamingDictationSession`):**
+  - **Post-Stop Hardware Tail Capture (`AudioRecordingController`):** Added a `180 ms` post-stop tail grace window (`POST_STOP_TAIL_GRACE_MS = 180L`), finer `40 ms` (`640`-sample) capture reads, and a non-blocking `AudioRecord.READ_NON_BLOCKING` hardware buffer drain before stopping `AudioRecord` so the final syllable or consonant still in flight when tapping Stop is never cut off.
+  - **Stop-Closure & Plosive-Release Bridging (`AudioChunking.buildSilenceMask`):** Words ending in stop consonants (`/p/`, `/t/`, `/k/`, `/b/`, `/d/`, `/g/`) have a `40–100 ms` (`2–5` frame) silent vocal-tract occlusion followed by a `20–40 ms` (`1–2` frame) plosive release burst or short unstressed syllable. Short bursts within `100 ms` (`5` frames) of a confirmed speech run are now bridged across the stop closure into the word rather than suppressed as clicks, and trailing speech hangover is extended to `100 ms` (`5` frames at `0.45x` threshold).
+  - **Conformer-Transducer Lookahead Runway (`SmartPipeline.prepareChunkForInference`):** Expanded leading silence runway to `320 ms` (`5,120` samples = 4 Conformer frames), trailing silence runway to **`640 ms` (`10,240` samples = 8 Conformer frames)**, and minimum chunk length to `1.60 s` (`25,600` samples = 20 Conformer frames) so `Voz`'s Token-and-Duration Transducer (TDT / RNN-T) always has full right-context lookahead to flush the final word of every chunk and short tail.
+  - **Sensitive Final Tail Retention (`AudioChunking.hasAnyTailSpeech`, `StreamingDictationSession.finish`):** Preserves any post-pause tail containing even a single soft `60 ms` (`3`-frame) spoken word (`"it"`, `"on"`, `"ok"`) while still skipping pure dead air and isolated button-tap clicks.
+- **Default Configuration Optimization When `Clear` & `Uhm` Are Disabled (`SmartPipeline`):**
+  - **Lightweight Speech Conditioner (`conditionAudioWhenClearDisabled`):** Whenever the `Clear` neural enhancer is disabled (the default configuration), applies fast (< 0.4 ms), zero-RAM DC-offset removal and 400 ms windowed speech-envelope leveling (boosting quiet sentence-final words up to `3.0x` with soft-knee limiting at `0.85f` while keeping silence at unity gain) so prosodic volume drop-off at the end of a sentence or chunk never causes words to fade out.
+  - **Direct Detokenized Text Preservation (`reconcileTranscript`):** When `Uhm` filler removal is disabled, preserves `Voz`'s full detokenized `transcription.text` directly (while still stripping unambiguous hesitation noises `"uh"`, `"uhm"`, `"äh"`, `"ähm"`, `"hm"`, `"hmm"`) so boundary words omitted from `transcription.words` timestamp alignment are never lost.
+- **Settings UI (`DictationChunkingSettingsSection`, `MainActivity`):**
+  - Hid the `"Detect language once per dictation (faster)"` checkbox whenever `Ear` (spoken language identification) is deactivated.
+
 ## [2.6.2] - 2026-10-22
 
 ### Improved

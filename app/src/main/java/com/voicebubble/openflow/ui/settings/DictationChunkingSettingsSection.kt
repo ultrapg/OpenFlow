@@ -30,7 +30,10 @@ import kotlin.math.roundToInt
  * Changes are persisted immediately and picked up by the next dictation (no service restart needed).
  */
 @Composable
-fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
+fun DictationChunkingSettingsSection(
+    modifier: Modifier = Modifier,
+    earEnabled: Boolean = true
+) {
     val context = LocalContext.current
     var settings by remember { mutableStateOf(DictationChunkSettings.load(context)) }
 
@@ -114,15 +117,17 @@ fun DictationChunkingSettingsSection(modifier: Modifier = Modifier) {
                     color = MaterialTheme.colorScheme.onBackground
                 )
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(
-                    checked = settings.reuseLanguage,
-                    onCheckedChange = { apply(settings.copy(reuseLanguage = it), persist = true) }
-                )
-                Text(
-                    "Detect language once per dictation (faster)",
-                    color = MaterialTheme.colorScheme.onBackground
-                )
+            if (earEnabled) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = settings.reuseLanguage,
+                        onCheckedChange = { apply(settings.copy(reuseLanguage = it), persist = true) }
+                    )
+                    Text(
+                        "Detect language once per dictation (faster)",
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                }
             }
         }
 

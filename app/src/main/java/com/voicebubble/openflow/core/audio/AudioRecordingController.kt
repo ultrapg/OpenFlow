@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -26,6 +27,10 @@ import kotlin.math.sqrt
 class AudioRecordingController {
     companion object {
         private const val SAMPLE_RATE = 16000
+        // 40 ms read blocks (640 samples) keep pcmBuffer fresh without large blocking-read latency
+        private const val READ_CHUNK_SHORTS = 640
+        // 180 ms post-tap grace window captures the final syllable still in flight through the air / AudioFlinger HAL
+        private const val POST_STOP_TAIL_GRACE_MS = 180L
         // Initial capacity: 15 seconds (240,000 floats = ~960 KB) — avoids repeated small allocations
         private const val INITIAL_CAPACITY_SAMPLES = SAMPLE_RATE * 15
         // Hard safety ceiling: 5 minutes at 16 kHz (4,800,000 floats = ~19.2 MB) to prevent unbounded RAM growth
@@ -90,7 +95,7 @@ class AudioRecordingController {
             releaseInternal()
 
             val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, channelConfig, audioFormat)
-            val bufferSize = if (minBufferSize > 0) maxOf(minBufferSize * 2, 4096) else 8192
+            val bufferSize = if (minBufferSize > 0) maxOf(minBufferSize * 3, 16384) else 16384
 
             val record = try {
                 AudioRecord(
@@ -155,7 +160,7 @@ class AudioRecordingController {
             }
 
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
-                val shortBuffer = ShortArray(bufferSize / 2)
+                val shortBuffer = ShortArray(READ_CHUNK_SHORTS)
 
                 while (isActive && audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                     val readCount = audioRecord?.read(shortBuffer, 0, shortBuffer.size) ?: 0
@@ -170,47 +175,7 @@ class AudioRecordingController {
                         break
                     }
                     if (readCount > 0) {
-                        var sumSquares = 0.0
-                        synchronized(bufferLock) {
-                            val currentBuf = pcmBuffer ?: FloatArray(INITIAL_CAPACITY_SAMPLES).also { pcmBuffer = it }
-                            val availableSpace = MAX_RECORDING_SAMPLES - pcmSize
-                            val toCopy = min(readCount, availableSpace)
-                            if (toCopy > 0) {
-                                val requiredSize = pcmSize + toCopy
-                                val targetBuf = if (requiredSize > currentBuf.size) {
-                                    // Grow by 1.5x (or +30s) up to MAX_RECORDING_SAMPLES to avoid 2x heap spikes
-                                    val grownCapacity = min(
-                                        MAX_RECORDING_SAMPLES,
-                                        maxOf(requiredSize, currentBuf.size + (SAMPLE_RATE * 20))
-                                    )
-                                    try {
-                                        currentBuf.copyOf(grownCapacity).also { pcmBuffer = it }
-                                    } catch (oom: OutOfMemoryError) {
-                                        DebugLogManager.logWarning(
-                                            "AudioRecordingController",
-                                            "JVM heap full while growing audio buffer at $pcmSize samples; capping recording buffer"
-                                        )
-                                        currentBuf
-                                    }
-                                } else {
-                                    currentBuf
-                                }
-
-                                val actualCopy = min(toCopy, targetBuf.size - pcmSize)
-                                for (i in 0 until actualCopy) {
-                                    val normalized = shortBuffer[i] / 32768.0f
-                                    sumSquares += normalized * normalized
-                                    targetBuf[pcmSize + i] = normalized
-                                }
-                                pcmSize += actualCopy
-                            } else {
-                                for (i in 0 until readCount) {
-                                    val normalized = shortBuffer[i] / 32768.0f
-                                    sumSquares += normalized * normalized
-                                }
-                            }
-                        }
-
+                        val sumSquares = appendSamplesToBuffer(shortBuffer, readCount)
                         val rms = sqrt(sumSquares / readCount).toFloat()
                         _rmsLevel.value = (rms * 5.0f).coerceIn(0.0f, 1.0f)
                     }
@@ -218,6 +183,50 @@ class AudioRecordingController {
             }
             true
         }
+    }
+
+    private fun appendSamplesToBuffer(shortBuffer: ShortArray, readCount: Int): Double {
+        var sumSquares = 0.0
+        synchronized(bufferLock) {
+            val currentBuf = pcmBuffer ?: FloatArray(INITIAL_CAPACITY_SAMPLES).also { pcmBuffer = it }
+            val availableSpace = MAX_RECORDING_SAMPLES - pcmSize
+            val toCopy = min(readCount, availableSpace)
+            if (toCopy > 0) {
+                val requiredSize = pcmSize + toCopy
+                val targetBuf = if (requiredSize > currentBuf.size) {
+                    // Grow by +20s up to MAX_RECORDING_SAMPLES to avoid 2x heap spikes
+                    val grownCapacity = min(
+                        MAX_RECORDING_SAMPLES,
+                        maxOf(requiredSize, currentBuf.size + (SAMPLE_RATE * 20))
+                    )
+                    try {
+                        currentBuf.copyOf(grownCapacity).also { pcmBuffer = it }
+                    } catch (oom: OutOfMemoryError) {
+                        DebugLogManager.logWarning(
+                            "AudioRecordingController",
+                            "JVM heap full while growing audio buffer at $pcmSize samples; capping recording buffer"
+                        )
+                        currentBuf
+                    }
+                } else {
+                    currentBuf
+                }
+
+                val actualCopy = min(toCopy, targetBuf.size - pcmSize)
+                for (i in 0 until actualCopy) {
+                    val normalized = shortBuffer[i] / 32768.0f
+                    sumSquares += normalized * normalized
+                    targetBuf[pcmSize + i] = normalized
+                }
+                pcmSize += actualCopy
+            } else {
+                for (i in 0 until readCount) {
+                    val normalized = shortBuffer[i] / 32768.0f
+                    sumSquares += normalized * normalized
+                }
+            }
+        }
+        return sumSquares
     }
 
     /**
@@ -254,18 +263,37 @@ class AudioRecordingController {
 
     suspend fun stopRecording(): FloatArray {
         return controllerMutex.withLock {
-            try {
-                if (audioRecord?.state == AudioRecord.STATE_INITIALIZED &&
-                    audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
-                ) {
-                    audioRecord?.stop()
+            val activeRecord = audioRecord
+            if (activeRecord?.state == AudioRecord.STATE_INITIALIZED &&
+                activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING
+            ) {
+                // Capture the final 180 ms after the user taps Stop so the last syllable/word still in flight
+                // through the air and Android's AudioFlinger HAL is never cut off by the tap.
+                delay(POST_STOP_TAIL_GRACE_MS)
+                try {
+                    activeRecord.stop()
+                } catch (e: IllegalStateException) {
+                    e.printStackTrace()
                 }
-            } catch (e: IllegalStateException) {
-                e.printStackTrace()
             }
 
             recordingJob?.cancelAndJoin()
             recordingJob = null
+
+            // Drain any remaining unread frames still sitting in AudioRecord's hardware buffer after stop()
+            if (activeRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                try {
+                    val drainBuf = ShortArray(READ_CHUNK_SHORTS)
+                    var drainLoops = 0
+                    while (drainLoops < 16) {
+                        val drained = activeRecord.read(drainBuf, 0, drainBuf.size, AudioRecord.READ_NON_BLOCKING)
+                        if (drained <= 0) break
+                        appendSamplesToBuffer(drainBuf, drained)
+                        drainLoops++
+                    }
+                } catch (_: Throwable) {
+                }
+            }
 
             releaseInternal()
             _rmsLevel.value = 0.0f
