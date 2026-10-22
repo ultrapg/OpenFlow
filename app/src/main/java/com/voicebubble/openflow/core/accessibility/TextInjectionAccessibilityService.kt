@@ -63,7 +63,17 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private fun startPollingLoop() {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
             while (isActive) {
+                // Self-sufficient power state tracking (never trust a flag that only FloatingBubbleService sets)
+                val interactiveNow = try {
+                    powerManager?.isInteractive ?: true
+                } catch (_: Throwable) {
+                    true
+                }
+                if (isScreenInteractive.value != interactiveNow) {
+                    isScreenInteractive.value = interactiveNow
+                }
                 refreshKeyboardVisibilityState()
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastWatchdogCheckMs >= 8_000L) {
@@ -75,8 +85,20 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                delay(180L)
+                // Back off while the display is off: nothing can be shown, and the screen-on broadcast in
+                // FloatingBubbleService forces an immediate refresh anyway.
+                delay(if (isScreenInteractive.value) 180L else 1_000L)
             }
+        }
+    }
+
+    /**
+     * Restarts the keyboard-visibility poller only if it died; unlike [refreshNow] it never touches
+     * the window list, so it is safe to call frequently from the main thread.
+     */
+    fun ensurePollingActive() {
+        if (pollingJob?.isActive != true) {
+            startPollingLoop()
         }
     }
 
@@ -293,7 +315,14 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
 
         try {
-            clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", textToInsert))
+            val clip = ClipData.newPlainText("OpenFlow", textToInsert)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // Hide the dictated text from the Android 13+ clipboard preview / keyboard clipboard suggestions
+                clip.description.extras = android.os.PersistableBundle().apply {
+                    putBoolean("android.content.extra.IS_SENSITIVE", true)
+                }
+            }
+            clipboard.setPrimaryClip(clip)
         } catch (_: Throwable) {
         }
 
@@ -351,6 +380,10 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             try {
                 if (oldClip != null) {
                     clipboard.setPrimaryClip(oldClip)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    // The previous clipboard could not be read (background-app restriction on Android 10+).
+                    // Never leave the already-pasted dictation sitting in the clipboard / clipboard history.
+                    clipboard.clearPrimaryClip()
                 }
             } catch (_: Throwable) {
             }

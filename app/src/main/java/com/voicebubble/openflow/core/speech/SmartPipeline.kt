@@ -39,6 +39,7 @@ import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -948,6 +949,7 @@ class SmartPipeline(
             onStageProgress?.invoke("Uhm$stageSuffix")
             uhmInstance.detect(samples, SAMPLE_RATE_HZ)
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.w(TAG, "Uhm filler inference failed; bypassing filler removal: ${t.message}")
             DebugLogManager.logWarn(TAG, "Uhm filler inference failed; bypassing filler removal", t)
             emptyList()
@@ -975,6 +977,8 @@ class SmartPipeline(
                 vozWarmedUp = true
             }
         } catch (firstError: Throwable) {
+            // A cancelled dictation must never trigger the expensive "shed all sessions + reload Voz" recovery path.
+            if (firstError is CancellationException) throw firstError
             Log.w(TAG, "Voz inference failed on first attempt (${firstError.message}); freeing auxiliary RAM and retrying.")
             DebugLogManager.logWarn(
                 TAG,
@@ -1073,6 +1077,7 @@ class SmartPipeline(
                 vozWarmedUp = true
                 DebugLogManager.logInfo(TAG, "Voz accelerator warm-up complete", includeMemory = true)
             } catch (t: Throwable) {
+                if (t is CancellationException) throw t
                 Log.w(TAG, "Voz warm-up deferred to first dictation: ${t.message}")
                 DebugLogManager.logWarn(TAG, "Voz warm-up deferred to first dictation", t)
             }
@@ -1468,6 +1473,9 @@ fun splitAudioIntoSmartChunks(
     val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
     val window = pauseWindowSamples.coerceIn(320, 3_200)
     val step = max(160, window / 4)
+    // Never leave a sub-second orphan tail: a few hundred samples fed to Clear/Voz yields hallucinated or empty text.
+    // Bounded by (safeMax - safeMin) so the split window below can never become empty.
+    val minTailSamples = min(8_000, safeMax - safeMin)
     val chunks = mutableListOf<FloatArray>()
 
     var cursor = 0
@@ -1479,8 +1487,9 @@ fun splitAudioIntoSmartChunks(
         }
 
         val searchStart = cursor + safeMin
-        val searchEnd = min(samples.size - window, cursor + safeMax)
-        var bestSplitIndex = cursor + safeMax
+        val latestSplit = min(cursor + safeMax, samples.size - minTailSamples)
+        val searchEnd = min(samples.size - window, latestSplit)
+        var bestSplitIndex = latestSplit
         var lowestEnergy = Double.MAX_VALUE
 
         var pos = searchStart
@@ -1497,7 +1506,7 @@ fun splitAudioIntoSmartChunks(
             pos += step
         }
 
-        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, min(samples.size, cursor + safeMax))
+        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, latestSplit)
         chunks.add(samples.copyOfRange(cursor, splitAt))
         cursor = splitAt
     }
@@ -1741,6 +1750,26 @@ fun normalizeTranscriptText(
 }
 
 /**
+ * Compiled per-term regex cache. `applyCustomVocabulary` runs once per audio chunk (and again per word-level
+ * pass), so recompiling `Regex(...)` for every vocabulary term on every call was pure allocation churn.
+ */
+private val CUSTOM_VOCAB_REGEX_CACHE = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+private const val CUSTOM_VOCAB_REGEX_CACHE_MAX = 512
+
+private fun customVocabularyRegex(trimmed: String): Regex {
+    CUSTOM_VOCAB_REGEX_CACHE[trimmed]?.let { return it }
+    val escaped = Regex.escape(trimmed)
+    val leadingBoundary = if (trimmed.first().isLetterOrDigit()) "\\b" else "(?<!\\w)"
+    val trailingBoundary = if (trimmed.last().isLetterOrDigit()) "\\b" else "(?!\\w)"
+    val compiled = Regex("$leadingBoundary$escaped$trailingBoundary", RegexOption.IGNORE_CASE)
+    if (CUSTOM_VOCAB_REGEX_CACHE.size >= CUSTOM_VOCAB_REGEX_CACHE_MAX) {
+        CUSTOM_VOCAB_REGEX_CACHE.clear()
+    }
+    CUSTOM_VOCAB_REGEX_CACHE[trimmed] = compiled
+    return compiled
+}
+
+/**
  * Applies user-configured custom vocabulary terms (canonical casing and close phonetic/edit-distance
  * token biasing) to the transcript text.
  */
@@ -1752,11 +1781,8 @@ fun applyCustomVocabulary(text: String, customVocabulary: List<String>): String 
         if (trimmed.isEmpty()) continue
         // Replace case-insensitive matches with the user's canonical casing, supporting both
         // alphanumeric terms and terms starting/ending with punctuation (e.g. ".NET", "C++").
-        val escaped = Regex.escape(trimmed)
-        val leadingBoundary = if (trimmed.first().isLetterOrDigit()) "\\b" else "(?<!\\w)"
-        val trailingBoundary = if (trimmed.last().isLetterOrDigit()) "\\b" else "(?!\\w)"
         updated = updated.replace(
-            Regex("$leadingBoundary$escaped$trailingBoundary", RegexOption.IGNORE_CASE),
+            customVocabularyRegex(trimmed),
             Regex.escapeReplacement(trimmed)
         )
     }

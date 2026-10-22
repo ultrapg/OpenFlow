@@ -398,6 +398,40 @@ class SmartPipelineTest {
     }
 
     @Test
+    fun `splitAudioIntoSmartChunks never leaves a tiny orphan tail chunk`() {
+        val max = 20 * 16_000
+        val min = 11 * 16_000
+        // Just a few hundred samples over the limit used to produce a ~0.01s orphan trailing chunk
+        for (extra in listOf(1, 100, 400, 1_279, 4_000, 7_999)) {
+            val clip = FloatArray(max + extra) { 0.2f }
+            val chunks = com.voicebubble.openflow.core.speech.splitAudioIntoSmartChunks(
+                samples = clip,
+                maxChunkSamples = max,
+                minChunkSamples = min
+            )
+            assertEquals("extra=$extra must not lose samples", clip.size, chunks.sumOf { it.size })
+            assertTrue("extra=$extra chunk exceeds max", chunks.all { it.size <= max })
+            assertTrue(
+                "extra=$extra produced an orphan tail of ${chunks.last().size} samples",
+                chunks.size == 1 || chunks.last().size >= 8_000
+            )
+        }
+    }
+
+    @Test
+    fun `applyCustomVocabulary is stable across repeated calls using cached patterns`() {
+        val vocab = listOf("C++", "OpenFlow", "a.b")
+        val text = "ich nutze c++ und openflow, aber nicht axb"
+        val first = com.voicebubble.openflow.core.speech.applyCustomVocabulary(text, vocab)
+        val second = com.voicebubble.openflow.core.speech.applyCustomVocabulary(text, vocab)
+        assertEquals(first, second)
+        assertTrue(first.contains("C++"))
+        assertTrue(first.contains("OpenFlow"))
+        // "a.b" must be matched literally (regex-escaped), never as the wildcard pattern a.b
+        assertTrue(first.contains("axb"))
+    }
+
+    @Test
     fun `NpuHardwareManager detects Qualcomm Hexagon and common mobile NPUs accurately`() {
         val qcomElite = com.voicebubble.openflow.core.speech.NpuHardwareManager.classifySocAndVendor("Qualcomm SM8750 Sun")
         assertEquals(com.voicebubble.openflow.core.speech.NpuVendor.QUALCOMM_HEXAGON, qcomElite.first)

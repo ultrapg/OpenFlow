@@ -157,6 +157,16 @@ class AudioRecordingController {
 
                 while (isActive && audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                     val readCount = audioRecord?.read(shortBuffer, 0, shortBuffer.size) ?: 0
+                    if (readCount < 0) {
+                        // ERROR_DEAD_OBJECT / ERROR_INVALID_OPERATION / ERROR_BAD_VALUE: the record object is no
+                        // longer usable (e.g. mic taken over by another app). Bail out instead of busy-spinning
+                        // a CPU core on a permanently failing read().
+                        DebugLogManager.logWarning(
+                            "AudioRecordingController",
+                            "AudioRecord.read() failed with code $readCount; ending capture loop"
+                        )
+                        break
+                    }
                     if (readCount > 0) {
                         var sumSquares = 0.0
                         synchronized(bufferLock) {

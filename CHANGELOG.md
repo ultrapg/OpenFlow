@@ -2,6 +2,18 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.5.9] - 2026-10-22
+
+### Fixed
+- **Audio capture busy-loop (`AudioRecordingController`):** `AudioRecord.read()` error codes (`ERROR_DEAD_OBJECT`, `ERROR_INVALID_OPERATION`, ...) were ignored, so a lost microphone (e.g. taken over by another app) made the capture coroutine spin a CPU core at 100% until the user stopped dictation. The loop now logs the error and exits cleanly.
+- **Cancelled dictation triggered full model teardown (`SmartPipeline`):** `CancellationException` was swallowed by the broad `catch (Throwable)` around `Voz.transcribe`, which caused the expensive "shed all native sessions, GC and reload Voz" recovery path on a plain cancel. Cancellation is now always rethrown (Voz inference, Voz warm-up, Uhm stage).
+- **Orphan trailing audio chunk (`splitAudioIntoSmartChunks`):** Recordings slightly longer than the chunk limit could end with a sub-second tail (a few hundred samples) that was fed to `Clear`/`Voz` and produced empty or hallucinated text. Splits now always leave a tail of at least 0.5 s.
+- **Dictated text left in the clipboard (`TextInjectionAccessibilityService`):** When the previous clipboard could not be read (Android 10+ background restriction), the pasted dictation stayed in the clipboard afterwards. It is now cleared after a successful paste, and the temporary clip is flagged sensitive on Android 13+ so it is hidden from clipboard previews.
+
+### Improved
+- **Lower idle CPU / battery use:** the bubble heartbeat now runs every 200 ms only while the screen is on (1 s while off) and no longer re-enumerates accessibility windows on the main thread; the accessibility keyboard poller backs off to 1 s while the display is off and tracks the screen state itself.
+- **Fewer allocations per dictation:** custom-vocabulary regexes are compiled once and cached, and post-processing regexes in `FloatingBubbleService` are hoisted into constants.
+
 ## [2.5.8] - 2026-10-20
 
 ### Changed

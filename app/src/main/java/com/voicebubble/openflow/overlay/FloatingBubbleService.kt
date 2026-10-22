@@ -36,6 +36,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -107,6 +108,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         private const val CHANNEL_ID = "bubble_service_channel_min"
         private const val NOTIFICATION_ID = 1001
         private const val REQUEST_CODE_RESTORE_NOTIFICATION = 1002
+
+        private val SPACE_BEFORE_PUNCT_REGEX = Regex(" +([.,!?:;%€])")
+        private val WHITESPACE_RUN_REGEX = Regex("\\s+")
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -355,13 +359,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         // Main-thread heartbeat (independent of Compose Choreographer VSYNC):
         // enforces immediate screen-off hiding, restores visibility as soon as keyboard opens after screen-on,
         // and self-heals overlay attachment & notification every 4 seconds.
+        // Adaptive cadence: 200 ms while the screen is on, 1 s while it is off (the SCREEN_ON receiver already
+        // reacts instantly, so the heartbeat only needs to be a cheap safety net then).
         serviceScope.launch {
-            var tickCount = 0
+            var lastHealMs = SystemClock.elapsedRealtime()
             while (isActive) {
-                delay(200L)
-                tickCount++
                 val nowInteractive = checkScreenInteractive()
-                if (!nowInteractive) {
+                delay(if (nowInteractive) 200L else 1_000L)
+                val stillInteractive = checkScreenInteractive()
+                val nowMs = SystemClock.elapsedRealtime()
+                val healDue = nowMs - lastHealMs >= 4_000L
+                if (healDue) lastHealMs = nowMs
+
+                if (!stillInteractive) {
                     if (isScreenInteractive.value || isBubbleVisibleFlow.value ||
                         (::layoutParams.isInitialized && layoutParams.alpha > 0f)
                     ) {
@@ -371,14 +381,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     if (!isScreenInteractive.value) {
                         onScreenTurnedOn()
                     } else {
-                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                        // The accessibility poller already samples the IME window every 180 ms off the main
+                        // thread; only make sure it is still alive instead of re-enumerating windows here.
+                        TextInjectionAccessibilityService.getSharedInstance()?.ensurePollingActive()
                         syncBubbleVisibility()
                     }
-                    if (tickCount % 20 == 0) {
+                    if (healDue) {
                         ensureOverlayAttached()
                     }
                 }
-                if (tickCount % 20 == 0) {
+                if (healDue) {
                     ensureNotificationPresent()
                 }
             }
@@ -1036,10 +1048,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 }
 
                 val finalText = chunkText.trim()
-                    .replace(Regex(" +([.,!?:;%€])"), "$1")
+                    .replace(SPACE_BEFORE_PUNCT_REGEX, "$1")
                     .replace("O K", "OK")
                     .replace("o k", "ok")
-                    .replace(Regex("\\s+"), " ")
+                    .replace(WHITESPACE_RUN_REGEX, " ")
 
                 if (finalText.isNotBlank()) {
                     val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
