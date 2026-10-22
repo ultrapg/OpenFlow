@@ -232,7 +232,9 @@ class SmartPipeline(
         private set
 
     private var appliedAccelerator: HardwareAccelerator? = null
+    private var appliedLowMemoryMode: Boolean? = null
     private var appliedSettingsSnapshot: ModelSettings? = null
+    private var lastForcedGcAtMs: Long = 0L
     private var activeAcceleratorDescription: String =
         NpuHardwareManager.configureNativeRuntime(appContext, initialSettings.hardwareAccelerator, false)
 
@@ -718,12 +720,19 @@ class SmartPipeline(
         accelerator: HardwareAccelerator,
         lowMemoryPressure: Boolean
     ) {
+        if (appliedAccelerator == accelerator &&
+            appliedLowMemoryMode == lowMemoryPressure &&
+            activeAcceleratorDescription.isNotEmpty()
+        ) {
+            return
+        }
         activeAcceleratorDescription = NpuHardwareManager.configureNativeRuntime(
             context = appContext,
             requested = accelerator,
             lowMemoryPressure = lowMemoryPressure
         )
         appliedAccelerator = accelerator
+        appliedLowMemoryMode = lowMemoryPressure
     }
 
     private fun evaluateMemoryPressure(): MemoryPressureReport {
@@ -771,13 +780,18 @@ class SmartPipeline(
     /**
      * Proactively reclaims JVM heap garbage before `FfiWriter.floats()` allocates its
      * `ByteArrayOutputStream` + `toByteArray()` buffers (~8-12 bytes per audio sample).
+     * Rate-limited so sequential Clear slices / live chunks do not trigger repeated stop-the-world GC pauses.
      */
     private fun ensureMemoryHeadroomForFfiLocked(sampleCount: Int) {
         val estimatedFfiMegabytes = ((sampleCount.toLong() * 12L) / (1024L * 1024L)).coerceAtLeast(4L)
         val report = evaluateMemoryPressure()
         if (report.isJvmHeapTight || report.jvmFreeHeadroomMb < estimatedFfiMegabytes * 3L) {
-            System.gc()
-            System.runFinalization()
+            val now = SystemClock.elapsedRealtime()
+            if (report.isJvmHeapCritical || now - lastForcedGcAtMs >= 1_500L) {
+                lastForcedGcAtMs = now
+                System.gc()
+                System.runFinalization()
+            }
         }
     }
 
@@ -873,6 +887,7 @@ class SmartPipeline(
             DebugLogManager.logMemorySnapshot("After Clear.enhance$stageSuffix (${enhanced.size} samples)")
             if (enhanced.isNotEmpty()) enhanced else conditionAudioWhenClearDisabled(rawSamples)
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.w(TAG, "Clear enhancement failed, falling back to conditioned PCM audio: ${t.message}")
             DebugLogManager.logWarn(TAG, "Clear enhancement failed, falling back to conditioned PCM audio", t)
             closeClearLocked()
@@ -946,6 +961,7 @@ class SmartPipeline(
                 fallbackLanguage
             }
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.w(TAG, "Ear language detection failed, falling back to $fallbackLanguage: ${t.message}")
             DebugLogManager.logWarn(TAG, "Ear language detection failed, falling back to $fallbackLanguage", t)
             closeEarLocked()
@@ -985,8 +1001,9 @@ class SmartPipeline(
             uhmInstance.detect(samples, SAMPLE_RATE_HZ)
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            Log.w(TAG, "Uhm filler inference failed; bypassing filler removal: ${t.message}")
-            DebugLogManager.logWarn(TAG, "Uhm filler inference failed; bypassing filler removal", t)
+            Log.w(TAG, "Uhm filler inference failed; resetting Uhm session and bypassing filler removal: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Uhm filler inference failed; resetting Uhm session and bypassing filler removal", t)
+            closeUhmLocked()
             emptyList()
         }
     }
@@ -1185,6 +1202,7 @@ class SmartPipeline(
                     )
                     earWarmedUp = true
                 } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
                     Log.w(TAG, "Ear warm-up deferred: ${t.message}")
                     DebugLogManager.logWarn(TAG, "Ear warm-up deferred", t)
                 }
@@ -1237,6 +1255,7 @@ class SmartPipeline(
                     clearWarmedUp = true
                     DebugLogManager.logInfo(TAG, "Clear accelerator warm-up complete", includeMemory = true)
                 } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
                     Log.w(TAG, "Clear warm-up deferred: ${t.message}")
                     DebugLogManager.logWarn(TAG, "Clear warm-up deferred", t)
                 }
@@ -1697,10 +1716,21 @@ fun conditionAudioWhenClearDisabled(samples: FloatArray): FloatArray {
         frameRms[f] = kotlin.math.sqrt(sumSq / frameLen).toFloat()
     }
 
-    // 3. Identify voiced frames vs background noise floor
-    val nonZeroRms = frameRms.filter { it > 0.0005f }.sorted()
-    if (nonZeroRms.isEmpty()) return samples
-    val noiseFloor = nonZeroRms[(nonZeroRms.size * 0.08f).toInt().coerceIn(0, nonZeroRms.size - 1)]
+    // 3. Identify voiced frames vs background noise floor (using primitive FloatArray copy + sort to avoid boxed List<Float> allocations)
+    var nonZeroCount = 0
+    for (r in frameRms) {
+        if (r > 0.0005f) nonZeroCount++
+    }
+    if (nonZeroCount == 0) return samples
+    val nonZeroRms = FloatArray(nonZeroCount)
+    var nzIdx = 0
+    for (r in frameRms) {
+        if (r > 0.0005f) {
+            nonZeroRms[nzIdx++] = r
+        }
+    }
+    nonZeroRms.sort()
+    val noiseFloor = nonZeroRms[(nonZeroCount * 0.08f).toInt().coerceIn(0, nonZeroCount - 1)]
     val voiceGate = max(noiseFloor * 2.2f, 0.0025f).coerceAtMost(0.018f)
 
     val voiced = BooleanArray(numFrames) { frameRms[it] >= voiceGate }
@@ -1718,15 +1748,20 @@ fun conditionAudioWhenClearDisabled(samples: FloatArray): FloatArray {
         }
     }
 
-    val voicedLevels = ArrayList<Float>(numFrames)
+    var voicedCount = 0
+    for (f in 0 until numFrames) {
+        if (voiced[f] && frameRms[f] >= voiceGate) voicedCount++
+    }
+    if (voicedCount == 0) return samples
+    val voicedLevels = FloatArray(voicedCount)
+    var vIdx = 0
     for (f in 0 until numFrames) {
         if (voiced[f] && frameRms[f] >= voiceGate) {
-            voicedLevels.add(frameRms[f])
+            voicedLevels[vIdx++] = frameRms[f]
         }
     }
-    if (voicedLevels.isEmpty()) return samples
     voicedLevels.sort()
-    val p80Speech = voicedLevels[(voicedLevels.size * 0.80f).toInt().coerceIn(0, voicedLevels.size - 1)]
+    val p80Speech = voicedLevels[(voicedCount * 0.80f).toInt().coerceIn(0, voicedCount - 1)]
     val targetRms = p80Speech.coerceIn(0.13f, 0.17f)
 
     // 4. Compute local 400 ms (+/- 10 frame) voiced RMS envelope and per-frame target gain

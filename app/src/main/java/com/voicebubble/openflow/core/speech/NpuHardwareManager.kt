@@ -145,6 +145,10 @@ object NpuHardwareManager {
         "librknn_api.so"
     )
 
+    private val QUALCOMM_SOC_REGEX = Regex(
+        "\\b(sm[4678]\\d{3}|sdm\\d{3}|qcs\\d{3,4}|lahaina|taro|kalama|pineapple|sun|crow|cliff|pakala|canoe)\\b"
+    )
+
     @Volatile
     private var cachedProfile: NpuHardwareProfile? = null
 
@@ -249,7 +253,7 @@ object NpuHardwareManager {
         val isQualcommSoc = norm.contains("qcom") ||
             norm.contains("qualcomm") ||
             norm.contains("snapdragon") ||
-            Regex("\\b(sm[4678]\\d{3}|sdm\\d{3}|qcs\\d{3,4}|lahaina|taro|kalama|pineapple|sun|crow|cliff)\\b").containsMatchIn(norm)
+            QUALCOMM_SOC_REGEX.containsMatchIn(norm)
 
         if (isQualcommSoc || hasQualcommLibs) {
             val arch = resolveQualcommHexagonArch(norm)
@@ -412,11 +416,16 @@ object NpuHardwareManager {
 
         try {
             // Native DAL LiteRT thread count (verified in dal_lrt_model_create -> getenv("DAL_LITERT_THREADS"))
-            // and DAL_RUN_DEPTH=1 (verified in ParallelRuns.depth -> getenv("DAL_RUN_DEPTH"))
+            // and DAL_RUN_DEPTH=1 (verified in ParallelRuns.depth -> getenv("DAL_RUN_DEPTH")).
+            // Cache dirs ensure compiled NPU/QNN/OpenCL/XNNPACK graphs are persisted across sessions and
+            // FastRPC / DSP restarts instead of recompiling on the fly.
             Os.setenv("DAL_LITERT_THREADS", threads.toString(), true)
             Os.setenv("DAL_RUN_DEPTH", "1", true)
             Os.setenv("LITERT_NUM_THREADS", threads.toString(), true)
             Os.setenv("LITERT_NPU_CACHE_DIR", npuCacheDir.absolutePath, true)
+            Os.setenv("LITERT_CACHE_DIR", npuCacheDir.absolutePath, true)
+            Os.setenv("TFLITE_CACHE_DIR", npuCacheDir.absolutePath, true)
+            Os.setenv("OPENCL_CACHE_DIR", npuCacheDir.absolutePath, true)
 
             when (effectiveMode) {
                 HardwareAccelerator.NPU -> {
@@ -424,31 +433,47 @@ object NpuHardwareManager {
                     Os.setenv("LITERT_USE_NNAPI", "1", true)
                     Os.setenv("LITERT_USE_GPU", "1", true)
                     Os.setenv("DAL_ACCELERATOR", "npu", true)
+                    Os.setenv("NNAPI_ALLOW_FP16", "1", true)
 
                     profile.dispatchLibraryDir?.let { dir ->
                         Os.setenv("LITERT_DISPATCH_LIBRARY_DIR", dir, true)
                         Os.setenv("QNN_LIBRARY_PATH", dir, true)
                     }
 
-                    // Qualcomm Hexagon HTP / CDSP FastRPC library paths
+                    // Qualcomm Hexagon HTP / CDSP FastRPC library paths & PDR (Process Domain Restart) recovery
                     if (profile.vendor == NpuVendor.QUALCOMM_HEXAGON || profile.hasFastRpcSupport) {
                         val dspPath = profile.dspLibraryPath
                             ?: "/vendor/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp"
                         Os.setenv("ADSP_LIBRARY_PATH", dspPath, true)
                         Os.setenv("CDSP_LIBRARY_PATH", dspPath, true)
-                        Os.setenv("QNN_HTP_PERF_MODE", if (lowMemoryPressure) "balanced" else "burst", true)
+                        // Use "sustained_high_performance" rather than "burst" when not in low-memory mode so
+                        // back-to-back live chunks do not trigger Hexagon HTP thermal/voltage throttling or
+                        // FastRPC CDSP watchdog timeouts on long dictations.
+                        Os.setenv(
+                            "QNN_HTP_PERF_MODE",
+                            if (lowMemoryPressure) "balanced" else "sustained_high_performance",
+                            true
+                        )
+                        Os.setenv("QNN_HTP_ENABLE_PDR", "1", true)
+                        Os.setenv("FASTRPC_PERF_KERNEL", "1", true)
                         Os.setenv("HEXAGON_NPU_ENABLE", "1", true)
                     }
 
                     // MediaTek NeuroPilot APU hints
                     if (profile.vendor == NpuVendor.MEDIATEK_NEUROPILOT) {
-                        Os.setenv("NEURON_RT_PERFORMANCE_MODE", "1", true)
+                        Os.setenv("NEURON_RT_PERFORMANCE_MODE", if (lowMemoryPressure) "0" else "1", true)
+                        Os.setenv("NEURON_RT_ALLOW_FP16", "1", true)
                         Os.setenv("MTK_NEUROPILOT_ENABLE", "1", true)
                     }
 
                     // Google Tensor EdgeTPU / DarwiNN hints
                     if (profile.vendor == NpuVendor.GOOGLE_TENSOR) {
                         Os.setenv("LITERT_GOOGLE_TENSOR_ENABLE", "1", true)
+                    }
+
+                    // Samsung Exynos ENN / EDEN NPU hints
+                    if (profile.vendor == NpuVendor.SAMSUNG_EXYNOS) {
+                        Os.setenv("ENN_PREFER_FP16", "1", true)
                     }
                 }
 

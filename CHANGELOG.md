@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.4] - 2026-10-22
+
+### Improved & Fixed
+- **NPU & Native Runtime Stability (`NpuHardwareManager`, `SmartPipeline`):**
+  - **Qualcomm Hexagon HTP Sustained Performance & CDSP Recovery (`NpuHardwareManager`):** Configured `QNN_HTP_PERF_MODE=sustained_high_performance` (replacing `"burst"`), `QNN_HTP_ENABLE_PDR=1` (Process Domain Restart recovery), `FASTRPC_PERF_KERNEL=1`, and persistent compiled-graph cache directories (`LITERT_CACHE_DIR`, `TFLITE_CACHE_DIR`, `OPENCL_CACHE_DIR`) so back-to-back live chunks do not trigger Hexagon HTP thermal/voltage throttling, CDSP FastRPC watchdog resets, or repeated graph recompilation.
+  - **Pre-Compiled SoC Detection Regex (`NpuHardwareManager`):** Pre-compiled `QUALCOMM_SOC_REGEX` once as a constant (including Snapdragon 8 Elite `pakala`/`canoe`) instead of recompiling a `Regex` on every classification call.
+  - **Idempotent Native Env Var Application & Rate-Limited FFI GC (`SmartPipeline`):** `applyHardwareAcceleratorSettingsLocked` now skips redundant `Os.setenv` calls when `(accelerator, lowMemoryPressure)` has not changed, and `ensureMemoryHeadroomForFfiLocked` rate-limits non-critical `System.gc()` + `System.runFinalization()` calls across sequential `Clear` windows and live chunks to eliminate stop-the-world GC pauses during dictation.
+  - **Native Session Fault Recovery & Coroutine Cancellation Safety (`SmartPipeline`):** Re-throws `CancellationException` in `runClearStageLocked`, `resolveLanguageLocked`, and warm-up stages so cancelled coroutines never trigger unnecessary native session teardowns, and resets `Uhm` (`closeUhmLocked()`) if `uhmInstance.detect` throws a native error so subsequent chunks recover cleanly.
+  - **Zero-Boxed-Allocation Speech Conditioning (`conditionAudioWhenClearDisabled`) & Cached Model Directory Checks (`DesertAntModelStorage`):** Replaced boxed `List<Float>` allocations in `conditionAudioWhenClearDisabled` with primitive `FloatArray` operations and added an in-memory directory timestamp cache in `isModelDirectoryComplete` to avoid redundant per-chunk disk `stat()` syscalls.
+
 ## [2.6.3] - 2026-10-22
 
 ### Fixed & Improved

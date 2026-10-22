@@ -311,6 +311,10 @@ object DesertAntModelStorage {
         DesertAntModel.UHM to "v1.1.0"
     )
 
+    // In-memory cache of (targetDir.absolutePath -> (lastModifiedSum, sizeSum)) for verified model directories
+    // so repeated per-chunk / per-UI checks avoid redundant disk stat() syscalls when nothing on disk changed.
+    private val directoryCompleteCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Long>>()
+
     @Volatile
     private var bundledExtractionChecked = false
 
@@ -434,21 +438,41 @@ object DesertAntModelStorage {
      * but intentionally does NOT forge `.openflow_verified` stamps for unverified files.
      */
     fun isModelDirectoryComplete(targetDir: File, artifacts: List<ModelFileArtifact>): Boolean {
-        if (!targetDir.exists() || !targetDir.isDirectory || artifacts.isEmpty()) return false
+        if (!targetDir.exists() || !targetDir.isDirectory || artifacts.isEmpty()) {
+            directoryCompleteCache.remove(targetDir.absolutePath)
+            return false
+        }
+        val manifestFile = File(File(targetDir, ".dal-meta"), "manifest")
+        val dirKey = targetDir.absolutePath
+        val cached = directoryCompleteCache[dirKey]
+        if (cached != null && manifestFile.exists()) {
+            val dirLastMod = targetDir.lastModified()
+            if (dirLastMod > 0L && dirLastMod == cached.first && artifacts.size.toLong() == cached.second) {
+                return true
+            }
+        }
+
         for (artifact in artifacts) {
             val finalFile = File(targetDir, artifact.relativePath)
             val partFile = File(targetDir, "${artifact.relativePath}.part")
-            if (partFile.exists()) return false
+            if (partFile.exists()) {
+                directoryCompleteCache.remove(dirKey)
+                return false
+            }
             if (!finalFile.exists() || !finalFile.isFile || finalFile.length() != artifact.sizeBytes) {
+                directoryCompleteCache.remove(dirKey)
                 return false
             }
         }
-        val manifestFile = File(File(targetDir, ".dal-meta"), "manifest")
         if (!manifestFile.exists()) {
             try {
                 writeModelManifest(targetDir, artifacts)
             } catch (_: Throwable) {
             }
+        }
+        val finalDirMod = targetDir.lastModified()
+        if (finalDirMod > 0L && manifestFile.exists()) {
+            directoryCompleteCache[dirKey] = finalDirMod to artifacts.size.toLong()
         }
         return true
     }
@@ -570,6 +594,8 @@ object DesertAntModelStorage {
      */
     fun deleteModelCache(context: Context, model: DesertAntModel): Boolean {
         if (model.isRequired) return false
+        val revDir = modelRevisionDir(context, model)
+        directoryCompleteCache.remove(revDir.absolutePath)
         val root = modelCacheRoot(context, model)
         return if (root.exists()) {
             root.deleteRecursively()
