@@ -89,6 +89,7 @@ fun OnboardingScreen(
     val sessionState by ModelDownloadManager.sessionState.collectAsState()
 
     var earSelected by remember { mutableStateOf(initialSettings.earEnabled) }
+    var punctSelected by remember { mutableStateOf(initialSettings.punctEnabled) }
 
     var step by remember {
         mutableStateOf(
@@ -101,7 +102,8 @@ fun OnboardingScreen(
     }
 
     val configuredSettings = initialSettings.copy(
-        earEnabled = earSelected
+        earEnabled = earSelected,
+        punctEnabled = punctSelected
     )
 
     val selectedModels = configuredSettings.enabledModels()
@@ -227,6 +229,18 @@ fun OnboardingScreen(
                             enabled = true,
                             isLocked = false,
                             onCheckedChange = { earSelected = it }
+                        )
+
+                        HorizontalDivider()
+
+                        // Punct (Off by default)
+                        OnboardingModelRow(
+                            title = "Punct — Text & Punctuation Cleanup (${DesertAntModel.PUNCT.sizeMb} MB, Optional)",
+                            subtitle = DesertAntModel.PUNCT.roleSummary,
+                            checked = punctSelected,
+                            enabled = true,
+                            isLocked = false,
+                            onCheckedChange = { punctSelected = it }
                         )
                     }
                 }

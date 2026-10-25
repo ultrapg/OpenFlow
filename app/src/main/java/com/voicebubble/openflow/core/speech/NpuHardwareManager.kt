@@ -16,12 +16,15 @@
 
 package com.voicebubble.openflow.core.speech
 
+import ai.onnxruntime.OrtSession
+import ai.onnxruntime.providers.NNAPIFlags
 import android.content.Context
 import android.os.Build
 import android.system.Os
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import java.io.File
+import java.util.EnumSet
 import java.util.Locale
 
 enum class NpuVendor(val displayName: String, val runtimeName: String) {
@@ -433,10 +436,13 @@ object NpuHardwareManager {
                     Os.setenv("LITERT_USE_NNAPI", "1", true)
                     Os.setenv("LITERT_USE_GPU", "1", true)
                     Os.setenv("DAL_ACCELERATOR", "npu", true)
+                    Os.setenv("DAL_DEVICE_ID", "npu", true)
                     Os.setenv("NNAPI_ALLOW_FP16", "1", true)
+                    Os.setenv("ORT_NNAPI_ENABLE_FP16", "1", true)
 
                     profile.dispatchLibraryDir?.let { dir ->
                         Os.setenv("LITERT_DISPATCH_LIBRARY_DIR", dir, true)
+                        Os.setenv("LITERT_DISPATCH_LIB_PATH", dir, true)
                         Os.setenv("QNN_LIBRARY_PATH", dir, true)
                     }
 
@@ -482,6 +488,7 @@ object NpuHardwareManager {
                     Os.setenv("LITERT_USE_NNAPI", "0", true)
                     Os.setenv("LITERT_USE_GPU", "1", true)
                     Os.setenv("DAL_ACCELERATOR", "gpu", true)
+                    Os.setenv("DAL_DEVICE_ID", "gpu", true)
                 }
 
                 HardwareAccelerator.CPU -> {
@@ -489,6 +496,7 @@ object NpuHardwareManager {
                     Os.setenv("LITERT_USE_NNAPI", "0", true)
                     Os.setenv("LITERT_USE_GPU", "0", true)
                     Os.setenv("DAL_ACCELERATOR", "cpu", true)
+                    Os.setenv("DAL_DEVICE_ID", "cpu", true)
                 }
 
                 HardwareAccelerator.AUTO -> Unit
@@ -542,6 +550,80 @@ object NpuHardwareManager {
             HardwareAccelerator.GPU -> null // default native computeUnits (.cpuAndGPU / .all)
             HardwareAccelerator.NPU, HardwareAccelerator.AUTO -> null
         }
+    }
+
+    /**
+     * Configures an ONNX Runtime [OrtSession.SessionOptions] instance to maximize NPU execution
+     * (via Qualcomm QNN HTP and Android NNAPI hardware HAL with FP16 relaxation) while registering
+     * XNNPACK + multi-core CPU threads as a fast fallback for any un-partitioned graph nodes.
+     */
+    fun configureOnnxSessionForNpu(
+        sessionOptions: OrtSession.SessionOptions,
+        requested: HardwareAccelerator,
+        lowMemoryPressure: Boolean
+    ): String {
+        val profile = detectHardwareProfile()
+        val threads = if (lowMemoryPressure) {
+            profile.recommendedCpuThreads.coerceAtMost(3)
+        } else {
+            profile.recommendedCpuThreads
+        }
+
+        val preferNpu = !lowMemoryPressure && (
+            requested == HardwareAccelerator.NPU ||
+                (requested == HardwareAccelerator.AUTO && (profile.hasHardwareNpu || profile.hasNnapiSupport))
+            )
+
+        runCatching {
+            sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            sessionOptions.setIntraOpNumThreads(threads)
+            sessionOptions.setInterOpNumThreads(1)
+        }
+
+        val activeProviders = mutableListOf<String>()
+
+        if (preferNpu) {
+            // 1. Direct Qualcomm QNN HTP Execution Provider (when bundled or available on system path)
+            if (profile.vendor == NpuVendor.QUALCOMM_HEXAGON || profile.hasFastRpcSupport) {
+                val htpLib = profile.discoveredLibraries.firstOrNull { it.endsWith("libQnnHtp.so") }
+                    ?: "/vendor/lib64/libQnnHtp.so"
+                val qnnOptions = mapOf(
+                    "backend_path" to htpLib,
+                    "htp_performance_mode" to if (lowMemoryPressure) "balanced" else "sustained_high_performance",
+                    "enable_htp_fp16_precision" to "1"
+                )
+                runCatching {
+                    sessionOptions.addQnn(qnnOptions)
+                    activeProviders.add("QNN-HTP")
+                }
+            }
+
+            // 2. Android NNAPI Execution Provider (dispatches INT8/FP16 transformer ops to Hexagon NPU,
+            //    Google Tensor TPU, MediaTek NeuroPilot APU, Samsung Exynos ENN, and Kirin DaVinci)
+            if (profile.hasNnapiSupport) {
+                runCatching {
+                    sessionOptions.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
+                    activeProviders.add("NNAPI (${profile.vendor.displayName})")
+                }
+            }
+        }
+
+        // 3. XNNPACK Execution Provider for fast SIMD acceleration of any un-partitioned subgraphs
+        runCatching {
+            sessionOptions.addXnnpack(mapOf("intra_op_num_threads" to threads.toString()))
+            activeProviders.add("XNNPACK ($threads threads)")
+        }
+
+        if (activeProviders.isEmpty()) {
+            activeProviders.add("CPU ($threads threads)")
+        }
+
+        val summary = activeProviders.joinToString(" -> ")
+        DebugLogManager.logInfo(
+            "NpuHardwareManager",
+            "Configured ONNX Runtime session providers: $summary (requested=${requested.id}, vendor=${profile.vendor.name})"
+        )
+        return summary
     }
 
     private fun buildSocSignature(): String {

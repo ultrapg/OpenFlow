@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.7] - 2026-10-25
+
+### Added
+- **`Punct` — On-Device Neural Punctuation & Casing Restoration Model (`PunctuationRestorer`, `DesertAntModel.PUNCT`, `ModelSettings`, `ModelDownloadManager`, `OnboardingScreen`, `SpeechRecognitionSettingsSection`, `SmartPipeline`):**
+  - Integrated the INT8 multilingual `XLMRobertaForTokenClassification` model (`onnx-community/punctuate-all-ONNX` / `kredor/punctuate-all`, `282 MB`, **disabled by default**) for post-stitching punctuation and casing restoration across European languages.
+  - **0% Hallucination Guarantee:** Runs a single bidirectional encoder forward pass over the spoken words (`0` = none, `1` = `.`, `2` = `,`, `3` = `?`, `4` = `-`, `5` = `:`) to remove false mid-sentence periods across chunk boundaries, restore missing commas/question marks, and lowercase falsely capitalized continuation words while preserving German noun capitalization, `"I"`, acronyms, and custom vocabulary terms—without ever adding, deleting, or altering any spoken word.
+  - **Streaming Unigram SentencePiece Tokenizer (`UnigramSentencePieceTokenizer`):** Parses `tokenizer.json` (`250,002` pieces) via a streaming UTF-8 reader and performs Viterbi maximum-likelihood subword segmentation with `▁` prefixing.
+- **Full-Pipeline NPU Acceleration (`NpuHardwareManager`, `PunctuationRestorer`):**
+  - Configured ONNX Runtime Android (`onnxruntime-android:1.20.0`) with **Qualcomm QNN HTP (`addQnn`)** and **Android NNAPI (`addNnapi(NNAPIFlags.USE_FP16)`)** execution providers plus **XNNPACK** fallback so `Punct` executes directly on the device NPU alongside `Voz` and `Ear`.
+
 ## [2.6.6] - 2026-10-22
 
 ### Removed

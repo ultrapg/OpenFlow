@@ -66,6 +66,14 @@ enum class DesertAntModel(
         sizeMb = 10,
         expectedBytes = 10_738_698L,
         isRequired = false
+    ),
+    PUNCT(
+        id = "punct",
+        displayName = "Punct — Text & Punctuation Cleanup",
+        roleSummary = "XLM-RoBERTa token tagger that fixes mid-sentence periods, commas & casing on the NPU (0% hallucination)",
+        sizeMb = 282,
+        expectedBytes = 295_740_930L,
+        isRequired = false
     );
 }
 
@@ -115,6 +123,7 @@ enum class HardwareAccelerator(
  */
 data class ModelSettings(
     val earEnabled: Boolean = true,
+    val punctEnabled: Boolean = false,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -128,32 +137,40 @@ data class ModelSettings(
      * Active disk footprint in MB based on currently enabled models:
      * - `Voz`: 1,187 MB
      * - `Ear`: +10 MB
+     * - `Punct`: +282 MB
      */
     val activeDiskFootprintMb: Int
         get() = DesertAntModel.VOZ.sizeMb +
-            (if (earEnabled) DesertAntModel.EAR.sizeMb else 0)
+            (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
+            (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on loaded LiteRT model weights (`Voz` + `Ear`) + runtime buffers:
+     * Estimated peak RAM in MB based on loaded LiteRT/ONNX model weights (`Voz` + `Ear` + `Punct`) + runtime buffers:
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
+     * - `Punct` (INT8 XLM-RoBERTa token classifier on NPU/XNNPACK): +120 MB
      */
     val estimatedPeakRamMb: Int
-        get() = 1400 + (if (earEnabled) 50 else 0)
+        get() = 1400 +
+            (if (earEnabled) 50 else 0) +
+            (if (punctEnabled) 120 else 0)
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
         DesertAntModel.VOZ -> true
         DesertAntModel.EAR -> earEnabled
+        DesertAntModel.PUNCT -> punctEnabled
     }
 
     fun enabledModels(): List<DesertAntModel> = buildList {
         add(DesertAntModel.VOZ)
         if (earEnabled) add(DesertAntModel.EAR)
+        if (punctEnabled) add(DesertAntModel.PUNCT)
     }
 
     companion object {
         const val PREFS_NAME = "openflow_model_settings"
         const val KEY_EAR_ENABLED = "ear_enabled"
+        const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -182,6 +199,7 @@ data class ModelSettings(
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
+                punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel
@@ -205,6 +223,7 @@ data class ModelSettings(
 
             getPreferences(context).edit()
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
+                .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
@@ -261,7 +280,8 @@ object DesertAntModelStorage {
 
     private val MODEL_REVISIONS = mapOf(
         DesertAntModel.VOZ to "v0.4.0",
-        DesertAntModel.EAR to "v0.2.0"
+        DesertAntModel.EAR to "v0.2.0",
+        DesertAntModel.PUNCT to "v1.0.0"
     )
 
     // In-memory cache of (targetDir.absolutePath -> (lastModifiedSum, sizeSum)) for verified model directories

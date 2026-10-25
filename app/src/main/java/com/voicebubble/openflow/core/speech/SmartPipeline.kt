@@ -136,7 +136,8 @@ data class PipelineStatus(
     val dynamicLoadingMode: String = "Adaptive Stage Management",
     val modelStates: Map<DesertAntModel, ModelLoadState> = mapOf(
         DesertAntModel.VOZ to ModelLoadState.STANDBY,
-        DesertAntModel.EAR to ModelLoadState.STANDBY
+        DesertAntModel.EAR to ModelLoadState.STANDBY,
+        DesertAntModel.PUNCT to ModelLoadState.DISABLED
     ),
     val statusMessage: String = "Models on disk — ready to load",
     val lastInferenceMs: Long? = null,
@@ -206,9 +207,11 @@ class SmartPipeline(
 
     private var voz: Voz? = null
     private var ear: Ear? = null
+    private var punctRestorer: PunctuationRestorer? = null
 
     private var vozWarmedUp: Boolean = false
     private var earWarmedUp: Boolean = false
+    private var punctWarmedUp: Boolean = false
 
     @Volatile
     private var isTranscribing: Boolean = false
@@ -377,10 +380,12 @@ class SmartPipeline(
                     includeMemory = true
                 )
                 closeEarLocked()
+                closePunctLocked()
                 closeVozLocked()
                 System.gc()
             } else {
                 if (!snapshot.earEnabled) closeEarLocked()
+                if (!snapshot.punctEnabled) closePunctLocked()
             }
 
             updateStatusSnapshot(
@@ -546,11 +551,33 @@ class SmartPipeline(
                     }
                 }
 
-                val finalTranscript = stitchChunkTranscripts(
+                val stitchedTranscript = stitchChunkTranscripts(
                     chunks = segmentTranscripts,
                     language = resolvedLanguage,
                     customVocabulary = activeSettings.customVocabulary
                 )
+
+                // =========================================================================
+                // Stage 4: Neural Punctuation & Casing Restoration (`Punct`, optional)
+                // =========================================================================
+                val finalTranscript = if (stitchedTranscript.isNotBlank() &&
+                    activeSettings.punctEnabled &&
+                    DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
+                ) {
+                    runPunctLocked(
+                        text = stitchedTranscript,
+                        language = resolvedLanguage,
+                        activeSettings = activeSettings,
+                        onStageProgress = onStageProgress
+                    ).also {
+                        if (dynamicStageRelease && punctRestorer != null) {
+                            DebugLogManager.logInfo(TAG, "Critical memory staging: releasing Punct session after restoration")
+                            closePunctLocked()
+                        }
+                    }
+                } else {
+                    stitchedTranscript
+                }
 
                 // Re-attach auxiliary models in ready state if memory is healthy
                 val postMem = evaluateMemoryPressure()
@@ -592,14 +619,15 @@ class SmartPipeline(
     }
 
     /**
-     * Evicts optional models (`Ear`) from native RAM while keeping `Voz` resident.
+     * Evicts optional models (`Ear`, `Punct`) from native RAM while keeping `Voz` resident.
      */
     suspend fun evictOptionalModels() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             if (!isTranscribing) {
-                Log.i(TAG, "Evicting optional models (Ear) to free native RAM; keeping Voz resident.")
-                DebugLogManager.logInfo(TAG, "Evicting optional models (Ear) from native RAM", includeMemory = true)
+                Log.i(TAG, "Evicting optional models (Ear, Punct) to free native RAM; keeping Voz resident.")
+                DebugLogManager.logInfo(TAG, "Evicting optional models (Ear, Punct) from native RAM", includeMemory = true)
                 closeEarLocked()
+                closePunctLocked()
                 System.gc()
                 val snap = settings
                 updateStatusSnapshot(
@@ -624,13 +652,14 @@ class SmartPipeline(
     }
 
     /**
-     * Releases all native LiteRT sessions (`Ear` and `Voz`).
+     * Releases all native LiteRT/ONNX sessions (`Ear`, `Punct`, and `Voz`).
      */
     suspend fun shutdown() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
             closeEarLocked()
+            closePunctLocked()
             closeVozLocked()
             System.gc()
             val snap = settings
@@ -732,6 +761,12 @@ class SmartPipeline(
             if (activeSettings.earEnabled &&
                 DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR) &&
                 ear == null
+            ) {
+                return false
+            }
+            if (activeSettings.punctEnabled &&
+                DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT) &&
+                punctRestorer == null
             ) {
                 return false
             }
@@ -840,6 +875,7 @@ class SmartPipeline(
             )
             // Free all optional native sessions & compact JVM heap before retrying Voz
             closeEarLocked()
+            closePunctLocked()
             closeVozLocked()
             System.gc()
             System.runFinalization()
@@ -1009,12 +1045,100 @@ class SmartPipeline(
         } else if (!activeSettings.earEnabled) {
             closeEarLocked()
         }
+
+        // Punct (Neural Punctuation & Casing Restoration on NPU/XNNPACK)
+        if (activeSettings.punctEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)) {
+            if (punctRestorer == null && !mem.isCriticalPressure) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.PUNCT,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading Punct text cleanup model on NPU..."
+                    )
+                    val punctDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.PUNCT)
+                    punctRestorer = PunctuationRestorer(
+                        context = appContext,
+                        modelDir = punctDir,
+                        accelerator = activeSettings.hardwareAccelerator,
+                        lowMemoryPressure = mem.isAnyMemoryTight
+                    )
+                    punctWarmedUp = false
+                    DebugLogManager.logInfo(TAG, "Punct model loaded into RAM", includeMemory = true)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not initialize Punct: ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not initialize Punct model", t)
+                    closePunctLocked()
+                }
+            }
+            val currentPunct = punctRestorer
+            if (warmUp && currentPunct != null && !punctWarmedUp && !mem.isCriticalPressure) {
+                try {
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = DesertAntModel.PUNCT,
+                        state = ModelLoadState.LOADING,
+                        message = "Warming up Punct on NPU..."
+                    )
+                    currentPunct.warmUp()
+                    punctWarmedUp = true
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    Log.w(TAG, "Punct warm-up deferred: ${t.message}")
+                    DebugLogManager.logWarn(TAG, "Punct warm-up deferred", t)
+                }
+            }
+        } else if (!activeSettings.punctEnabled) {
+            closePunctLocked()
+        }
+    }
+
+    private fun runPunctLocked(
+        text: String,
+        language: String,
+        activeSettings: ModelSettings,
+        onStageProgress: ((String) -> Unit)?
+    ): String {
+        val mem = evaluateMemoryPressure()
+        val instance = punctRestorer ?: run {
+            val punctDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.PUNCT)
+            try {
+                PunctuationRestorer(
+                    context = appContext,
+                    modelDir = punctDir,
+                    accelerator = activeSettings.hardwareAccelerator,
+                    lowMemoryPressure = mem.isAnyMemoryTight
+                ).also { punctRestorer = it }
+            } catch (t: Throwable) {
+                DebugLogManager.logWarn(TAG, "Failed to dynamically load Punct: ${t.message}")
+                return text
+            }
+        }
+
+        return try {
+            setModelActiveStatusLocked(activeSettings, DesertAntModel.PUNCT, "Cleaning punctuation & casing with Punct...")
+            onStageProgress?.invoke("Punct")
+            val restored = instance.restore(
+                text = text,
+                languageCode = language,
+                customVocabulary = activeSettings.customVocabulary
+            )
+            punctWarmedUp = true
+            restored
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Log.w(TAG, "Punct inference failed, keeping Voz transcript: ${t.message}")
+            DebugLogManager.logWarn(TAG, "Punct inference failed, keeping Voz transcript", t)
+            closePunctLocked()
+            text
+        }
     }
 
     private fun countLoadedModelsLocked(activeSettings: ModelSettings): Int {
         var count = 0
         if (voz != null) count++
         if (activeSettings.earEnabled && ear != null) count++
+        if (activeSettings.punctEnabled && punctRestorer != null) count++
         return count
     }
 
@@ -1034,6 +1158,7 @@ class SmartPipeline(
             val instanceLoaded = when (model) {
                 DesertAntModel.VOZ -> voz != null
                 DesertAntModel.EAR -> ear != null
+                DesertAntModel.PUNCT -> punctRestorer != null
             }
             result[model] = when {
                 !enabled -> ModelLoadState.DISABLED
@@ -1133,6 +1258,18 @@ class SmartPipeline(
         val instance = ear
         ear = null
         earWarmedUp = false
+        if (instance != null) {
+            try {
+                instance.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun closePunctLocked() {
+        val instance = punctRestorer
+        punctRestorer = null
+        punctWarmedUp = false
         if (instance != null) {
             try {
                 instance.close()

@@ -61,7 +61,8 @@ import kotlin.math.roundToInt
 data class ModelFileArtifact(
     val relativePath: String,
     val sizeBytes: Long,
-    val sha256: String
+    val sha256: String,
+    val downloadUrl: String? = null
 )
 
 enum class ModelQueueStatus {
@@ -230,6 +231,22 @@ object ModelDownloadManager {
                     sha256 = "07163e5f6f8a68f9ffeed7a8ff770c68098c2db216232321912188bd614b9a72"
                 )
             )
+            ),
+        DesertAntModel.PUNCT to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "model_int8.onnx",
+                    sizeBytes = 278_658_098L,
+                    sha256 = "c73af2ff16e71cd198db85043eb687575bcefe6ee8281cb0db6b0969c6a258ec",
+                    downloadUrl = "https://huggingface.co/onnx-community/punctuate-all-ONNX/resolve/main/onnx/model_int8.onnx"
+                ),
+                ModelFileArtifact(
+                    relativePath = "tokenizer.json",
+                    sizeBytes = 17_082_832L,
+                    sha256 = "8373f9cd3d27591e1924426bcc1c8799bc5a9affc4fc857982c5d66668dd1f41",
+                    downloadUrl = "https://huggingface.co/onnx-community/punctuate-all-ONNX/resolve/main/tokenizer.json"
+                )
+            )
             )
     )
 
@@ -291,6 +308,7 @@ object ModelDownloadManager {
             val current = ModelSettings.load(context)
             val updated = when (model) {
                 DesertAntModel.EAR -> current.copy(earEnabled = true)
+                DesertAntModel.PUNCT -> current.copy(punctEnabled = true)
                 DesertAntModel.VOZ -> current
             }
             if (updated != current) {
@@ -576,7 +594,8 @@ object ModelDownloadManager {
                 }
             }
 
-            val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val urlStr = artifact.downloadUrl
+                ?: "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
             val completedBeforeFile = completedArtifactBytes
             downloadFileWithAutoResume(
                 urlStr = urlStr,
@@ -652,7 +671,8 @@ object ModelDownloadManager {
                 finalFile.delete()
             }
 
-            val urlStr = "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
+            val urlStr = artifact.downloadUrl
+                ?: "https://huggingface.co/desert-ant-labs/${model.id}/resolve/$revision/${artifact.relativePath}"
             val completedBeforeThisFile = completedBytesInModel
 
             val currentQueueSnapshot = synchronized(queueLock) { activeQueue.toList() }

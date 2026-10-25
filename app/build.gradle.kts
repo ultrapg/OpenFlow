@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 31
-        versionName = "2.6.6"
+        versionCode = 32
+        versionName = "2.6.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -160,6 +160,9 @@ dependencies {
     // Desert Ant Labs Audio AI Ecosystem (LiteRT 2.2.0 CPU + GPU/OpenCL accelerator bundled via ai.desertant:core:4.0.0)
     implementation("ai.desertant:voz:4.0.0")
     implementation("ai.desertant:ear:4.0.0")
+
+    // ONNX Runtime Android with NNAPI / QNN NPU & XNNPACK Execution Providers for Punctuation & Casing Restoration
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")

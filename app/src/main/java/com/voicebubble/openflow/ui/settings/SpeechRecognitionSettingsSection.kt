@@ -144,6 +144,7 @@ fun SpeechRecognitionSettingsSection(
             ModelDownloadManager.cancelAutoEnable(model)
             val updated = when (model) {
                 DesertAntModel.EAR -> settings.copy(earEnabled = false)
+                DesertAntModel.PUNCT -> settings.copy(punctEnabled = false)
                 DesertAntModel.VOZ -> settings
             }
             persistAndReload(updated)
@@ -155,6 +156,7 @@ fun SpeechRecognitionSettingsSection(
                 if (alreadyDownloaded) {
                     val updated = when (model) {
                         DesertAntModel.EAR -> settings.copy(earEnabled = true)
+                        DesertAntModel.PUNCT -> settings.copy(punctEnabled = true)
                         DesertAntModel.VOZ -> settings
                     }
                     persistAndReload(updated)
@@ -299,7 +301,7 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/2)",
+                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/${DesertAntModel.entries.size})",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -471,6 +473,22 @@ fun SpeechRecognitionSettingsSection(
                     onPause = { ModelDownloadManager.pauseDownloads() },
                     onResume = { handleOptionalToggle(DesertAntModel.EAR, true) },
                     onCheckedChange = { handleOptionalToggle(DesertAntModel.EAR, it) }
+                )
+
+                HorizontalDivider()
+
+                // Punct (Off by default)
+                ModelToggleItem(
+                    title = "Punct — Text & Punctuation Cleanup (${DesertAntModel.PUNCT.sizeMb} MB)",
+                    subtitle = DesertAntModel.PUNCT.roleSummary,
+                    loadState = pipelineStatus.modelStates[DesertAntModel.PUNCT],
+                    checked = settings.punctEnabled || DesertAntModel.PUNCT in downloadState.pendingAutoEnableModels,
+                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.PUNCT),
+                    isLocked = false,
+                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.PUNCT && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                    onPause = { ModelDownloadManager.pauseDownloads() },
+                    onResume = { handleOptionalToggle(DesertAntModel.PUNCT, true) },
+                    onCheckedChange = { handleOptionalToggle(DesertAntModel.PUNCT, it) }
                 )
 
                 if (downloadState.errorMessage != null) {

@@ -13,6 +13,14 @@
 -dontwarn org.tensorflow.lite.**
 -dontwarn com.google.ai.edge.litert.**
 
+# ONNX Runtime Android (NNAPI / QNN NPU & XNNPACK Execution Providers)
+-keep class ai.onnxruntime.** { *; }
+-keepclassmembers class ai.onnxruntime.** {
+    native <methods>;
+    *;
+}
+-dontwarn ai.onnxruntime.**
+
 # OpenFlow Core & Persistence
 -keep class com.voicebubble.openflow.core.database.** { *; }
 -keep class com.voicebubble.openflow.core.speech.** { *; }

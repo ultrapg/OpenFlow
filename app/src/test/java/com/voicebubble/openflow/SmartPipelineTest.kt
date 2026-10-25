@@ -95,17 +95,36 @@ class SmartPipelineTest {
 
     @Test
     fun `ModelSettings toggle state matrix calculates RAM and disk accurately`() {
-        assertEquals(1450, ModelSettings(earEnabled = true).estimatedPeakRamMb)
-        assertEquals(1197, ModelSettings(earEnabled = true).activeDiskFootprintMb)
+        assertEquals(1450, ModelSettings(earEnabled = true, punctEnabled = false).estimatedPeakRamMb)
+        assertEquals(1197, ModelSettings(earEnabled = true, punctEnabled = false).activeDiskFootprintMb)
 
-        assertEquals(1400, ModelSettings(earEnabled = false).estimatedPeakRamMb)
-        assertEquals(1187, ModelSettings(earEnabled = false).activeDiskFootprintMb)
+        assertEquals(1400, ModelSettings(earEnabled = false, punctEnabled = false).estimatedPeakRamMb)
+        assertEquals(1187, ModelSettings(earEnabled = false, punctEnabled = false).activeDiskFootprintMb)
+
+        assertEquals(1570, ModelSettings(earEnabled = true, punctEnabled = true).estimatedPeakRamMb)
+        assertEquals(1479, ModelSettings(earEnabled = true, punctEnabled = true).activeDiskFootprintMb)
 
         val defaultSettings = ModelSettings()
         assertTrue(defaultSettings.vozEnabled)
         assertTrue(defaultSettings.earEnabled)
+        assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
+        assertEquals(
+            listOf(
+                com.voicebubble.openflow.settings.DesertAntModel.VOZ,
+                com.voicebubble.openflow.settings.DesertAntModel.EAR
+            ),
+            defaultSettings.enabledModels()
+        )
+        assertEquals(
+            listOf(
+                com.voicebubble.openflow.settings.DesertAntModel.VOZ,
+                com.voicebubble.openflow.settings.DesertAntModel.EAR,
+                com.voicebubble.openflow.settings.DesertAntModel.PUNCT
+            ),
+            ModelSettings(earEnabled = true, punctEnabled = true).enabledModels()
+        )
 
         for (model in com.voicebubble.openflow.settings.DesertAntModel.entries) {
             assertEquals(
@@ -732,5 +751,116 @@ class SmartPipelineTest {
             transcription = transcription
         )
         assertEquals("Optimize it so that the end never gets cut off.", result)
+    }
+
+    @Test
+    fun `UnigramSentencePieceTokenizer parses tokenizer json and segments words via Viterbi`() {
+        val tempFile = java.io.File.createTempFile("punct_tokenizer_test", ".json")
+        try {
+            tempFile.writeText(
+                """
+                {
+                  "version": "1.0",
+                  "model": {
+                    "type": "Unigram",
+                    "unk_id": 3,
+                    "vocab": [
+                      ["<s>", 0.0],
+                      ["<pad>", 0.0],
+                      ["</s>", 0.0],
+                      ["<unk>", 0.0],
+                      ["\u2581hello", -4.2],
+                      ["\u2581world", -4.5],
+                      ["\u2581un", -3.1],
+                      ["believ", -5.0],
+                      ["able", -3.8],
+                      ["\u2581u", -6.0],
+                      ["n", -6.0]
+                    ]
+                  }
+                }
+                """.trimIndent()
+            )
+
+            val tokenizer = com.voicebubble.openflow.core.speech.UnigramSentencePieceTokenizer.fromTokenizerJson(tempFile)
+            assertEquals(11, tokenizer.vocabSize)
+
+            // Exact whole-word match -> single token ID
+            val helloIds = tokenizer.encodeWord("hello")
+            assertEquals(listOf(4L), helloIds.toList())
+
+            // Multi-subword Viterbi segmentation ("\u2581un" + "believ" + "able" = -11.9 beats "\u2581u" + "n" + ...)
+            val unbelievableIds = tokenizer.encodeWord("unbelievable")
+            assertEquals(listOf(6L, 7L, 8L), unbelievableIds.toList())
+        } finally {
+            tempFile.delete()
+        }
+    }
+
+    @Test
+    fun `PunctuationRestorer applyPunctuationAndCasing fixes false mid-sentence periods and preserves German nouns`() {
+        // 1. English false mid-sentence period removal + comma insertion + preserving "I" and custom vocab
+        val enRawTokens = "I want to test this. Because the chunking split here. And I use openflow.".split(" ")
+        val enParsed = enRawTokens.mapIndexed { idx, tok ->
+            com.voicebubble.openflow.core.speech.parseWordToken(tok, idx, enRawTokens)
+        }
+        // Labels: 0=none, 1='.', 2=',', 3='?'
+        // "this." had a false period -> model predicts 0 (none) so "Because" becomes "because"
+        // "here." had a false period -> model predicts 2 (comma) so "here," and "And" becomes "and", while "I" stays "I"
+        val enLabels = intArrayOf(
+            0, // I
+            0, // want
+            0, // to
+            0, // test
+            0, // this (was "this.") -> false period removed!
+            0, // Because -> lowercased to "because"
+            0, // the
+            0, // chunking
+            0, // split
+            2, // here (was "here.") -> converted to comma!
+            0, // And -> lowercased to "and"
+            0, // I -> stays "I"
+            0, // use
+            1  // openflow. -> period + custom vocab "OpenFlow"
+        )
+        val enRestored = com.voicebubble.openflow.core.speech.applyPunctuationAndCasing(
+            words = enParsed,
+            predictedLabels = enLabels,
+            languageCode = "en",
+            customVocabulary = listOf("OpenFlow")
+        )
+        assertEquals(
+            "I want to test this because the chunking split here, and I use OpenFlow.",
+            enRestored
+        )
+
+        // 2. German false mid-sentence period removal: lowercases verbs/conjunctions while keeping German nouns capitalized
+        val deRawTokens = "Wir arbeiten an der. Optimierung von dem Programm. Weil es schneller läuft.".split(" ")
+        val deParsed = deRawTokens.mapIndexed { idx, tok ->
+            com.voicebubble.openflow.core.speech.parseWordToken(tok, idx, deRawTokens)
+        }
+        val deLabels = intArrayOf(
+            0, // Wir
+            0, // arbeiten
+            0, // an
+            0, // der (was "der.") -> false period removed!
+            0, // Optimierung -> German noun (-ung after "der"), stays capitalized!
+            0, // von
+            0, // dem
+            2, // Programm (was "Programm.") -> comma before subordinate clause!
+            0, // Weil -> German conjunction, lowercased to "weil"!
+            0, // es
+            0, // schneller
+            1  // läuft.
+        )
+        val deRestored = com.voicebubble.openflow.core.speech.applyPunctuationAndCasing(
+            words = deParsed,
+            predictedLabels = deLabels,
+            languageCode = "de"
+        )
+        assertEquals(
+            "Wir arbeiten an der Optimierung von dem Programm, weil es schneller läuft.",
+            deRestored
+        )
     }
 }
