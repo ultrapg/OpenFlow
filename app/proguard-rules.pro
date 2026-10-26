@@ -13,6 +13,16 @@
 -dontwarn org.tensorflow.lite.**
 -dontwarn com.google.ai.edge.litert.**
 
+# Google AI Edge LiteRT-LM (Experimental Gemma 4 E2B on NPU / GPU / CPU) & Gson JNI Payloads
+-keep class com.google.ai.edge.litertlm.** { *; }
+-keepclassmembers class com.google.ai.edge.litertlm.** {
+    native <methods>;
+    *;
+}
+-keep class com.google.gson.** { *; }
+-dontwarn com.google.ai.edge.litertlm.**
+-dontwarn kotlin.reflect.jvm.internal.**
+
 # ONNX Runtime Android (NNAPI / QNN NPU & XNNPACK Execution Providers)
 -keep class ai.onnxruntime.** { *; }
 -keepclassmembers class ai.onnxruntime.** {

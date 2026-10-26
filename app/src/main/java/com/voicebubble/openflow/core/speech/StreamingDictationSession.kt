@@ -144,10 +144,16 @@ class StreamingDictationSession(
             .map { it.value }
             .filter { it.isNotBlank() }
         val activeSettings = pipeline.currentSettings()
-        return stitchChunkTranscripts(
+        val resolvedLang = language ?: activeSettings.preferredLanguage
+        val stitched = stitchChunkTranscripts(
             chunks = orderedChunks,
-            language = language ?: activeSettings.preferredLanguage,
+            language = resolvedLang,
             customVocabulary = activeSettings.customVocabulary
+        )
+        return pipeline.postProcessFinalTranscript(
+            text = stitched,
+            languageHint = resolvedLang,
+            onStageProgress = onStageProgress
         )
     }
 
@@ -176,7 +182,8 @@ class StreamingDictationSession(
                 languageHint = if (config.reuseLanguage && allowLanguageHint) language else null,
                 onLanguageResolved = { detected ->
                     if (config.reuseLanguage && language == null) language = detected
-                }
+                },
+                applyPostProcessing = false
             )
         } catch (ce: CancellationException) {
             throw ce

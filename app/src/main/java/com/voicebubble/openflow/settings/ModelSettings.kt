@@ -45,14 +45,17 @@ val Voz.Companion.supportedLanguages: Set<String>
 
 enum class DesertAntModel(
     val id: String,
+    val shortLabel: String,
     val displayName: String,
     val roleSummary: String,
     val sizeMb: Int,
     val expectedBytes: Long,
-    val isRequired: Boolean
+    val isRequired: Boolean,
+    val isExperimental: Boolean = false
 ) {
     VOZ(
         id = "voz",
+        shortLabel = "Voz",
         displayName = "Voz — Speech Recognition",
         roleSummary = "Required • Core transcription across 25 European languages",
         sizeMb = 1187,
@@ -61,6 +64,7 @@ enum class DesertAntModel(
     ),
     EAR(
         id = "ear",
+        shortLabel = "Ear",
         displayName = "Ear — Auto Language Detection",
         roleSummary = "Automatically detects spoken language before transcription",
         sizeMb = 10,
@@ -69,12 +73,83 @@ enum class DesertAntModel(
     ),
     PUNCT(
         id = "punct",
+        shortLabel = "Punct",
         displayName = "Punct — Text & Punctuation Cleanup",
         roleSummary = "XLM-RoBERTa token tagger that fixes mid-sentence periods, commas & casing on the NPU (0% hallucination)",
         sizeMb = 282,
         expectedBytes = 295_740_930L,
         isRequired = false
+    ),
+    GEMMA_4_E2B(
+        id = "gemma4_e2b",
+        shortLabel = "Gemma 4 E2B",
+        displayName = "Gemma 4 E2B — AI Reformatting",
+        roleSummary = "Experimental • On-device Gemma 4 E2B LLM on NPU for removing 'um'/fillers, smart reformatting & custom prompts",
+        sizeMb = 2468,
+        expectedBytes = 2_588_147_712L,
+        isRequired = false,
+        isExperimental = true
     );
+}
+
+/**
+ * Selectable system prompt presets (plus [CUSTOM]) for Experimental Gemma 4 E2B post-processing.
+ */
+enum class GemmaPromptPreset(
+    val id: String,
+    val title: String,
+    val shortLabel: String,
+    val subtitle: String,
+    val defaultSystemPrompt: String
+) {
+    CLEAN_AND_POLISH(
+        id = "clean_polish",
+        title = "Clean & Polish (Default)",
+        shortLabel = "Clean & Polish",
+        subtitle = "Removes 'um', 'uh', 'ähm', 'like', stutters & false starts; fixes grammar and punctuation while keeping your voice",
+        defaultSystemPrompt = "Remove vocal fillers (such as 'um', 'uh', 'er', 'ah', 'äh', 'ähm', 'hm', filler 'like', 'you know'), stutters, accidental word repetitions, and spoken self-corrections (keep only the speaker's intended correction). Fix punctuation, capitalization, and natural sentence or paragraph breaks. Keep the speaker's exact language, tone, meaning, and vocabulary without adding new information."
+    ),
+    STRICT_CLEANUP(
+        id = "strict_cleanup",
+        title = "Strict Filler & Grammar Fix",
+        shortLabel = "Strict Cleanup",
+        subtitle = "Minimalist cleanup: strips vocal hesitations and fixes broken punctuation/casing with zero rephrasing",
+        defaultSystemPrompt = "Perform strictly minimal dictation cleanup: remove only obvious vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm') and stutters, and repair broken punctuation, mid-sentence periods, and capitalization. Do not rephrase, reorder, summarize, or change the speaker's word choice."
+    ),
+    CONCISE_DIRECT(
+        id = "concise_direct",
+        title = "Concise & Direct",
+        shortLabel = "Concise",
+        subtitle = "Tightens rambling spoken thoughts into clear, crisp, easy-to-read sentences",
+        defaultSystemPrompt = "Rewrite the spoken dictation into clear, concise, direct prose. Remove all vocal fillers, hedging, tangents, and redundant phrasing while preserving every fact, name, number, and the speaker's original language."
+    ),
+    PROFESSIONAL_MESSAGE(
+        id = "professional_message",
+        title = "Professional Message / Email",
+        shortLabel = "Professional",
+        subtitle = "Formats dictation into a polished, well-structured professional message or email with clean paragraphs",
+        defaultSystemPrompt = "Format the spoken dictation into a polished, natural, well-structured professional message or email. Remove all spoken hesitations and false starts, organize distinct thoughts into clean paragraphs, and maintain a courteous, professional tone in the speaker's original language without inventing placeholders."
+    ),
+    STRUCTURED_NOTES(
+        id = "structured_notes",
+        title = "Bullet Points & Action Items",
+        shortLabel = "Bullet Points",
+        subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean, scannable bullet points",
+        defaultSystemPrompt = "Transform the spoken dictation into a clean, well-organized list of concise bullet points using '- '. Remove all vocal fillers and repetitions, group related ideas or action items clearly, and keep the speaker's original language."
+    ),
+    CUSTOM(
+        id = "custom",
+        title = "Custom System Prompt",
+        shortLabel = "Custom",
+        subtitle = "Write your own custom system instruction for how Gemma 4 E2B transforms dictated speech",
+        defaultSystemPrompt = "Remove vocal fillers ('um', 'uh', 'like'), stutters, and false starts, and format the text cleanly while keeping the original meaning."
+    );
+
+    companion object {
+        fun fromId(id: String?): GemmaPromptPreset {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: CLEAN_AND_POLISH
+        }
+    }
 }
 
 /**
@@ -124,6 +199,9 @@ enum class HardwareAccelerator(
 data class ModelSettings(
     val earEnabled: Boolean = true,
     val punctEnabled: Boolean = false,
+    val gemmaEnabled: Boolean = false,
+    val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
+    val gemmaCustomPrompt: String = "",
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
@@ -134,43 +212,63 @@ data class ModelSettings(
     val vozEnabled: Boolean = true
 
     /**
+     * Resolves the active task instruction for Gemma 4 E2B based on [gemmaPromptPreset] and [gemmaCustomPrompt].
+     */
+    fun resolvedGemmaTaskInstruction(): String {
+        return if (gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
+            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.defaultSystemPrompt }
+        } else {
+            gemmaPromptPreset.defaultSystemPrompt
+        }
+    }
+
+    /**
      * Active disk footprint in MB based on currently enabled models:
      * - `Voz`: 1,187 MB
      * - `Ear`: +10 MB
      * - `Punct`: +282 MB
+     * - `Gemma 4 E2B` (Experimental): +2,468 MB
      */
     val activeDiskFootprintMb: Int
         get() = DesertAntModel.VOZ.sizeMb +
             (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
-            (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0)
+            (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
+            (if (gemmaEnabled) DesertAntModel.GEMMA_4_E2B.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on loaded LiteRT/ONNX model weights (`Voz` + `Ear` + `Punct`) + runtime buffers:
+     * Estimated peak RAM in MB based on loaded LiteRT/ONNX/LiteRT-LM model weights + runtime buffers:
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      * - `Punct` (INT8 XLM-RoBERTa token classifier on NPU/XNNPACK): +120 MB
+     * - `Gemma 4 E2B` (2/4/8-bit QAT weights + mmap embeddings via LiteRT-LM): +850 MB
      */
     val estimatedPeakRamMb: Int
         get() = 1400 +
             (if (earEnabled) 50 else 0) +
-            (if (punctEnabled) 120 else 0)
+            (if (punctEnabled) 120 else 0) +
+            (if (gemmaEnabled) 850 else 0)
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
         DesertAntModel.VOZ -> true
         DesertAntModel.EAR -> earEnabled
         DesertAntModel.PUNCT -> punctEnabled
+        DesertAntModel.GEMMA_4_E2B -> gemmaEnabled
     }
 
     fun enabledModels(): List<DesertAntModel> = buildList {
         add(DesertAntModel.VOZ)
         if (earEnabled) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
+        if (gemmaEnabled) add(DesertAntModel.GEMMA_4_E2B)
     }
 
     companion object {
         const val PREFS_NAME = "openflow_model_settings"
         const val KEY_EAR_ENABLED = "ear_enabled"
         const val KEY_PUNCT_ENABLED = "punct_enabled"
+        const val KEY_GEMMA_ENABLED = "gemma_enabled"
+        const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
+        const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -196,10 +294,17 @@ data class ModelSettings(
             val accel = HardwareAccelerator.fromId(
                 prefs.getString(KEY_HARDWARE_ACCELERATOR, HardwareAccelerator.AUTO.id)
             )
+            val preset = GemmaPromptPreset.fromId(
+                prefs.getString(KEY_GEMMA_PROMPT_PRESET, GemmaPromptPreset.CLEAN_AND_POLISH.id)
+            )
+            val customPrompt = prefs.getString(KEY_GEMMA_CUSTOM_PROMPT, "") ?: ""
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
+                gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false),
+                gemmaPromptPreset = preset,
+                gemmaCustomPrompt = customPrompt,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel
@@ -224,6 +329,9 @@ data class ModelSettings(
             getPreferences(context).edit()
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
+                .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
+                .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
+                .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
@@ -281,7 +389,8 @@ object DesertAntModelStorage {
     private val MODEL_REVISIONS = mapOf(
         DesertAntModel.VOZ to "v0.4.0",
         DesertAntModel.EAR to "v0.2.0",
-        DesertAntModel.PUNCT to "v1.0.0"
+        DesertAntModel.PUNCT to "v1.0.0",
+        DesertAntModel.GEMMA_4_E2B to "v1.0.0"
     )
 
     // In-memory cache of (targetDir.absolutePath -> (lastModifiedSum, sizeSum)) for verified model directories

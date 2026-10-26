@@ -90,6 +90,7 @@ fun OnboardingScreen(
 
     var earSelected by remember { mutableStateOf(initialSettings.earEnabled) }
     var punctSelected by remember { mutableStateOf(initialSettings.punctEnabled) }
+    var gemmaSelected by remember { mutableStateOf(initialSettings.gemmaEnabled) }
 
     var step by remember {
         mutableStateOf(
@@ -103,7 +104,8 @@ fun OnboardingScreen(
 
     val configuredSettings = initialSettings.copy(
         earEnabled = earSelected,
-        punctEnabled = punctSelected
+        punctEnabled = punctSelected,
+        gemmaEnabled = gemmaSelected
     )
 
     val selectedModels = configuredSettings.enabledModels()
@@ -242,6 +244,18 @@ fun OnboardingScreen(
                             isLocked = false,
                             onCheckedChange = { punctSelected = it }
                         )
+
+                        HorizontalDivider()
+
+                        // Gemma 4 E2B (Experimental, Off by default)
+                        OnboardingModelRow(
+                            title = "Gemma 4 E2B — AI Post-Processing (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB, Experimental)",
+                            subtitle = DesertAntModel.GEMMA_4_E2B.roleSummary,
+                            checked = gemmaSelected,
+                            enabled = true,
+                            isLocked = false,
+                            onCheckedChange = { gemmaSelected = it }
+                        )
                     }
                 }
 
@@ -317,8 +331,7 @@ fun OnboardingScreen(
                         val activeModel = sessionState.activeModel
                         val headerText = when {
                             sessionState.isRunning && activeModel != null -> {
-                                val modelTitle = activeModel.id.replaceFirstChar { it.uppercase() }
-                                "Downloading $modelTitle (${sessionState.currentModelIndex}/${sessionState.totalModelsInQueue})"
+                                "Downloading ${activeModel.shortLabel} (${sessionState.currentModelIndex}/${sessionState.totalModelsInQueue})"
                             }
                             sessionState.isPaused -> "Download Paused (Progress Saved)"
                             sessionState.errorMessage != null -> "Connection Interrupted (Progress Saved)"

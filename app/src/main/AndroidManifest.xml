@@ -27,6 +27,16 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.OpenFlow"
         tools:targetApi="31">
+
+        <!-- Hardware NPU & OpenCL GPU driver visibility for LiteRT-LM (Gemma 4 E2B) & LiteRT audio models -->
+        <uses-native-library android:name="libvndksupport.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libadsprpc.so" android:required="false" />
+        <uses-native-library android:name="libQnnHtp.so" android:required="false" />
+        <uses-native-library android:name="libQnnSystem.so" android:required="false" />
+        <uses-native-library android:name="libneuron_adapter.so" android:required="false" />
+        <uses-native-library android:name="libedgetpu_client.so" android:required="false" />
         
         <activity
             android:name=".MainActivity"

@@ -108,8 +108,18 @@ class SmartPipelineTest {
         assertTrue(defaultSettings.vozEnabled)
         assertTrue(defaultSettings.earEnabled)
         assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
+        assertFalse("Gemma 4 E2B must be OFF by default (Experimental)", defaultSettings.gemmaEnabled)
+        assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            defaultSettings.gemmaPromptPreset
+        )
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
+        assertEquals(2300, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(3665, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
+        assertEquals(2420, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(3947, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
         assertEquals(
             listOf(
                 com.voicebubble.openflow.settings.DesertAntModel.VOZ,
@@ -862,5 +872,155 @@ class SmartPipelineTest {
             "Wir arbeiten an der Optimierung von dem Programm, weil es schneller läuft.",
             deRestored
         )
+    }
+
+    @Test
+    fun `GemmaPromptPreset and ModelSettings resolve built-in and custom instructions safely`() {
+        for (preset in com.voicebubble.openflow.settings.GemmaPromptPreset.entries) {
+            assertEquals(preset, com.voicebubble.openflow.settings.GemmaPromptPreset.fromId(preset.id))
+            assertEquals(preset, com.voicebubble.openflow.settings.GemmaPromptPreset.fromId(preset.id.uppercase()))
+            assertTrue("Preset ${preset.id} must have non-blank default prompt", preset.defaultSystemPrompt.isNotBlank())
+        }
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            com.voicebubble.openflow.settings.GemmaPromptPreset.fromId("non_existent_preset")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            com.voicebubble.openflow.settings.GemmaPromptPreset.fromId(null)
+        )
+
+        // Blank custom prompt falls back safely to CUSTOM.defaultSystemPrompt
+        val blankCustom = ModelSettings(
+            gemmaEnabled = true,
+            gemmaPromptPreset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,
+            gemmaCustomPrompt = "   "
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM.defaultSystemPrompt,
+            blankCustom.resolvedGemmaTaskInstruction()
+        )
+
+        // Non-blank custom prompt is trimmed and returned directly
+        val activeCustom = ModelSettings(
+            gemmaEnabled = true,
+            gemmaPromptPreset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,
+            gemmaCustomPrompt = "  Rewrite as concise Markdown release notes.  "
+        )
+        assertEquals(
+            "Rewrite as concise Markdown release notes.",
+            activeCustom.resolvedGemmaTaskInstruction()
+        )
+    }
+
+    @Test
+    fun `GemmaTextProcessor buildSystemInstruction enforces anti-hallucination guardrails and custom flexibility`() {
+        val builtInInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "",
+            languageCode = "de",
+            customVocabulary = listOf("OpenFlow", "LiteRT-LM")
+        )
+        assertTrue(builtInInstruction.contains("German [de]"))
+        assertTrue(builtInInstruction.contains("Never translate into another language"))
+        assertTrue(builtInInstruction.contains("OpenFlow, LiteRT-LM"))
+        assertTrue(builtInInstruction.contains("<transcript>"))
+
+        val customInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,
+            customPrompt = "Translate the transcript into English and make it polite.",
+            languageCode = "de",
+            customVocabulary = emptyList()
+        )
+        assertTrue(customInstruction.contains("Translate the transcript into English and make it polite."))
+        assertTrue(customInstruction.contains("unless the transformation instruction explicitly asks to translate"))
+        assertFalse(customInstruction.contains("Never translate into another language"))
+    }
+
+    @Test
+    fun `GemmaTextProcessor sanitizeGemmaOutput strips thinking channels chatter fences and preserves structure`() {
+        val rawInput = "um so we need to ship version two point six point eight today and uh test the npu"
+
+        // 1. Strips Gemma 4 <|channel>thought...<channel|> reasoning blocks and conversational preambles
+        val withThoughtAndChatter = """
+            <|channel>thought
+            The user wants me to clean up vocal fillers from their dictation.
+            <channel|>Sure! Here is the cleaned transcript:
+
+            We need to ship version 2.6.8 today and test the NPU.
+        """.trimIndent()
+        assertEquals(
+            "We need to ship version 2.6.8 today and test the NPU.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = withThoughtAndChatter,
+                fallbackInput = rawInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // 2. Unwraps echoed <transcript>...</transcript> tags and preserves multi-line bullet lists
+        val bulletOutput = """
+            <transcript>
+            - Ship version 2.6.8 today
+            - Test NPU acceleration on Snapdragon
+            </transcript>
+        """.trimIndent()
+        assertEquals(
+            "- Ship version 2.6.8 today\n- Test NPU acceleration on Snapdragon",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = bulletOutput,
+                fallbackInput = rawInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES
+            )
+        )
+
+        // 3. Unwraps accidental outer quotes and code fences for standard presets
+        assertEquals(
+            "We need to ship version 2.6.8 today.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "```text\n\"We need to ship version 2.6.8 today.\"\n```",
+                fallbackInput = rawInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CONCISE_DIRECT
+            )
+        )
+
+        // 4. Falls back safely to rawInput on empty or runaway hallucinated output
+        assertEquals(
+            rawInput,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<|channel>thought\n<channel|>   ",
+                fallbackInput = rawInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+        assertEquals(
+            "Hello world.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "Hallucinated text. ".repeat(80),
+                fallbackInput = "Hello world.",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRICT_CLEANUP
+            )
+        )
+    }
+
+    @Test
+    fun `GemmaTextProcessor splitLongTranscript splits cleanly at sentence boundaries`() {
+        val shortText = "First sentence. Second sentence."
+        assertEquals(
+            listOf(shortText),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.splitLongTranscript(shortText, maxCharsPerSegment = 200)
+        )
+
+        val s1 = "This is the first complete spoken sentence in a long dictation."
+        val s2 = "Here is the second spoken sentence with plenty of details."
+        val s3 = "Finally, this is the third sentence at the end."
+        val combined = "$s1 $s2 $s3"
+        val split = com.voicebubble.openflow.core.speech.GemmaTextProcessor.splitLongTranscript(
+            text = combined,
+            maxCharsPerSegment = 130
+        )
+        assertEquals(2, split.size)
+        assertEquals("$s1 $s2", split[0])
+        assertEquals(s3, split[1])
     }
 }

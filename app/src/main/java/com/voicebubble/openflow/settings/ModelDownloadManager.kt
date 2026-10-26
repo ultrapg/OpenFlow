@@ -247,6 +247,16 @@ object ModelDownloadManager {
                     downloadUrl = "https://huggingface.co/onnx-community/punctuate-all-ONNX/resolve/main/tokenizer.json"
                 )
             )
+            ),
+        DesertAntModel.GEMMA_4_E2B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "gemma-4-E2B-it.litertlm",
+                    sizeBytes = 2_588_147_712L,
+                    sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
+                    downloadUrl = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm"
+                )
+            )
             )
     )
 
@@ -309,6 +319,7 @@ object ModelDownloadManager {
             val updated = when (model) {
                 DesertAntModel.EAR -> current.copy(earEnabled = true)
                 DesertAntModel.PUNCT -> current.copy(punctEnabled = true)
+                DesertAntModel.GEMMA_4_E2B -> current.copy(gemmaEnabled = true)
                 DesertAntModel.VOZ -> current
             }
             if (updated != current) {
@@ -1130,7 +1141,7 @@ class ModelDownloadService : Service() {
         )
 
         val percent = (state.overallProgress * 100f).roundToInt()
-        val modelName = state.activeModel?.id?.replaceFirstChar { it.uppercase() } ?: "Models"
+        val modelName = state.activeModel?.shortLabel ?: "Models"
         val title = "Downloading $modelName ($percent%) — ${state.formattedOverallBytes}"
         val subtitle = state.statusNote ?: "${state.formattedSpeed} • ${state.formattedEta}"
 

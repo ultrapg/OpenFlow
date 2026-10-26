@@ -18,7 +18,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("com.google.devtools.ksp") version "2.1.0-1.0.29"
+    id("com.google.devtools.ksp")
 }
 
 android {
@@ -26,15 +26,15 @@ android {
     compileSdk = 35
 
     androidResources {
-        noCompress += listOf("tflite", "f16", "f32")
+        noCompress += listOf("tflite", "f16", "f32", "litertlm")
     }
 
     defaultConfig {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 32
-        versionName = "2.6.7"
+        versionCode = 33
+        versionName = "2.6.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -107,6 +107,7 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        freeCompilerArgs += listOf("-Xskip-metadata-version-check")
     }
     buildFeatures {
         compose = true
@@ -114,6 +115,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            pickFirsts += "**/liblitertlm_jni.so"
         }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -143,7 +145,7 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.5")
 
     // Room
-    val roomVersion = "2.6.1"
+    val roomVersion = "2.7.2"
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
@@ -163,6 +165,12 @@ dependencies {
 
     // ONNX Runtime Android with NNAPI / QNN NPU & XNNPACK Execution Providers for Punctuation & Casing Restoration
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+
+    // Google AI Edge LiteRT-LM & NPU Compiler/Dispatch Runtimes (Experimental Gemma 4 E2B on NPU / GPU / CPU)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.1")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-qualcomm:2.3.0")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.0")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")

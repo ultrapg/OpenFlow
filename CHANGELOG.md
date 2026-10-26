@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.8] - 2026-10-26
+
+### Added
+- **Experimental `Gemma 4 E2B` On-Device NPU AI Post-Processing (`GemmaTextProcessor`, `DesertAntModel.GEMMA_4_E2B`, `GemmaPromptPreset`, `ModelSettings`, `ModelDownloadManager`, `SmartPipeline`, `StreamingDictationSession`, `FloatingBubbleService`, `SpeechRecognitionSettingsSection`, `OnboardingScreen`):**
+  - Integrated Google's real **`gemma-4-E2B-it`** (`litert-community/gemma-4-E2B-it-litert-lm`, `2,468 MB`, SHA-256 verified, **Experimental & OFF by default**) via **Google AI Edge `LiteRT-LM` (`litertlm-android:0.18.1`)** for 100% offline spoken filler removal (`"um"`, `"uh"`, `"ähm"`, `"like"`, stutters, spoken self-corrections), smart reformatting, and custom prompt transformations.
+  - **NPU-First Hardware Cascade:** Bundles Qualcomm QNN (`litert-npu-runtime-qualcomm:2.3.0`), MediaTek NeuroPilot (`litert-npu-runtime-mediatek:2.3.0`), and Google Tensor (`litert-npu-runtime-google-tensor:2.3.0`) LiteRT compiler/dispatch runtimes and prioritizes `Backend.NPU(nativeLibraryDir)` / `Backend.GOOGLE_TENSOR()`, with automatic zero-crash fallback to `Backend.GPU()` + Multi-Token Prediction (`enableSpeculativeDecoding`) and `Backend.CPU(threads)` + MTP.
+  - **Selectable System Prompt Presets + Custom System Prompt:** Added 5 curated system prompt presets (**`Clean & Polish`**, **`Strict Filler & Grammar Fix`**, **`Concise & Direct`**, **`Professional Message / Email`**, **`Bullet Points & Action Items`**) plus a **`Custom System Prompt`** mode with a multi-line prompt editor and one-tap **`Copy & Edit as Custom Prompt`** action in Settings.
+  - **Zero-Latency Non-Thinking Mode & Anti-Hallucination Guardrails:** Explicitly disables Gemma 4's thinking channel (`ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)` + `extraContext = mapOf("enable_thinking" to false)`), wraps input transcripts in `<transcript>` delimiters, biases custom vocabulary spellings, locks spoken language (unless a Custom System Prompt requests translation), runs post-processing once over the complete stitched transcript in live-streaming sessions, preserves multi-line paragraphs/bullet lists during text injection, and dynamically stages model sessions on tighter-RAM devices to prevent OOMs.
+
 ## [2.6.7] - 2026-10-25
 
 ### Added

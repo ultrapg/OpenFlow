@@ -36,14 +36,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.Button
@@ -85,6 +88,7 @@ import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
+import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
@@ -109,6 +113,12 @@ fun SpeechRecognitionSettingsSection(
 
     var storageRefreshTick by remember { mutableIntStateOf(0) }
     var newVocabInput by remember { mutableStateOf("") }
+    var customPromptDraft by remember { mutableStateOf(settings.gemmaCustomPrompt) }
+    LaunchedEffect(settings.gemmaCustomPrompt) {
+        if (customPromptDraft != settings.gemmaCustomPrompt) {
+            customPromptDraft = settings.gemmaCustomPrompt
+        }
+    }
 
     val downloadedStatusMap = remember { mutableStateMapOf<DesertAntModel, Boolean>() }
     LaunchedEffect(
@@ -145,6 +155,7 @@ fun SpeechRecognitionSettingsSection(
             val updated = when (model) {
                 DesertAntModel.EAR -> settings.copy(earEnabled = false)
                 DesertAntModel.PUNCT -> settings.copy(punctEnabled = false)
+                DesertAntModel.GEMMA_4_E2B -> settings.copy(gemmaEnabled = false)
                 DesertAntModel.VOZ -> settings
             }
             persistAndReload(updated)
@@ -157,6 +168,7 @@ fun SpeechRecognitionSettingsSection(
                     val updated = when (model) {
                         DesertAntModel.EAR -> settings.copy(earEnabled = true)
                         DesertAntModel.PUNCT -> settings.copy(punctEnabled = true)
+                        DesertAntModel.GEMMA_4_E2B -> settings.copy(gemmaEnabled = true)
                         DesertAntModel.VOZ -> settings
                     }
                     persistAndReload(updated)
@@ -528,6 +540,228 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
+        // 3b. Experimental: Gemma 4 E2B AI Post-Processing & Reformatting (NPU / LiteRT-LM)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Gemma 4 E2B — AI Post-Processing",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.tertiaryContainer
+                    ) {
+                        Text(
+                            text = "EXPERIMENTAL",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = "Runs Google's Gemma 4 E2B (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB) 100% offline via LiteRT-LM on your phone's NPU (Qualcomm Hexagon QNN, MediaTek NeuroPilot, Google Tensor TPU) with automatic GPU/CPU fallback. Removes 'um'/'uh'/'like', stutters, and false starts, or reformats speech using your chosen system prompt. Off by default • 8 GB+ RAM recommended.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                val activeGemmaBackend = pipelineStatus.activeGemmaBackendLabel
+                if (!activeGemmaBackend.isNullOrBlank()) {
+                    Text(
+                        text = "Active Gemma 4 E2B runtime: $activeGemmaBackend",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                ModelToggleItem(
+                    title = "Enable Gemma 4 E2B (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB)",
+                    subtitle = DesertAntModel.GEMMA_4_E2B.roleSummary,
+                    loadState = pipelineStatus.modelStates[DesertAntModel.GEMMA_4_E2B],
+                    checked = settings.gemmaEnabled || DesertAntModel.GEMMA_4_E2B in downloadState.pendingAutoEnableModels,
+                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.GEMMA_4_E2B),
+                    isLocked = false,
+                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.GEMMA_4_E2B && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                    onPause = { ModelDownloadManager.pauseDownloads() },
+                    onResume = { handleOptionalToggle(DesertAntModel.GEMMA_4_E2B, true) },
+                    onCheckedChange = { handleOptionalToggle(DesertAntModel.GEMMA_4_E2B, it) }
+                )
+
+                HorizontalDivider()
+
+                Text(
+                    text = "System Prompt Preset",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Choose how Gemma 4 E2B cleans or reformats your dictated text, or write a custom system prompt.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                GemmaPromptPreset.entries.forEach { preset ->
+                    val selected = settings.gemmaPromptPreset == preset
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(gemmaPromptPreset = preset))
+                                }
+                            }
+                            .padding(vertical = 4.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = selected,
+                            onClick = {
+                                if (!selected) {
+                                    persistAndReload(settings.copy(gemmaPromptPreset = preset))
+                                }
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = preset.title,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                            )
+                            Text(
+                                text = preset.subtitle,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                if (settings.gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
+                    OutlinedTextField(
+                        value = customPromptDraft,
+                        onValueChange = { updatedText ->
+                            customPromptDraft = updatedText
+                            persistAndReload(settings.copy(gemmaCustomPrompt = updatedText))
+                        },
+                        label = { Text("Custom System Prompt") },
+                        placeholder = { Text(GemmaPromptPreset.CUSTOM.defaultSystemPrompt) },
+                        minLines = 3,
+                        maxLines = 8,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (customPromptDraft.isBlank()) {
+                                "Using default fallback instruction until you enter custom text."
+                            } else {
+                                "Anti-chatter & Custom Vocabulary guardrails are applied automatically."
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (customPromptDraft.isNotBlank()) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    customPromptDraft = ""
+                                    persistAndReload(settings.copy(gemmaCustomPrompt = ""))
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.RestartAlt,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Reset")
+                            }
+                        }
+                    }
+                } else {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Active System Instruction:",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = settings.gemmaPromptPreset.defaultSystemPrompt,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            OutlinedButton(
+                                onClick = {
+                                    val presetPrompt = settings.gemmaPromptPreset.defaultSystemPrompt
+                                    customPromptDraft = presetPrompt
+                                    persistAndReload(
+                                        settings.copy(
+                                            gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
+                                            gemmaCustomPrompt = presetPrompt
+                                        )
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Copy & Edit as Custom Prompt")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Manual / Fallback Language Selector (Always Visible, Specification Section 5.2.3)
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -819,7 +1053,7 @@ private fun ModelStatusChip(
             )
             Spacer(modifier = Modifier.width(5.dp))
             Text(
-                text = "${model.id.replaceFirstChar { it.uppercase() }}: ${state.label}",
+                text = "${model.shortLabel}: ${state.label}",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Medium,
                 color = textColor

@@ -113,6 +113,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         private val SPACE_BEFORE_PUNCT_REGEX = Regex(" +([.,!?:;%€])")
         private val WHITESPACE_RUN_REGEX = Regex("\\s+")
+        private val HORIZONTAL_WHITESPACE_RUN_REGEX = Regex("[ \\t]{2,}")
+        private val TRAILING_LINE_SPACES_REGEX = Regex("[ \\t]+\\n")
+        private val EXCESS_BLANK_LINES_REGEX = Regex("\\n{3,}")
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -1118,17 +1121,31 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         }
                     }
                 } else {
-                    smartPipeline.transcribe(samples) { stageLabel ->
-                        processingProgress.value = stageLabel
-                    }
+                    smartPipeline.transcribe(
+                        samples = samples,
+                        onStageProgress = { stageLabel ->
+                            processingProgress.value = stageLabel
+                        }
+                    )
                 }
                 val totalSamples = session?.totalSamples ?: samples.size.toLong()
 
-                val finalText = chunkText.trim()
+                val activeModelSettings = smartPipeline.currentSettings()
+                val normalizedBase = chunkText.trim()
                     .replace(SPACE_BEFORE_PUNCT_REGEX, "$1")
                     .replace("O K", "OK")
                     .replace("o k", "ok")
-                    .replace(WHITESPACE_RUN_REGEX, " ")
+                val finalText = if (activeModelSettings.gemmaEnabled) {
+                    normalizedBase
+                        .replace("\r\n", "\n")
+                        .replace('\r', '\n')
+                        .replace(HORIZONTAL_WHITESPACE_RUN_REGEX, " ")
+                        .replace(TRAILING_LINE_SPACES_REGEX, "\n")
+                        .replace(EXCESS_BLANK_LINES_REGEX, "\n\n")
+                        .trim()
+                } else {
+                    normalizedBase.replace(WHITESPACE_RUN_REGEX, " ")
+                }
 
                 if (finalText.isNotBlank()) {
                     val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
@@ -1154,13 +1171,18 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     if (prefs.getBoolean("haptic_feedback", true)) vibrate(15, 120)
 
                     try {
+                        val modelId = buildString {
+                            append("desert-ant-voz-4.0.0")
+                            if (activeModelSettings.punctEnabled) append("+punct")
+                            if (activeModelSettings.gemmaEnabled) append("+gemma-4-e2b")
+                        }
                         val dao = AppDatabase.getDatabase(this@FloatingBubbleService).transcriptionDao()
                         dao.insert(
                             TranscriptionRecord(
                                 transcribedText = finalText,
                                 durationMs = totalSamples / 16L,
                                 audioSamplesCount = totalSamples.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                modelIdentifier = "desert-ant-voz-4.0.0",
+                                modelIdentifier = modelId,
                                 wasInjectedSuccessfully = injected
                             )
                         )
