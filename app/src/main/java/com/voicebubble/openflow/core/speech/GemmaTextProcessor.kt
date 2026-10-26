@@ -25,6 +25,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
@@ -75,6 +76,36 @@ data class FlowFieldContext(
 }
 
 /**
+ * Memory headroom tier used to scale Gemma 4 E2B's KV-cache context window, speculative decoding,
+ * and standby system-prompt KV-cache pre-warming so lower-RAM phones never experience OOM kills.
+ */
+enum class GemmaMemoryMode {
+    /** Plenty of free physical RAM (`>= 2.2 GB` free): 4,096-token KV window + system-prompt KV caching. */
+    HIGH_HEADROOM,
+
+    /** Moderate physical RAM (`1.2–2.2 GB` free): 2,048-token KV window (halves KV-cache footprint). */
+    MODERATE_HEADROOM,
+
+    /** Tight JVM or system RAM (`< 1.2 GB` free): 1,536-token KV window, no MTP draft head, no idle KV cache. */
+    LOW_MEMORY
+}
+
+/**
+ * Immutable cache key identifying a pre-prefilled standby system prompt `Conversation`.
+ * Language is intentionally passed via `<transcript lang="...">` in the user message rather than
+ * mutating the cached system prompt, yielding near-100% KV-cache hits across multilingual dictations.
+ */
+internal data class SystemPromptCacheKey(
+    val preset: GemmaPromptPreset,
+    val customPrompt: String,
+    val customVocabulary: List<String>,
+    val appCategory: AppContextCategory,
+    val continuingNumberedListFrom: Int?,
+    val isContinuingBulletList: Boolean,
+    val disableThinking: Boolean
+)
+
+/**
  * Wispr Flow–style on-device formatting & auto-editing engine powered by Google's
  * **Gemma 4 E2B (`gemma-4-E2B-it`)** via **LiteRT-LM** (`com.google.ai.edge.litertlm`).
  *
@@ -93,16 +124,29 @@ data class FlowFieldContext(
  *    optional `"Disable Model Thinking"` fast mode (`disableThinking = true` ->
  *    `ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)` +
  *    `extraContext = mapOf("enable_thinking" to false)`) to skip `<|channel>thought` generation.
- * 4. **Stateless Ephemeral Conversations & Anti-Hallucination Guardrails:** Creates and closes a
- *    fresh `Conversation` per pass, wraps transcripts in `<transcript>` delimiters, rejects
- *    assistant-mode refusals, locks spoken language, and enforces custom vocabulary spellings.
+ * 4. **RAM-Aware System-Prompt KV-Cache Pre-Warming (`prefillPrefaceOnInit = true`):** Pre-computes
+ *    and holds at most one pre-prefilled standby `Conversation` while the user is speaking (or idle
+ *    with ample RAM headroom) so `sendMessage` skips ~500 tokens of system-prompt prefill, while
+ *    evicting the standby KV cache immediately under OS memory trim or tight RAM.
  */
 class GemmaTextProcessor(
     context: Context,
     private val modelDir: File,
     private val accelerator: HardwareAccelerator,
-    private val lowMemoryPressure: Boolean
+    private val memoryMode: GemmaMemoryMode = GemmaMemoryMode.HIGH_HEADROOM
 ) : AutoCloseable {
+
+    constructor(
+        context: Context,
+        modelDir: File,
+        accelerator: HardwareAccelerator,
+        lowMemoryPressure: Boolean
+    ) : this(
+        context = context,
+        modelDir = modelDir,
+        accelerator = accelerator,
+        memoryMode = if (lowMemoryPressure) GemmaMemoryMode.LOW_MEMORY else GemmaMemoryMode.HIGH_HEADROOM
+    )
 
     companion object {
         private const val TAG = "GemmaTextProcessor"
@@ -110,19 +154,24 @@ class GemmaTextProcessor(
 
         private const val DEFAULT_MAX_CONTEXT_TOKENS = 4_096
         private const val FALLBACK_MAX_CONTEXT_TOKENS = 2_048
-        private const val LOW_MEM_MAX_CONTEXT_TOKENS = 2_048
+        private const val LOW_MEM_MAX_CONTEXT_TOKENS = 1_536
         private const val MAX_CHARS_PER_PASS = 1_800
         private const val MAX_CHARS_PER_PASS_THINK_2K = 1_200
+        private const val MAX_CHARS_PER_PASS_LOW_MEM = 900
         private const val MAX_CURSOR_CONTEXT_CHARS = 140
         private const val MAX_CONTINUITY_TAIL_CHARS = 160
+        private const val MAX_VOCAB_REGEX_CACHE_ENTRIES = 64
+
+        private val vocabRegexCacheLock = Any()
+        private val vocabRegexCache = LinkedHashMap<String, Regex>(32, 0.75f, true)
 
         private val CHANNEL_BLOCK_REGEX = Regex("<\\|channel>.*?<channel\\|>", setOf(RegexOption.DOT_MATCHES_ALL))
         private val UNCLOSED_CHANNEL_REGEX = Regex("<\\|channel>.*$", setOf(RegexOption.DOT_MATCHES_ALL))
         private val THOUGHT_TAG_REGEX = Regex("<\\|?thought\\|?>.*?</\\|?thought\\|?>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val THINK_TAG_REGEX = Regex("<think>.*?</think>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val SPECIAL_TURN_TOKENS_REGEX = Regex("(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>)")
-        private val TRANSCRIPT_WRAPPER_REGEX = Regex("<transcript>\\s*(.*?)\\s*</transcript>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
-        private val STRAY_TRANSCRIPT_TAG_REGEX = Regex("</?transcript>", RegexOption.IGNORE_CASE)
+        private val TRANSCRIPT_WRAPPER_REGEX = Regex("<transcript(?:\\s+[^>]*)?>\\s*(.*?)\\s*</transcript>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val STRAY_TRANSCRIPT_TAG_REGEX = Regex("</?transcript(?:\\s+[^>]*)?>", RegexOption.IGNORE_CASE)
         private val CODE_FENCE_WRAPPER_REGEX = Regex("^```[a-zA-Z0-9_-]*\\s*\\n?(.*?)\\n?```$", setOf(RegexOption.DOT_MATCHES_ALL))
         private val CHATTER_PREAMBLE_REGEX = Regex(
             pattern = "^(?:sure[!,.]?\\s+|certainly[!,.]?\\s+|of course[!,.]?\\s+|gerne[!,.]?\\s+|natürlich[!,.]?\\s+)?" +
@@ -510,9 +559,56 @@ class GemmaTextProcessor(
         }
 
         /**
+         * Builds the canonical [SystemPromptCacheKey] for a pre-prefilled standby `Conversation`,
+         * normalizing unused fields so unrelated UI state never causes spurious KV-cache misses.
+         */
+        internal fun buildSystemPromptCacheKey(
+            preset: GemmaPromptPreset,
+            customPrompt: String = "",
+            customVocabulary: List<String> = emptyList(),
+            fieldContext: FlowFieldContext = FlowFieldContext.NONE,
+            disableThinking: Boolean = false
+        ): SystemPromptCacheKey {
+            val normalizedCustom = if (preset == GemmaPromptPreset.CUSTOM) {
+                customPrompt.trim()
+            } else {
+                ""
+            }
+            val cleanedVocab = customVocabulary
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .take(40)
+            val effectiveCategory = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
+                fieldContext.appCategory
+            } else {
+                AppContextCategory.GENERAL
+            }
+            val effectiveNumList = if (preset != GemmaPromptPreset.CUSTOM) {
+                fieldContext.continuingNumberedListFrom
+            } else {
+                null
+            }
+            val effectiveBulletList = preset != GemmaPromptPreset.CUSTOM && fieldContext.isContinuingBulletList
+            return SystemPromptCacheKey(
+                preset = preset,
+                customPrompt = normalizedCustom,
+                customVocabulary = cleanedVocab,
+                appCategory = effectiveCategory,
+                continuingNumberedListFrom = effectiveNumList,
+                isContinuingBulletList = effectiveBulletList,
+                disableThinking = disableThinking
+            )
+        }
+
+        /**
          * Builds the full Wispr Flow–style system instruction for Gemma 4 E2B, incorporating
          * app-category style hints, cursor continuation context, multi-segment continuity,
          * compact few-shot grounding, custom vocabulary, and anti-hallucination rules.
+         *
+         * When [languageCode] is `null`, produces a universal language-agnostic system prompt
+         * suitable for pre-prefilling (`prefillPrefaceOnInit = true`) before `Ear` runs, while
+         * [buildUserPrompt] attaches the resolved `lang`/`language` attributes on `<transcript>`.
          *
          * Pure function (unit-tested in `SmartPipelineTest`).
          */
@@ -536,7 +632,7 @@ class GemmaTextProcessor(
             val langHint = when {
                 langName != null -> " (detected spoken language: $langName [$normalizedLang])"
                 normalizedLang != null -> " (detected spoken language code: $normalizedLang)"
-                else -> ""
+                else -> " (matching any lang/language attribute on <transcript> when provided)"
             }
 
             val languageDirective = if (preset == GemmaPromptPreset.CUSTOM) {
@@ -607,7 +703,7 @@ class GemmaTextProcessor(
                     appendLine()
                     appendLine("REFERENCE EXAMPLES:")
                     if (normalizedLang == "de") {
-                        appendLine("Input: <transcript>ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update für version zwei punkt sieben punkt null testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
+                        appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update für version zwei punkt sieben punkt null testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
                         appendLine("Output:")
                         appendLine("Hallo Lukas, lass uns am Mittwoch um 15:30 Uhr sprechen. Wir müssen zwei Punkte klären:")
                         appendLine("1. Das NPU-Update für Version 2.7.0 testen")
@@ -621,6 +717,13 @@ class GemmaTextProcessor(
                         appendLine("1. Test NPU latency under 500 ms")
                         appendLine("2. Verify 6 GB RAM headroom")
                         appendLine("3. Update GitHub release notes")
+                        if (normalizedLang == null) {
+                            appendLine("Example 3 Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
+                            appendLine("Example 3 Output:")
+                            appendLine("Hallo Lukas, lass uns am Mittwoch um 15:30 Uhr sprechen. Wir müssen zwei Punkte klären:")
+                            appendLine("1. Das NPU-Update testen")
+                            appendLine("2. Die 8 GB RAM-Grenze prüfen")
+                        }
                     }
                 }
 
@@ -644,17 +747,29 @@ class GemmaTextProcessor(
         }
 
         /**
-         * Wraps raw dictated text in XML `<transcript>` tags so Gemma 4 cleanly separates
-         * dictated content from system instructions.
+         * Wraps raw dictated text in XML `<transcript>` tags (attaching `lang`/`language` metadata
+         * when [languageCode] is known so the pre-cached system prompt stays language-universal).
          */
-        fun buildUserPrompt(transcript: String): String {
-            return "<transcript>\n${transcript.trim()}\n</transcript>"
+        fun buildUserPrompt(transcript: String, languageCode: String? = null): String {
+            val normalizedLang = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf {
+                it.isNotEmpty() && it.all { ch -> ch.isLetterOrDigit() || ch == '-' }
+            }
+            if (normalizedLang == null) {
+                return "<transcript>\n${transcript.trim()}\n</transcript>"
+            }
+            val langName = LANGUAGE_NAMES_EN[normalizedLang]
+            val openTag = if (langName != null) {
+                "<transcript lang=\"$normalizedLang\" language=\"$langName\">"
+            } else {
+                "<transcript lang=\"$normalizedLang\">"
+            }
+            return "$openTag\n${transcript.trim()}\n</transcript>"
         }
 
         /**
          * Computes a safe upper bound on generated tokens proportional to the input transcript
          * (plus reasoning headroom when Gemma 4 thinking is enabled) so generation never hits a
-         * premature mid-thought cutoff or runs into an unbounded token loop.
+         * premature mid-thought cutoff or overflows smaller low-memory KV-cache windows.
          */
         fun computeMaxOutputTokens(
             inputText: String,
@@ -668,12 +783,25 @@ class GemmaTextProcessor(
             } else {
                 3
             }
-            val baseTokens = (approxWords * multiplier + 96).coerceIn(96, 1_280)
+            val maxBaseCap = when {
+                maxContextTokens >= 4_096 -> 1_280
+                maxContextTokens >= 2_048 -> 896
+                else -> 384
+            }
+            val baseTokens = (approxWords * multiplier + 96).coerceIn(96, maxBaseCap)
             if (disableThinking) {
                 return baseTokens
             }
-            val thinkingHeadroom = if (maxContextTokens >= 4_096) 640 else 384
-            val maxCap = if (maxContextTokens >= 4_096) 2_048 else 1_280
+            val thinkingHeadroom = when {
+                maxContextTokens >= 4_096 -> 640
+                maxContextTokens >= 2_048 -> 384
+                else -> 192
+            }
+            val maxCap = when {
+                maxContextTokens >= 4_096 -> 2_048
+                maxContextTokens >= 2_048 -> 1_280
+                else -> 576
+            }
             return (baseTokens + thinkingHeadroom).coerceIn(baseTokens, maxCap)
         }
 
@@ -994,6 +1122,9 @@ class GemmaTextProcessor(
     private var activeCandidateIndex: Int = -1
     private var activeMaxContextTokens: Int = DEFAULT_MAX_CONTEXT_TOKENS
     private var candidates: List<BackendCandidate> = emptyList()
+    private var cachedConversation: Conversation? = null
+    private var cachedPromptKey: SystemPromptCacheKey? = null
+    private var supportsPrefacePrefill: Boolean = true
 
     @Volatile
     var activeBackendSummary: String = "Standby"
@@ -1015,6 +1146,7 @@ class GemmaTextProcessor(
     private fun initializeWithHardwareCascade(startIndex: Int) {
         synchronized(engineLock) {
             closeEngineLocked()
+            supportsPrefacePrefill = true
 
             val profile = NpuHardwareManager.detectHardwareProfile()
             val supportsMtp = detectSpeculativeDecodingSupport(modelFile)
@@ -1022,10 +1154,10 @@ class GemmaTextProcessor(
                 candidates = buildBackendCandidates(profile, supportsMtp)
             }
 
-            val tokenWindowCandidates = if (lowMemoryPressure) {
-                listOf(LOW_MEM_MAX_CONTEXT_TOKENS)
-            } else {
-                listOf(DEFAULT_MAX_CONTEXT_TOKENS, FALLBACK_MAX_CONTEXT_TOKENS)
+            val tokenWindowCandidates = when (memoryMode) {
+                GemmaMemoryMode.HIGH_HEADROOM -> listOf(DEFAULT_MAX_CONTEXT_TOKENS, FALLBACK_MAX_CONTEXT_TOKENS)
+                GemmaMemoryMode.MODERATE_HEADROOM -> listOf(FALLBACK_MAX_CONTEXT_TOKENS, LOW_MEM_MAX_CONTEXT_TOKENS)
+                GemmaMemoryMode.LOW_MEMORY -> listOf(LOW_MEM_MAX_CONTEXT_TOKENS)
             }
 
             var lastError: Throwable? = null
@@ -1062,7 +1194,7 @@ class GemmaTextProcessor(
                         DebugLogManager.logInfo(
                             TAG,
                             "Initialized Gemma 4 E2B on ${candidate.label} in ${elapsedMs}ms " +
-                                "(mtp=${candidate.enableMtp}, maxTokens=$maxTokens)",
+                                "(mtp=${candidate.enableMtp}, maxTokens=$maxTokens, memMode=$memoryMode)",
                             includeMemory = true
                         )
                         return
@@ -1093,12 +1225,13 @@ class GemmaTextProcessor(
         supportsMtp: Boolean
     ): List<BackendCandidate> {
         val nativeLibDir = appContext.applicationInfo.nativeLibraryDir ?: ""
-        val cpuThreads = if (lowMemoryPressure) {
+        val isLowMem = memoryMode == GemmaMemoryMode.LOW_MEMORY
+        val cpuThreads = if (isLowMem) {
             profile.recommendedCpuThreads.coerceAtMost(3)
         } else {
             profile.recommendedCpuThreads
         }
-        val allowMtp = supportsMtp && !lowMemoryPressure
+        val allowMtp = supportsMtp && !isLowMem
         val mtpSuffix = if (allowMtp) " + MTP" else ""
 
         val list = mutableListOf<BackendCandidate>()
@@ -1161,11 +1294,153 @@ class GemmaTextProcessor(
     }
 
     /**
-     * Light warm-up that validates conversation creation without generating unnecessary tokens.
+     * Returns `true` if a pre-prefilled standby system prompt `Conversation` is currently resident in KV cache.
      */
-    fun warmUp() {
+    fun hasCachedSystemPrompt(): Boolean {
+        return synchronized(engineLock) {
+            cachedPromptKey != null && cachedConversation?.isAlive == true
+        }
+    }
+
+    /**
+     * Immediately frees the pre-prefilled standby system prompt KV cache (~150–250 MB) without unloading
+     * the underlying Gemma 4 E2B weights. Safe to call from `onTrimMemory`.
+     */
+    fun evictCachedSystemPrompt() {
+        synchronized(engineLock) {
+            evictCachedSystemPromptLocked()
+        }
+    }
+
+    private fun evictCachedSystemPromptLocked() {
+        val stale = cachedConversation
+        cachedConversation = null
+        cachedPromptKey = null
+        if (stale != null) {
+            runCatching { stale.close() }
+        }
+    }
+
+    /**
+     * Pre-computes and caches the KV state for the active system prompt + few-shot preface
+     * (`ConversationConfig.prefillPrefaceOnInit = true`) so the next [process] call only needs to
+     * prefill the short `<transcript>` user message.
+     *
+     * Strictly single-slot: any previous standby `Conversation` is closed *before* allocating a new one,
+     * and pre-warming is skipped entirely in [GemmaMemoryMode.LOW_MEMORY].
+     */
+    @Suppress("DEPRECATION")
+    fun prewarmSystemPrompt(
+        preset: GemmaPromptPreset,
+        customPrompt: String,
+        customVocabulary: List<String>,
+        disableThinking: Boolean = false,
+        fieldContext: FlowFieldContext = inspectActiveFieldContext()
+    ): Boolean {
+        if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
+            evictCachedSystemPrompt()
+            return false
+        }
+        val targetKey = buildSystemPromptCacheKey(
+            preset = preset,
+            customPrompt = customPrompt,
+            customVocabulary = customVocabulary,
+            fieldContext = fieldContext,
+            disableThinking = disableThinking
+        )
+
+        synchronized(engineLock) {
+            val activeEngine = engine ?: return false
+            if (!supportsPrefacePrefill) return false
+            if (cachedPromptKey == targetKey && cachedConversation?.isAlive == true) {
+                return true
+            }
+
+            // Never hold two Conversation KV-caches simultaneously
+            evictCachedSystemPromptLocked()
+
+            val candidate = candidates.getOrNull(activeCandidateIndex)
+            val isNpu = candidate?.isNpu == true
+            val useMtp = candidate?.enableMtp == true
+            val thinkingConfig = if (disableThinking) {
+                ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)
+            } else {
+                ThinkingConfig(enableThinking = true)
+            }
+            val templateContext: Map<String, Any> = mapOf("enable_thinking" to !disableThinking)
+            val systemInstruction = buildSystemInstruction(
+                preset = preset,
+                customPrompt = customPrompt,
+                languageCode = null,
+                customVocabulary = customVocabulary,
+                fieldContext = fieldContext,
+                precedingSegmentTail = null,
+                disableThinking = disableThinking
+            )
+
+            val config = ConversationConfig(
+                systemInstruction = Contents.of(systemInstruction),
+                samplerConfig = if (isNpu) {
+                    null
+                } else {
+                    SamplerConfig(topK = 20, topP = 0.90, temperature = 0.10)
+                },
+                automaticToolCalling = false,
+                extraContext = templateContext,
+                maxOutputToken = null,
+                thinkingConfig = thinkingConfig,
+                prefillPrefaceOnInit = true,
+                enableSpeculativeDecoding = if (isNpu) null else useMtp
+            )
+
+            val prewarmStartMs = SystemClock.elapsedRealtime()
+            var created: Conversation? = null
+            return try {
+                created = activeEngine.createConversation(config)
+                cachedConversation = created
+                cachedPromptKey = targetKey
+                val elapsedMs = SystemClock.elapsedRealtime() - prewarmStartMs
+                DebugLogManager.logInfo(
+                    TAG,
+                    "Pre-warmed Gemma system-prompt KV cache (${preset.id}, app=${fieldContext.appCategory.name.lowercase(Locale.ROOT)}, thinking=${!disableThinking}) in ${elapsedMs}ms on $activeBackendSummary",
+                    includeMemory = true
+                )
+                true
+            } catch (t: Throwable) {
+                created?.let { runCatching { it.close() } }
+                supportsPrefacePrefill = false
+                DebugLogManager.logWarn(
+                    TAG,
+                    "Gemma system-prompt KV prefill unavailable on $activeBackendSummary (${t.message}); falling back to uncached turns"
+                )
+                false
+            }
+        }
+    }
+
+    /**
+     * Warms up the engine and, when memory headroom permits, pre-fills the user's active system prompt
+     * into a standby KV cache so the first dictation avoids system-prompt prefill latency.
+     */
+    fun warmUp(
+        preset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
+        customPrompt: String = "",
+        customVocabulary: List<String> = emptyList(),
+        disableThinking: Boolean = false
+    ) {
+        if (memoryMode != GemmaMemoryMode.LOW_MEMORY &&
+            prewarmSystemPrompt(
+                preset = preset,
+                customPrompt = customPrompt,
+                customVocabulary = customVocabulary,
+                disableThinking = disableThinking
+            )
+        ) {
+            return
+        }
         synchronized(engineLock) {
             val activeEngine = engine ?: return
+            evictCachedSystemPromptLocked()
             val isNpu = isRunningOnNpu
             val config = ConversationConfig(
                 systemInstruction = Contents.of("Output OK."),
@@ -1184,9 +1459,9 @@ class GemmaTextProcessor(
     /**
      * Transforms [text] according to [preset] (or [customPrompt] when [preset] == [GemmaPromptPreset.CUSTOM]).
      * Applies Wispr Flow–style deterministic pre-normalization, app & cursor-continuation context,
-     * multi-segment continuity, configurable Gemma 4 thinking (`disableThinking` = `false` by default,
-     * or `true` when the user enables `"Disable Model Thinking"` for faster inference), and
-     * post-sanitization, falling back seamlessly to the next hardware backend if an NPU/GPU driver
+     * multi-segment continuity, pre-prefilled system-prompt KV-cache consumption, configurable Gemma 4
+     * thinking (`disableThinking` = `false` by default, or `true` when `"Disable Model Thinking"` is enabled),
+     * and post-sanitization, falling back seamlessly to the next hardware backend if an NPU/GPU driver
      * fails mid-conversation.
      */
     suspend fun process(
@@ -1204,10 +1479,10 @@ class GemmaTextProcessor(
         if (preNormalized.isBlank()) return text
 
         val currentContextWindow = synchronized(engineLock) { activeMaxContextTokens }
-        val maxCharsPerSegment = if (!disableThinking && currentContextWindow < 4_096) {
-            MAX_CHARS_PER_PASS_THINK_2K
-        } else {
-            MAX_CHARS_PER_PASS
+        val maxCharsPerSegment = when {
+            currentContextWindow <= LOW_MEM_MAX_CONTEXT_TOKENS -> MAX_CHARS_PER_PASS_LOW_MEM
+            !disableThinking && currentContextWindow < 4_096 -> MAX_CHARS_PER_PASS_THINK_2K
+            else -> MAX_CHARS_PER_PASS
         }
         val segments = splitLongTranscript(preNormalized, maxCharsPerSegment)
         if (segments.isEmpty()) return text
@@ -1233,10 +1508,23 @@ class GemmaTextProcessor(
                     isContinuingBulletList = false
                 )
             }
+            val requestedCacheKey = if (index == 0 && precedingTail == null) {
+                buildSystemPromptCacheKey(
+                    preset = preset,
+                    customPrompt = customPrompt,
+                    customVocabulary = customVocabulary,
+                    fieldContext = effectiveFieldContext,
+                    disableThinking = disableThinking
+                )
+            } else {
+                null
+            }
+            // Segment 0 uses the language-universal system prompt (with language passed via <transcript lang="...">)
+            // so pre-warmed KV caches hit cleanly even when Ear resolves language dynamically at speech time.
             val systemInstructionText = buildSystemInstruction(
                 preset = preset,
                 customPrompt = customPrompt,
-                languageCode = languageCode,
+                languageCode = if (requestedCacheKey != null) null else languageCode,
                 customVocabulary = customVocabulary,
                 fieldContext = effectiveFieldContext,
                 precedingSegmentTail = precedingTail,
@@ -1244,7 +1532,9 @@ class GemmaTextProcessor(
             )
             val transformed = processSingleSegmentWithFallback(
                 segment = segment,
+                languageCode = languageCode,
                 systemInstructionText = systemInstructionText,
+                requestedCacheKey = requestedCacheKey,
                 preset = preset,
                 customPrompt = customPrompt,
                 precedingSegmentTail = precedingTail,
@@ -1376,13 +1666,16 @@ class GemmaTextProcessor(
 
     private suspend fun processSingleSegmentWithFallback(
         segment: String,
+        languageCode: String?,
         systemInstructionText: String,
+        requestedCacheKey: SystemPromptCacheKey?,
         preset: GemmaPromptPreset,
         customPrompt: String,
         precedingSegmentTail: String?,
         disableThinking: Boolean
     ): String {
         val callerJob = coroutineContext[Job]
+        var attemptCacheKey = requestedCacheKey
         while (true) {
             if (callerJob?.isActive == false) {
                 throw CancellationException("Gemma post-processing cancelled")
@@ -1390,7 +1683,9 @@ class GemmaTextProcessor(
             try {
                 return runSingleConversationTurn(
                     segment = segment,
+                    languageCode = languageCode,
                     systemInstructionText = systemInstructionText,
+                    requestedCacheKey = attemptCacheKey,
                     preset = preset,
                     customPrompt = customPrompt,
                     precedingSegmentTail = precedingSegmentTail,
@@ -1400,6 +1695,7 @@ class GemmaTextProcessor(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
+                attemptCacheKey = null
                 val nextIndex = synchronized(engineLock) { activeCandidateIndex + 1 }
                 if (nextIndex in 1 until candidates.size) {
                     Log.w(TAG, "Gemma inference on '$activeBackendSummary' failed (${t.message}); cascading to fallback backend.")
@@ -1425,7 +1721,9 @@ class GemmaTextProcessor(
 
     private fun runSingleConversationTurn(
         segment: String,
+        languageCode: String?,
         systemInstructionText: String,
+        requestedCacheKey: SystemPromptCacheKey?,
         preset: GemmaPromptPreset,
         customPrompt: String,
         precedingSegmentTail: String?,
@@ -1438,7 +1736,9 @@ class GemmaTextProcessor(
                 executeConversationTurnLocked(
                     activeEngine = activeEngine,
                     segment = segment,
+                    languageCode = languageCode,
                     systemInstructionText = systemInstructionText,
+                    requestedCacheKey = requestedCacheKey,
                     preset = preset,
                     customPrompt = customPrompt,
                     precedingSegmentTail = precedingSegmentTail,
@@ -1457,7 +1757,9 @@ class GemmaTextProcessor(
                     executeConversationTurnLocked(
                         activeEngine = activeEngine,
                         segment = segment,
+                        languageCode = languageCode,
                         systemInstructionText = systemInstructionText,
+                        requestedCacheKey = null,
                         preset = preset,
                         customPrompt = customPrompt,
                         precedingSegmentTail = precedingSegmentTail,
@@ -1475,7 +1777,9 @@ class GemmaTextProcessor(
     private fun executeConversationTurnLocked(
         activeEngine: Engine,
         segment: String,
+        languageCode: String?,
         systemInstructionText: String,
+        requestedCacheKey: SystemPromptCacheKey?,
         preset: GemmaPromptPreset,
         customPrompt: String,
         precedingSegmentTail: String?,
@@ -1501,29 +1805,47 @@ class GemmaTextProcessor(
         }
         val templateContext: Map<String, Any> = mapOf("enable_thinking" to !disableThinking)
 
-        val conversationConfig = ConversationConfig(
-            systemInstruction = Contents.of(systemInstructionText),
-            samplerConfig = if (isNpu) {
-                null
-            } else {
-                SamplerConfig(topK = 20, topP = 0.90, temperature = 0.10)
-            },
-            automaticToolCalling = false,
-            extraContext = templateContext,
-            maxOutputToken = maxOutTokens,
-            thinkingConfig = thinkingConfig,
-            enableSpeculativeDecoding = if (isNpu) null else useMtp
-        )
+        val cachedHit: Conversation? = if (
+            requestedCacheKey != null &&
+            cachedPromptKey == requestedCacheKey &&
+            cachedConversation?.isAlive == true
+        ) {
+            val hit = cachedConversation
+            cachedConversation = null
+            cachedPromptKey = null
+            hit
+        } else {
+            // Never hold two Conversation KV-caches simultaneously
+            evictCachedSystemPromptLocked()
+            null
+        }
+        val promptCacheLabel = if (cachedHit != null) "HIT" else "MISS"
 
         val startMs = SystemClock.elapsedRealtime()
-        activeEngine.createConversation(conversationConfig).use { conversation ->
+        val activeConversation = cachedHit ?: activeEngine.createConversation(
+            ConversationConfig(
+                systemInstruction = Contents.of(systemInstructionText),
+                samplerConfig = if (isNpu) {
+                    null
+                } else {
+                    SamplerConfig(topK = 20, topP = 0.90, temperature = 0.10)
+                },
+                automaticToolCalling = false,
+                extraContext = templateContext,
+                maxOutputToken = maxOutTokens,
+                thinkingConfig = thinkingConfig,
+                enableSpeculativeDecoding = if (isNpu) null else useMtp
+            )
+        )
+
+        activeConversation.use { conversation ->
             val cancelHandle = callerJob?.invokeOnCompletion { cause ->
                 if (cause != null) {
                     runCatching { conversation.cancelProcess() }
                 }
             }
             try {
-                val userMessage = Message.user(buildUserPrompt(segment))
+                val userMessage = Message.user(buildUserPrompt(segment, languageCode))
                 val response = conversation.sendMessage(
                     userMessage,
                     templateContext,
@@ -1545,7 +1867,7 @@ class GemmaTextProcessor(
                 )
                 DebugLogManager.logInfo(
                     TAG,
-                    "Gemma 4 E2B (${preset.id}, thinking=$thinkingLogLabel, app=${inspectAppLabelForLog(systemInstructionText)}) processed ${segment.length} -> ${sanitized.length} chars in ${elapsedMs}ms on $activeBackendSummary"
+                    "Gemma 4 E2B (${preset.id}, thinking=$thinkingLogLabel, promptCache=$promptCacheLabel, app=${inspectAppLabelForLog(systemInstructionText)}) processed ${segment.length} -> ${sanitized.length} chars in ${elapsedMs}ms on $activeBackendSummary"
                 )
                 return sanitized
             } finally {
@@ -1565,19 +1887,39 @@ class GemmaTextProcessor(
         }
     }
 
+    private fun getOrCreateVocabRegex(term: String): Regex {
+        synchronized(vocabRegexCacheLock) {
+            vocabRegexCache[term]?.let { return it }
+            val compiled = Regex(
+                "(?<![\\p{L}\\p{N}])${Regex.escape(term)}(?![\\p{L}\\p{N}])",
+                RegexOption.IGNORE_CASE
+            )
+            if (vocabRegexCache.size >= MAX_VOCAB_REGEX_CACHE_ENTRIES) {
+                val eldestKey = vocabRegexCache.keys.firstOrNull()
+                if (eldestKey != null) {
+                    vocabRegexCache.remove(eldestKey)
+                }
+            }
+            vocabRegexCache[term] = compiled
+            return compiled
+        }
+    }
+
     private fun applyCustomVocabularyExactCasing(text: String, customVocabulary: List<String>): String {
         if (customVocabulary.isEmpty() || text.isBlank()) return text
         var result = text
         for (rawTerm in customVocabulary) {
             val term = rawTerm.trim()
             if (term.length < 2) continue
-            val regex = Regex("(?<![\\p{L}\\p{N}])${Regex.escape(term)}(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE)
+            val regex = getOrCreateVocabRegex(term)
             result = result.replace(regex) { term }
         }
         return result
     }
 
     private fun closeEngineLocked() {
+        // Always destroy child Conversation KV-cache before deleting parent native Engine
+        evictCachedSystemPromptLocked()
         val current = engine
         engine = null
         isRunningOnNpu = false

@@ -670,7 +670,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         DebugLogManager.logTrimMemory("FloatingBubbleService", level)
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && ::smartPipeline.isInitialized) {
+        if ((level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) &&
+            ::smartPipeline.isInitialized
+        ) {
             smartPipeline.onTrimMemory(level)
         }
     }
@@ -938,7 +941,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                             serviceScope.launch {
                                 val started = audioController.startRecording(this)
-                                if (!started) {
+                                if (started) {
+                                    // While the user is speaking, pre-fill Gemma's system-prompt KV cache
+                                    // for the active app & cursor context if RAM headroom allows.
+                                    smartPipeline.onRecordingStartedAsync()
+                                } else {
                                     session?.cancel()
                                     if (streamingSession === session) streamingSession = null
                                     bubbleState.value = OverlayBubbleState.IDLE

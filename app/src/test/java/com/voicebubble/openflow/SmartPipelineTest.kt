@@ -1337,5 +1337,156 @@ class SmartPipelineTest {
         )
         assertTrue(defaultInstruction.contains("Keep internal reasoning brief"))
         assertFalse(disabledThinkingInstruction.contains("Keep internal reasoning brief"))
+
+        // Low-memory 1,536-token KV window keeps output budget safely bounded inside compact context
+        val lowMemThinkingTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sampleTranscript.repeat(6),
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            maxContextTokens = 1_536
+        )
+        assertTrue("1.5K low-mem KV window must cap output tokens <= 576, got $lowMemThinkingTokens", lowMemThinkingTokens <= 576)
+    }
+
+    @Test
+    fun `GemmaTextProcessor system prompt cache key and language-tagged user prompt preserve multilingual KV cache hits`() {
+        val emailCtx = com.voicebubble.openflow.core.speech.FlowFieldContext(
+            appCategory = com.voicebubble.openflow.core.speech.AppContextCategory.EMAIL,
+            packageName = "com.google.android.gm",
+            isMidSentenceContinuation = false
+        )
+        // Mid-sentence continuation is handled deterministically post-generation and must not invalidate KV cache
+        val emailMidSentenceCtx = emailCtx.copy(isMidSentenceContinuation = true)
+
+        val keyA = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "ignored unless custom",
+            customVocabulary = listOf(" OpenFlow ", "NPU", "OpenFlow"),
+            fieldContext = emailCtx,
+            disableThinking = false
+        )
+        val keyB = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "different unused custom prompt",
+            customVocabulary = listOf("OpenFlow", "NPU"),
+            fieldContext = emailMidSentenceCtx,
+            disableThinking = false
+        )
+        assertEquals("Cache keys must match across identical normalized settings", keyA, keyB)
+
+        val keyNoThink = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "",
+            customVocabulary = listOf("OpenFlow", "NPU"),
+            fieldContext = emailCtx,
+            disableThinking = true
+        )
+        org.junit.Assert.assertNotEquals("Toggling disableThinking must produce a distinct cache key", keyA, keyNoThink)
+
+        // Language-universal cached system prompt includes both EN and DE mechanics + lang attribute guidance
+        val universalPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            languageCode = null,
+            fieldContext = emailCtx
+        )
+        assertTrue(universalPrompt.contains("lang/language attribute on <transcript>"))
+        assertTrue(universalPrompt.contains("<transcript lang=\"de\" language=\"German\">"))
+
+        // User prompt carries resolved Ear language without mutating the cached system prompt
+        val deUserPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildUserPrompt(
+            transcript = "ähm hallo lukas",
+            languageCode = "de"
+        )
+        assertEquals("<transcript lang=\"de\" language=\"German\">\nähm hallo lukas\n</transcript>", deUserPrompt)
+
+        // Output sanitizer cleanly unwraps <transcript lang="..." language="..."> if echoed by the LLM
+        val unwrapped = com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+            rawOutput = "<transcript lang=\"de\" language=\"German\">Hallo Lukas.</transcript>",
+            fallbackInput = "ähm hallo lukas",
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+        )
+        assertEquals("Hallo Lukas.", unwrapped)
+    }
+
+    @Test
+    fun `MemoryPressureReport tiers Gemma KV window and prevents Voz-Gemma co-residency OOMs on low-RAM phones`() {
+        // 12 GB flagship with 3.2 GB free -> HIGH_HEADROOM, prompt cache allowed, Voz + Gemma co-residency allowed
+        val flagshipHighRam = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 3_200L,
+            systemTotalMb = 11_500L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 48L,
+            jvmMaxMb = 512L,
+            jvmFreeHeadroomMb = 464L,
+            nativeAllocatedMb = 1_800L
+        )
+        assertEquals(com.voicebubble.openflow.core.speech.GemmaMemoryMode.HIGH_HEADROOM, flagshipHighRam.gemmaMemoryMode)
+        assertTrue(flagshipHighRam.canPrewarmGemmaPromptCache)
+        assertTrue(flagshipHighRam.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = false))
+        assertTrue(flagshipHighRam.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true))
+
+        // 8 GB phone with 1,650 MB free -> MODERATE_HEADROOM (2K KV window), prompt cache allowed when Gemma loaded,
+        // but loading Gemma ON TOP of Voz (or reloading Voz on top of Gemma) is blocked to prevent LMKD OOM!
+        val midRangeModerateRam = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 1_650L,
+            systemTotalMb = 7_600L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 64L,
+            jvmMaxMb = 256L,
+            jvmFreeHeadroomMb = 192L,
+            nativeAllocatedMb = 1_400L
+        )
+        assertEquals(com.voicebubble.openflow.core.speech.GemmaMemoryMode.MODERATE_HEADROOM, midRangeModerateRam.gemmaMemoryMode)
+        assertTrue(midRangeModerateRam.canPrewarmGemmaPromptCache)
+        assertFalse(midRangeModerateRam.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = false))
+        assertFalse(midRangeModerateRam.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true))
+        assertTrue(midRangeModerateRam.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = true))
+
+        // 6 GB phone with 980 MB free -> LOW_MEMORY (1.5K KV window), no idle prompt cache, no co-residency
+        val lowRamPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 980L,
+            systemTotalMb = 5_700L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 80L,
+            jvmMaxMb = 256L,
+            jvmFreeHeadroomMb = 176L,
+            nativeAllocatedMb = 1_200L
+        )
+        assertEquals(com.voicebubble.openflow.core.speech.GemmaMemoryMode.LOW_MEMORY, lowRamPhone.gemmaMemoryMode)
+        assertFalse(lowRamPhone.canPrewarmGemmaPromptCache)
+        assertFalse(lowRamPhone.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = true))
+    }
+
+    @Test
+    fun `conditionAudioWhenClearDisabled inPlace mode matches allocating mode bit-for-bit without extra array`() {
+        val raw = FloatArray(16_000) { idx ->
+            if (idx < 12_000) ((idx % 17) - 8) * 0.01f + 0.003f else 0f
+        }
+        val expected = com.voicebubble.openflow.core.speech.conditionAudioWhenClearDisabled(raw, inPlace = false)
+        val inPlaceBuf = raw.copyOf()
+        val returned = com.voicebubble.openflow.core.speech.conditionAudioWhenClearDisabled(inPlaceBuf, inPlace = true)
+
+        assertTrue("inPlace=true must return the exact same FloatArray instance", returned === inPlaceBuf)
+        org.junit.Assert.assertArrayEquals(expected, returned, 1e-6f)
+    }
+
+    @Test
+    fun `CompactTokenIdTable rehashes cleanly and matches zero-allocation substring range queries`() {
+        val table = com.voicebubble.openflow.core.speech.CompactTokenIdTable(initialCapacity = 16)
+        for (i in 0 until 5_000) {
+            table.putIfAbsent("▁piece_$i", i)
+        }
+        // Duplicate key keeps original ID
+        table.putIfAbsent("▁piece_42", 99_999)
+        assertEquals(5_000, table.size)
+        assertEquals(42, table.get("▁piece_42"))
+
+        val composite = "prefix:▁piece_4999:suffix"
+        val start = "prefix:".length
+        val end = start + "▁piece_4999".length
+        assertEquals(4_999, table.getRange(composite, start, end))
+        assertEquals(499, table.getRange(composite, start, end - 1))
+        val missing = "prefix:▁piece_9999:suffix"
+        assertEquals(-1, table.getRange(missing, start, start + "▁piece_9999".length))
     }
 }

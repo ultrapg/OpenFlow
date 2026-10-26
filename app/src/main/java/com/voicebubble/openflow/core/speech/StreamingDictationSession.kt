@@ -44,6 +44,9 @@ class StreamingDictationSession(
     private val results = ConcurrentHashMap<Int, String>()
     private val failed = ConcurrentHashMap<Int, FloatArray>()
     private val nextIndex = AtomicInteger(0)
+    private val inFlightChunks = AtomicInteger(0)
+    private val failedBufferedSamples = AtomicLong(0L)
+    private val droppedFailedChunks = AtomicInteger(0)
     private val recordedSamples = AtomicLong(0L)
     private val liveChunkCount = AtomicInteger(0)
 
@@ -67,17 +70,37 @@ class StreamingDictationSession(
     fun start() {
         workerJob = scope.launch(Dispatchers.Default) {
             for (chunk in queue) {
-                val text = transcribeChunk(chunk, allowLanguageHint = true)
-                if (text == null) {
-                    failed[chunk.index] = chunk.samples
-                } else {
-                    results[chunk.index] = text
+                try {
+                    val text = transcribeChunk(chunk, allowLanguageHint = true)
+                    if (text == null) {
+                        val canRetainForRetry = !pipeline.isMemoryCriticallyTight() &&
+                            failedBufferedSamples.get() + chunk.samples.size <= MAX_FAILED_RETRY_SAMPLES
+                        if (canRetainForRetry) {
+                            failed[chunk.index] = chunk.samples
+                            failedBufferedSamples.addAndGet(chunk.samples.size.toLong())
+                        } else {
+                            droppedFailedChunks.incrementAndGet()
+                            DebugLogManager.logWarn(
+                                TAG,
+                                "Skipping retry audio retention for failed chunk #${chunk.index} to protect RAM headroom"
+                            )
+                        }
+                    } else {
+                        results[chunk.index] = text
+                    }
+                } finally {
+                    inFlightChunks.decrementAndGet()
                 }
             }
         }
         pollerJob = scope.launch(Dispatchers.Default) {
             while (isActive) {
                 delay(POLL_INTERVAL_MS)
+                // Backpressure: if the inference worker already has MAX_IN_FLIGHT_LIVE_CHUNKS queued or memory
+                // is critically tight, keep new speech inside AudioRecordingController's single PCM buffer.
+                if (inFlightChunks.get() >= MAX_IN_FLIGHT_LIVE_CHUNKS || pipeline.isMemoryCriticallyTight()) {
+                    continue
+                }
                 val chunk = try {
                     audio.extractStreamingChunk(config)
                 } catch (ce: CancellationException) {
@@ -126,23 +149,27 @@ class StreamingDictationSession(
         queue.close()
         workerJob?.join()
 
-        var stillFailed = 0
+        var stillFailed = droppedFailedChunks.get()
         for (index in failed.keys.sorted()) {
-            val samples = failed[index] ?: continue
+            // Detach audio buffer immediately so GC can reclaim it right after retry
+            val samples = failed.remove(index) ?: continue
+            failedBufferedSamples.addAndGet(-samples.size.toLong())
             val text = transcribeChunk(PendingChunk(index, samples), allowLanguageHint = false)
             if (text != null) {
                 results[index] = text
-                failed.remove(index)
             } else {
                 stillFailed++
             }
         }
+        failed.clear()
         failedChunkCount = stillFailed
 
         val orderedChunks = results.entries
             .sortedBy { it.key }
             .map { it.value }
             .filter { it.isNotBlank() }
+        results.clear()
+
         val activeSettings = pipeline.currentSettings()
         val resolvedLang = language ?: activeSettings.preferredLanguage
         val stitched = stitchChunkTranscripts(
@@ -166,11 +193,16 @@ class StreamingDictationSession(
         queue.close()
         results.clear()
         failed.clear()
+        inFlightChunks.set(0)
+        failedBufferedSamples.set(0L)
     }
 
     private fun enqueue(samples: FloatArray) {
         recordedSamples.addAndGet(samples.size.toLong())
-        queue.trySend(PendingChunk(nextIndex.getAndIncrement(), samples))
+        inFlightChunks.incrementAndGet()
+        if (queue.trySend(PendingChunk(nextIndex.getAndIncrement(), samples)).isFailure) {
+            inFlightChunks.decrementAndGet()
+        }
     }
 
     /** Returns the chunk transcript, or `null` if the pipeline threw (caller keeps the audio for a retry). */
@@ -196,5 +228,7 @@ class StreamingDictationSession(
     private companion object {
         const val TAG = "StreamingDictation"
         const val POLL_INTERVAL_MS = 150L
+        const val MAX_IN_FLIGHT_LIVE_CHUNKS = 4
+        const val MAX_FAILED_RETRY_SAMPLES = 45L * DictationChunkSettings.SAMPLE_RATE
     }
 }

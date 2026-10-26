@@ -105,8 +105,8 @@ class AudioRecordingController {
                     audioFormat,
                     bufferSize
                 )
-            } catch (e: Exception) {
-                DebugLogManager.logWarning("AudioRecordingController", "Failed to create AudioRecord: ${e.message}", e)
+            } catch (t: Throwable) {
+                DebugLogManager.logWarning("AudioRecordingController", "Failed to create AudioRecord: ${t.message}", t)
                 return@withLock false
             }
 
@@ -120,9 +120,24 @@ class AudioRecordingController {
             }
 
             audioRecord = record
-            synchronized(bufferLock) {
-                pcmBuffer = FloatArray(INITIAL_CAPACITY_SAMPLES)
+            val bufferAllocated = synchronized(bufferLock) {
                 pcmSize = 0
+                pcmBuffer = try {
+                    FloatArray(INITIAL_CAPACITY_SAMPLES)
+                } catch (_: OutOfMemoryError) {
+                    System.gc()
+                    try {
+                        FloatArray(SAMPLE_RATE * 5)
+                    } catch (_: OutOfMemoryError) {
+                        null
+                    }
+                }
+                pcmBuffer != null
+            }
+            if (!bufferAllocated) {
+                DebugLogManager.logWarning("AudioRecordingController", "Insufficient JVM heap to allocate PCM recording buffer")
+                releaseInternal()
+                return@withLock false
             }
 
             try {
@@ -185,6 +200,12 @@ class AudioRecordingController {
         }
     }
 
+    private fun jvmFreeHeadroomBytes(): Long {
+        val rt = Runtime.getRuntime()
+        val used = (rt.totalMemory() - rt.freeMemory()).coerceAtLeast(0L)
+        return (rt.maxMemory() - used).coerceAtLeast(0L)
+    }
+
     private fun appendSamplesToBuffer(shortBuffer: ShortArray, readCount: Int): Double {
         var sumSquares = 0.0
         synchronized(bufferLock) {
@@ -194,17 +215,35 @@ class AudioRecordingController {
             if (toCopy > 0) {
                 val requiredSize = pcmSize + toCopy
                 val targetBuf = if (requiredSize > currentBuf.size) {
-                    // Grow by +20s up to MAX_RECORDING_SAMPLES to avoid 2x heap spikes
-                    val grownCapacity = min(
+                    // Grow by +20s up to MAX_RECORDING_SAMPLES, checking JVM heap headroom first to avoid 2x copyOf OOM spikes
+                    val desiredCapacity = min(
                         MAX_RECORDING_SAMPLES,
                         maxOf(requiredSize, currentBuf.size + (SAMPLE_RATE * 20))
                     )
-                    try {
-                        currentBuf.copyOf(grownCapacity).also { pcmBuffer = it }
-                    } catch (oom: OutOfMemoryError) {
+                    val freeBytes = jvmFreeHeadroomBytes()
+                    val neededBytes = desiredCapacity.toLong() * 4L + (20L * 1024L * 1024L)
+                    val safeCapacity = if (freeBytes >= neededBytes) {
+                        desiredCapacity
+                    } else if (freeBytes >= requiredSize.toLong() * 4L + (12L * 1024L * 1024L)) {
+                        min(MAX_RECORDING_SAMPLES, maxOf(requiredSize, currentBuf.size + (SAMPLE_RATE * 5)))
+                    } else {
+                        -1
+                    }
+
+                    if (safeCapacity > currentBuf.size) {
+                        try {
+                            currentBuf.copyOf(safeCapacity).also { pcmBuffer = it }
+                        } catch (_: OutOfMemoryError) {
+                            DebugLogManager.logWarning(
+                                "AudioRecordingController",
+                                "JVM heap full while growing audio buffer at $pcmSize samples; capping recording buffer"
+                            )
+                            currentBuf
+                        }
+                    } else {
                         DebugLogManager.logWarning(
                             "AudioRecordingController",
-                            "JVM heap full while growing audio buffer at $pcmSize samples; capping recording buffer"
+                            "Low JVM heap headroom (${freeBytes / (1024L * 1024L)} MB) at $pcmSize samples; capping recording buffer before OOM"
                         )
                         currentBuf
                     }
@@ -245,6 +284,10 @@ class AudioRecordingController {
             if (index <= 0) return null
             val resumeAt = cut.resumeIndex.coerceIn(1, index)
             val chunk = if (cut.hasSpeech) {
+                if (jvmFreeHeadroomBytes() < index.toLong() * 4L + (12L * 1024L * 1024L)) {
+                    // Leave audio in the single contiguous live buffer until JVM heap headroom recovers
+                    return null
+                }
                 try {
                     buf.copyOfRange(0, index)
                 } catch (_: OutOfMemoryError) {
@@ -255,6 +298,22 @@ class AudioRecordingController {
                 null
             }
             val remaining = size - resumeAt
+            // If an earlier long stretch grew pcmBuffer well past INITIAL_CAPACITY_SAMPLES, compact back down once drained
+            if (buf.size > INITIAL_CAPACITY_SAMPLES * 2 &&
+                remaining <= INITIAL_CAPACITY_SAMPLES / 2 &&
+                jvmFreeHeadroomBytes() >= INITIAL_CAPACITY_SAMPLES.toLong() * 4L + (16L * 1024L * 1024L)
+            ) {
+                try {
+                    val compacted = FloatArray(INITIAL_CAPACITY_SAMPLES)
+                    if (remaining > 0) {
+                        System.arraycopy(buf, resumeAt, compacted, 0, remaining)
+                    }
+                    pcmBuffer = compacted
+                    pcmSize = remaining
+                    return chunk
+                } catch (_: OutOfMemoryError) {
+                }
+            }
             System.arraycopy(buf, resumeAt, buf, 0, remaining)
             pcmSize = remaining
             return chunk

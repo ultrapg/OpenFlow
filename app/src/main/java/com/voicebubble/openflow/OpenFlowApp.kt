@@ -52,7 +52,9 @@ class OpenFlowApp : Application() {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         DebugLogManager.logTrimMemory("OpenFlowApp", level)
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+        ) {
             SmartPipeline.getInstance(this).onTrimMemory(level)
         }
     }

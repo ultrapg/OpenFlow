@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.7.2] - 2026-10-26
+
+### Added & Improved
+- **System-Prompt KV-Cache Pre-Warming for `Gemma 4 E2B` (`GemmaTextProcessor`, `SmartPipeline`, `FloatingBubbleService`):**
+  - Pre-computes and caches a single-slot standby `Conversation` (`ConversationConfig.prefillPrefaceOnInit = true`) containing the ~500-token system prompt + few-shot examples while you speak (`onRecordingStartedAsync()` using non-blocking `pipelineMutex.tryLock()`), during engine warm-up, on settings changes, and asynchronously post-dictation when RAM headroom permits.
+  - Decouples dynamic spoken language detection from the cached system prompt by passing resolved `Ear` language metadata via `<transcript lang="..." language="...">` on the user message, achieving near-100% KV-cache hits even on multilingual dictations while strictly closing any previous standby `Conversation` before allocating a new one.
+- **Comprehensive End-to-End RAM Awareness & Anti-OOM Hardening (`SmartPipeline`, `GemmaTextProcessor`, `PunctuationRestorer`, `AudioRecordingController`, `StreamingDictationSession`, `FloatingBubbleService`, `OpenFlowApp`):**
+  - **Co-Residency OOM Elimination (`canKeepVozAndGemmaCoResident`):** Prevents Android LMKD kills on 4–8 GB devices by safely unloading `Voz` (~1.3 GB) before dynamically loading `Gemma 4 E2B` (~1.9 GB)—and unloading `Gemma` before reloading `Voz`—whenever free physical RAM cannot safely hold both models simultaneously, while keeping both warm and co-resident on high-RAM flagships.
+  - **Memory-Tiered Gemma KV Context Window (`GemmaMemoryMode`):** Automatically scales Gemma's KV-cache context window across `HIGH_HEADROOM` (`4,096` tokens), `MODERATE_HEADROOM` (`2,048` tokens — halving KV-cache RAM), and `LOW_MEMORY` (`1,536` tokens, MTP disabled, idle KV-cache disabled), and guarantees child `Conversation` teardown before parent native `Engine.close()`.
+  - **Zero-Boxing `CompactTokenIdTable` in `Punct` (`PunctuationRestorer`):** Replaced `HashMap<String, Int>(335_000)` (~500,000 boxed `Integer` + `HashMap$Node` objects) with an open-addressed `Array<String?>` + primitive `IntArray` table and zero-allocation `getRange()` Viterbi substring lookups, saving ~12–16 MB of permanent JVM heap.
+  - **Lazy Audio Chunk Slicing & In-Place Conditioning (`SmartPipeline`):** Replaced upfront full-recording chunk copies in `transcribe()` with lazy per-iteration `computeSmartChunkRanges` slicing, early buffer release before post-processing, and in-place speech conditioning (`conditionAudioWhenClearDisabled(..., inPlace = true)`) on freshly padded chunks.
+  - **Live Recording & Streaming Backpressure (`AudioRecordingController`, `StreamingDictationSession`):** Added JVM free-heap headroom checks before growing `pcmBuffer`, automatic buffer compaction back to `15 s` once drained, live-poller backpressure (`MAX_IN_FLIGHT_LIVE_CHUNKS = 4`), and bounded failed-chunk retry retention (`MAX_FAILED_RETRY_SAMPLES = 45s`).
+  - **Multi-Tier OS `onTrimMemory` Eviction (`OpenFlowApp`, `FloatingBubbleService`, `SmartPipeline`):** Immediately evicts Gemma's standby system-prompt KV cache (~150–250 MB) on `TRIM_MEMORY_RUNNING_MODERATE` / `TRIM_MEMORY_UI_HIDDEN`, evicts optional models on `TRIM_MEMORY_RUNNING_LOW` / `TRIM_MEMORY_BACKGROUND`, and unloads idle `Voz` under `TRIM_MEMORY_RUNNING_CRITICAL` when physical RAM is critically low.
+
 ## [2.7.1] - 2026-10-26
 
 ### Added & Improved

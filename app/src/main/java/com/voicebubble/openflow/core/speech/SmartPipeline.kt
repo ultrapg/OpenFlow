@@ -122,6 +122,47 @@ data class MemoryPressureReport(
 
     val isCriticalPressure: Boolean
         get() = isJvmHeapCritical || isSystemRamCritical
+
+    /**
+     * Selects Gemma 4 E2B's KV-cache context window & speculative decoding tier from physical RAM headroom.
+     */
+    val gemmaMemoryMode: GemmaMemoryMode
+        get() = when {
+            isAnyMemoryTight || systemAvailMb < 1_200L -> GemmaMemoryMode.LOW_MEMORY
+            systemAvailMb < 2_200L -> GemmaMemoryMode.MODERATE_HEADROOM
+            else -> GemmaMemoryMode.HIGH_HEADROOM
+        }
+
+    /**
+     * Whether enough free system & JVM RAM exists to hold a pre-prefilled standby system-prompt `Conversation`
+     * in Gemma's KV cache (~150–250 MB) while idle or recording.
+     */
+    val canPrewarmGemmaPromptCache: Boolean
+        get() = !isAnyMemoryTight && systemAvailMb >= 1_350L && jvmFreeHeadroomMb >= 96L
+
+    /**
+     * Determines whether `Voz` (~1.3 GB) and `Gemma 4 E2B` (~1.9 GB) can safely stay co-resident in RAM
+     * without risking an Android LMKD out-of-memory kill.
+     *
+     * Accounts for whether each model's memory is *already* reflected in [systemAvailMb] or still needs
+     * to be allocated on top of current usage.
+     */
+    fun canKeepVozAndGemmaCoResident(
+        vozAlreadyLoaded: Boolean,
+        gemmaAlreadyLoaded: Boolean
+    ): Boolean {
+        if (isAnyMemoryTight) return false
+        return when {
+            vozAlreadyLoaded && gemmaAlreadyLoaded ->
+                systemAvailMb >= 1_050L
+            vozAlreadyLoaded && !gemmaAlreadyLoaded ->
+                systemTotalMb >= 7_200L && systemAvailMb >= 2_100L
+            !vozAlreadyLoaded && gemmaAlreadyLoaded ->
+                systemTotalMb >= 7_200L && systemAvailMb >= 2_150L
+            else ->
+                systemTotalMb >= 7_500L && systemAvailMb >= 2_500L
+        }
+    }
 }
 
 /**
@@ -195,6 +236,7 @@ class SmartPipeline(
     private val pipelineMutex = Mutex()
     private val idleScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var idleEvictionJob: Job? = null
+    private var promptPrewarmJob: Job? = null
 
     @Volatile
     var settings: ModelSettings = initialSettings
@@ -340,6 +382,74 @@ class SmartPipeline(
     fun currentSettings(): ModelSettings = settings
 
     /**
+     * Lightweight lock-free check used by live streaming chunkers to apply backpressure under memory distress.
+     */
+    fun isMemoryCriticallyTight(): Boolean = evaluateMemoryPressure().isCriticalPressure
+
+    /**
+     * Triggered asynchronously when the user taps the microphone bubble to start recording.
+     * Pre-fills Gemma 4 E2B's system-prompt KV cache (`prefillPrefaceOnInit = true`) for the currently
+     * focused app & cursor context while the user is speaking, using `pipelineMutex.tryLock()` so it
+     * never blocks or delays live `Voz` chunk transcription.
+     */
+    fun onRecordingStartedAsync() {
+        val snap = settings
+        if (!snap.gemmaEnabled || isTranscribing) return
+        promptPrewarmJob?.cancel()
+        promptPrewarmJob = idleScope.launch {
+            if (isTranscribing || !pipelineMutex.tryLock()) return@launch
+            try {
+                if (isTranscribing) return@launch
+                val activeSnap = settings
+                val gemma = gemmaProcessor ?: return@launch
+                if (!activeSnap.gemmaEnabled) return@launch
+                val mem = evaluateMemoryPressure()
+                if (mem.canPrewarmGemmaPromptCache) {
+                    gemma.prewarmSystemPrompt(
+                        preset = activeSnap.gemmaPromptPreset,
+                        customPrompt = activeSnap.gemmaCustomPrompt,
+                        customVocabulary = activeSnap.customVocabulary,
+                        disableThinking = activeSnap.gemmaDisableThinking
+                    )
+                } else {
+                    gemma.evictCachedSystemPrompt()
+                }
+            } finally {
+                pipelineMutex.unlock()
+            }
+        }
+    }
+
+    private fun schedulePostDictationPromptPrewarm() {
+        val snap = settings
+        if (!snap.gemmaEnabled) return
+        promptPrewarmJob?.cancel()
+        promptPrewarmJob = idleScope.launch {
+            delay(400L)
+            if (isTranscribing || !pipelineMutex.tryLock()) return@launch
+            try {
+                if (isTranscribing) return@launch
+                val activeSnap = settings
+                val gemma = gemmaProcessor ?: return@launch
+                if (!activeSnap.gemmaEnabled) return@launch
+                val mem = evaluateMemoryPressure()
+                if (mem.canPrewarmGemmaPromptCache && mem.systemAvailMb >= 1_600L) {
+                    gemma.prewarmSystemPrompt(
+                        preset = activeSnap.gemmaPromptPreset,
+                        customPrompt = activeSnap.gemmaCustomPrompt,
+                        customVocabulary = activeSnap.customVocabulary,
+                        disableThinking = activeSnap.gemmaDisableThinking
+                    )
+                } else if (!mem.canPrewarmGemmaPromptCache) {
+                    gemma.evictCachedSystemPrompt()
+                }
+            } finally {
+                pipelineMutex.unlock()
+            }
+        }
+    }
+
+    /**
      * Launches [reloadSettings] on the singleton's background scope.
      */
     fun reloadSettingsAsync(newSettings: ModelSettings) {
@@ -368,6 +478,20 @@ class SmartPipeline(
                 areEnabledModelsReadyOrStandbyLocked(snapshot)
             ) {
                 appliedSettingsSnapshot = snapshot
+                val currentGemma = gemmaProcessor
+                if (snapshot.gemmaEnabled && currentGemma != null) {
+                    val mem = evaluateMemoryPressure()
+                    if (mem.canPrewarmGemmaPromptCache) {
+                        currentGemma.prewarmSystemPrompt(
+                            preset = snapshot.gemmaPromptPreset,
+                            customPrompt = snapshot.gemmaCustomPrompt,
+                            customVocabulary = snapshot.customVocabulary,
+                            disableThinking = snapshot.gemmaDisableThinking
+                        )
+                    } else {
+                        currentGemma.evictCachedSystemPrompt()
+                    }
+                }
                 val count = countLoadedModelsLocked(snapshot)
                 val msg = "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 updateStatusSnapshot(
@@ -448,18 +572,21 @@ class SmartPipeline(
 
         // Fast silence trim before acquiring native sessions (uses a whisper-sensitive 0.0020f floor and 400 ms
         // margin so soft trailing fricatives/plosives at the end of a dictation are never clipped).
-        val trimmedSamples = trimLeadingAndTrailingSilence(
+        var trimmedSamplesRef: FloatArray? = trimLeadingAndTrailingSilence(
             samples = samples,
             threshold = 0.0020f,
             padSamples = 6_400
         )
-        if (trimmedSamples.isEmpty()) return@withContext ""
+        val initialTrimmed = trimmedSamplesRef
+        if (initialTrimmed == null || initialTrimmed.isEmpty()) return@withContext ""
 
-        val audioDurationMs = ((trimmedSamples.size.toDouble() / SAMPLE_RATE_HZ) * 1000.0).roundToLong()
+        val audioDurationMs = ((initialTrimmed.size.toDouble() / SAMPLE_RATE_HZ) * 1000.0).roundToLong()
 
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            promptPrewarmJob?.cancel()
+            promptPrewarmJob = null
             isTranscribing = true
             val inferenceStartMs = SystemClock.elapsedRealtime()
             try {
@@ -485,17 +612,18 @@ class SmartPipeline(
                     chunkSettings.effectiveOfflineMinChunkSamples
                 }
 
-                val audioChunks = splitAudioIntoSmartChunks(
-                    samples = trimmedSamples,
+                val chunkRanges = computeSmartChunkRanges(
+                    samples = initialTrimmed,
                     maxChunkSamples = maxChunkSamples,
                     minChunkSamples = minChunkSamples,
                     silenceThreshold = chunkSettings.silenceThreshold
                 )
+                val totalChunks = chunkRanges.size
 
                 DebugLogManager.logInfo(
                     TAG,
-                    "transcribe() start • raw=${samples.size}, trimmed=${trimmedSamples.size} (${audioDurationMs}ms), " +
-                        "chunks=${audioChunks.size}, criticalStaging=$dynamicStageRelease, " +
+                    "transcribe() start • raw=${samples.size}, trimmed=${initialTrimmed.size} (${audioDurationMs}ms), " +
+                        "chunks=$totalChunks, criticalStaging=$dynamicStageRelease, " +
                         "jvmFree=${initialMem.jvmFreeHeadroomMb}MB, sysAvail=${initialMem.systemAvailMb}MB",
                     includeMemory = true
                 )
@@ -507,12 +635,21 @@ class SmartPipeline(
                 // =========================================================================
                 // Stage 1: Spoken Language Identification (`Ear`) on a bounded 5.5s slice
                 // =========================================================================
+                val firstRange = chunkRanges.first()
+                val firstChunkEnd = min(firstRange.endExclusive, firstRange.start + MAX_EAR_WINDOW_SAMPLES)
                 val resolvedLanguage = languageHint?.takeIf { it in Voz.supportedLanguages }
-                    ?: resolveLanguageLocked(
-                        samples = audioChunks.first(),
-                        activeSettings = activeSettings,
-                        onStageProgress = onStageProgress
-                    )
+                    ?: run {
+                        val earSlice = if (firstRange.start == 0 && firstChunkEnd == initialTrimmed.size) {
+                            initialTrimmed
+                        } else {
+                            initialTrimmed.copyOfRange(firstRange.start, firstChunkEnd)
+                        }
+                        resolveLanguageLocked(
+                            samples = earSlice,
+                            activeSettings = activeSettings,
+                            onStageProgress = onStageProgress
+                        )
+                    }
                 onLanguageResolved?.invoke(resolvedLanguage)
                 if (dynamicStageRelease && ear != null) {
                     DebugLogManager.logInfo(TAG, "Critical memory staging: releasing Ear session before heavy stages")
@@ -520,12 +657,22 @@ class SmartPipeline(
                 }
 
                 // =========================================================================
-                // Stage 2..3: Process each bounded audio chunk sequentially
+                // Stage 2..3: Process each bounded audio chunk sequentially (lazy slicing)
                 // =========================================================================
-                val segmentTranscripts = ArrayList<String>(audioChunks.size)
-                val totalChunks = audioChunks.size
+                val segmentTranscripts = ArrayList<String>(totalChunks)
 
-                for ((chunkIdx, rawChunk) in audioChunks.withIndex()) {
+                for ((chunkIdx, range) in chunkRanges.withIndex()) {
+                    val sourceSamples = trimmedSamplesRef ?: break
+                    val rawChunk = if (range.start == 0 && range.endExclusive == sourceSamples.size) {
+                        sourceSamples
+                    } else {
+                        sourceSamples.copyOfRange(range.start, range.endExclusive)
+                    }
+                    if (chunkIdx == totalChunks - 1) {
+                        // Drop outer reference to the full trimmed audio buffer as soon as the final chunk is sliced
+                        trimmedSamplesRef = null
+                    }
+
                     val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
                     val preparedChunk = prepareChunkForInference(
                         samples = rawChunk,
@@ -535,7 +682,10 @@ class SmartPipeline(
                         edgeFadeSamples = 160,
                         silenceThreshold = 0.0020f
                     )
-                    val conditionedChunk = conditionAudioWhenClearDisabled(preparedChunk)
+                    val conditionedChunk = conditionAudioWhenClearDisabled(
+                        samples = preparedChunk,
+                        inPlace = preparedChunk !== rawChunk && preparedChunk !== samples
+                    )
 
                     // Stage 2: Multilingual Speech-to-Text (`Voz`)
                     ensureMemoryHeadroomForFfiLocked(conditionedChunk.size)
@@ -563,6 +713,7 @@ class SmartPipeline(
                         segmentTranscripts.add(segmentText)
                     }
                 }
+                trimmedSamplesRef = null
 
                 val stitchedTranscript = stitchChunkTranscripts(
                     chunks = segmentTranscripts,
@@ -585,13 +736,27 @@ class SmartPipeline(
                     stitchedTranscript
                 }
 
-                // Re-attach core & auxiliary models in ready state if memory is healthy
+                // Re-attach core & auxiliary models in ready state if memory is healthy,
+                // guaranteeing Voz and Gemma never co-reside when free RAM cannot hold both.
                 val postMem = evaluateMemoryPressure()
                 if (voz == null && !postMem.isCriticalPressure) {
+                    if (gemmaProcessor != null &&
+                        !postMem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true)
+                    ) {
+                        DebugLogManager.logInfo(
+                            TAG,
+                            "Unloading Gemma 4 E2B before reloading Voz so low/moderate-RAM device stays OOM-safe (sysAvail=${postMem.systemAvailMb}MB)"
+                        )
+                        closeGemmaLocked()
+                        System.gc()
+                    }
                     ensureVozLocked(activeSettings, warmUp = false)
                 }
                 if (!postMem.isCriticalPressure) {
                     ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
+                }
+                if (applyPostProcessing && activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                    schedulePostDictationPromptPrewarm()
                 }
 
                 val totalInferenceMs = (SystemClock.elapsedRealtime() - inferenceStartMs).coerceAtLeast(1L)
@@ -647,6 +812,8 @@ class SmartPipeline(
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            promptPrewarmJob?.cancel()
+            promptPrewarmJob = null
             isTranscribing = true
             try {
                 val activeSettings = settings
@@ -662,7 +829,20 @@ class SmartPipeline(
                 )
                 val postMem = evaluateMemoryPressure()
                 if (voz == null && !postMem.isCriticalPressure) {
+                    if (gemmaProcessor != null &&
+                        !postMem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true)
+                    ) {
+                        DebugLogManager.logInfo(
+                            TAG,
+                            "Unloading Gemma 4 E2B before reloading Voz after streaming session (sysAvail=${postMem.systemAvailMb}MB)"
+                        )
+                        closeGemmaLocked()
+                        System.gc()
+                    }
                     ensureVozLocked(activeSettings, warmUp = false)
+                }
+                if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                    schedulePostDictationPromptPrewarm()
                 }
                 result
             } finally {
@@ -702,11 +882,52 @@ class SmartPipeline(
     }
 
     /**
-     * Handles Android OS memory pressure callbacks (`TRIM_MEMORY_RUNNING_LOW` or higher).
+     * Multi-tier Android OS memory pressure handler:
+     * - Moderate / UI-hidden pressure: immediately evicts Gemma's standby system-prompt KV cache (~150–250 MB)
+     *   without unloading model weights.
+     * - Running-low / background pressure: evicts optional native models (`Ear`, `Punct`, `Gemma 4 E2B`).
+     * - Critical pressure with critically low physical RAM: also unloads `Voz` when idle so LMKD never kills
+     *   the foreground dictation service (`Voz` reloads transparently on the next tap).
      */
     fun onTrimMemory(level: Int) {
         DebugLogManager.logTrimMemory("SmartPipeline", level)
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW && !isTranscribing) {
+        if (!isTranscribing) {
+            gemmaProcessor?.evictCachedSystemPrompt()
+        }
+        val isSevereTrim = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+        val isLowTrim = level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+
+        if (isSevereTrim && !isTranscribing) {
+            idleScope.launch {
+                pipelineMutex.withLock {
+                    if (!isTranscribing) {
+                        closeEarLocked()
+                        closePunctLocked()
+                        closeGemmaLocked()
+                        if (evaluateMemoryPressure().isSystemRamCritical) {
+                            DebugLogManager.logWarn(
+                                TAG,
+                                "Critical OS memory trim ($level) with low physical RAM; unloading Voz to prevent LMKD kill"
+                            )
+                            closeVozLocked()
+                        }
+                        System.gc()
+                        val snap = settings
+                        updateStatusSnapshot(
+                            activeSettings = snap,
+                            phaseOverride = if (voz != null) PipelinePhase.STANDBY_EVICTED else PipelinePhase.UNINITIALIZED,
+                            messageOverride = if (voz != null) {
+                                "Voz loaded in RAM • Optional models on dynamic standby"
+                            } else {
+                                "Models on low-RAM standby — will reload on next tap"
+                            }
+                        )
+                    }
+                }
+            }
+        } else if (isLowTrim && !isTranscribing) {
             idleScope.launch {
                 evictOptionalModels()
             }
@@ -720,6 +941,8 @@ class SmartPipeline(
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            promptPrewarmJob?.cancel()
+            promptPrewarmJob = null
             closeEarLocked()
             closePunctLocked()
             closeGemmaLocked()
@@ -835,8 +1058,7 @@ class SmartPipeline(
             }
             if (activeSettings.gemmaEnabled &&
                 DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B) &&
-                !mem.isAnyMemoryTight &&
-                mem.systemAvailMb >= 1_650L &&
+                mem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = voz != null, gemmaAlreadyLoaded = gemmaProcessor != null) &&
                 gemmaProcessor == null
             ) {
                 return false
@@ -1167,7 +1389,10 @@ class SmartPipeline(
         // Experimental Gemma 4 E2B (LiteRT-LM on NPU / GPU / CPU)
         if (activeSettings.gemmaEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B)) {
             val gemmaMem = evaluateMemoryPressure()
-            val canPreloadGemma = !gemmaMem.isAnyMemoryTight && gemmaMem.systemAvailMb >= 1_650L
+            val canPreloadGemma = gemmaMem.canKeepVozAndGemmaCoResident(
+                vozAlreadyLoaded = voz != null,
+                gemmaAlreadyLoaded = gemmaProcessor != null
+            )
             if (gemmaProcessor == null && canPreloadGemma) {
                 try {
                     updateSingleModelStateLocked(
@@ -1181,12 +1406,12 @@ class SmartPipeline(
                         context = appContext,
                         modelDir = gemmaDir,
                         accelerator = activeSettings.hardwareAccelerator,
-                        lowMemoryPressure = gemmaMem.isAnyMemoryTight
+                        memoryMode = gemmaMem.gemmaMemoryMode
                     )
                     gemmaWarmedUp = false
                     DebugLogManager.logInfo(
                         TAG,
-                        "Gemma 4 E2B loaded into RAM (${gemmaProcessor?.activeBackendSummary})",
+                        "Gemma 4 E2B loaded into RAM (${gemmaProcessor?.activeBackendSummary}, memMode=${gemmaMem.gemmaMemoryMode})",
                         includeMemory = true
                     )
                 } catch (t: Throwable) {
@@ -1194,10 +1419,16 @@ class SmartPipeline(
                     DebugLogManager.logError(TAG, "Could not pre-load Gemma 4 E2B", t)
                     closeGemmaLocked()
                 }
+            } else if (gemmaProcessor != null && !canPreloadGemma) {
+                DebugLogManager.logInfo(
+                    TAG,
+                    "Releasing co-resident Gemma 4 E2B to preserve Voz RAM headroom (sysAvail=${gemmaMem.systemAvailMb}MB)"
+                )
+                closeGemmaLocked()
             } else if (gemmaProcessor == null) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Keeping Gemma 4 E2B on dynamic standby until post-processing stage (sysAvail=${gemmaMem.systemAvailMb}MB)"
+                    "Keeping Gemma 4 E2B on dynamic standby until post-processing stage (sysAvail=${gemmaMem.systemAvailMb}MB, total=${gemmaMem.systemTotalMb}MB)"
                 )
             }
 
@@ -1208,9 +1439,14 @@ class SmartPipeline(
                         activeSettings = activeSettings,
                         model = DesertAntModel.GEMMA_4_E2B,
                         state = ModelLoadState.LOADING,
-                        message = "Warming up Gemma 4 E2B (${currentGemma.activeBackendSummary})..."
+                        message = "Warming up Gemma 4 E2B & caching system prompt (${currentGemma.activeBackendSummary})..."
                     )
-                    currentGemma.warmUp()
+                    currentGemma.warmUp(
+                        preset = activeSettings.gemmaPromptPreset,
+                        customPrompt = activeSettings.gemmaCustomPrompt,
+                        customVocabulary = activeSettings.customVocabulary,
+                        disableThinking = activeSettings.gemmaDisableThinking
+                    )
                     gemmaWarmedUp = true
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
@@ -1316,15 +1552,15 @@ class SmartPipeline(
 
         if (gemmaProcessor == null) {
             val preLoadMem = evaluateMemoryPressure()
-            if (preLoadMem.isAnyMemoryTight || preLoadMem.systemAvailMb < 1_700L) {
+            if (preLoadMem.isAnyMemoryTight || preLoadMem.systemAvailMb < 2_200L) {
                 closeEarLocked()
                 closePunctLocked()
             }
             val memAfterAux = evaluateMemoryPressure()
-            if (memAfterAux.isCriticalPressure || memAfterAux.systemAvailMb < 1_050L) {
+            if (voz != null && !memAfterAux.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = false)) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Temporarily releasing Voz session to create NPU/RAM headroom for Gemma 4 E2B (sysAvail=${memAfterAux.systemAvailMb}MB)",
+                    "Temporarily releasing Voz session to guarantee OOM-safe NPU/RAM headroom for Gemma 4 E2B (sysAvail=${memAfterAux.systemAvailMb}MB, total=${memAfterAux.systemTotalMb}MB)",
                     includeMemory = true
                 )
                 closeVozLocked()
@@ -1347,7 +1583,7 @@ class SmartPipeline(
                     context = appContext,
                     modelDir = gemmaDir,
                     accelerator = activeSettings.hardwareAccelerator,
-                    lowMemoryPressure = memNow.isAnyMemoryTight
+                    memoryMode = memNow.gemmaMemoryMode
                 ).also { gemmaProcessor = it }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
@@ -1377,10 +1613,14 @@ class SmartPipeline(
             )
             gemmaWarmedUp = true
             val postGemmaMem = evaluateMemoryPressure()
-            if (dynamicStageRelease || postGemmaMem.systemAvailMb < 950L) {
+            val cannotKeepAlongsideVoz = !postGemmaMem.canKeepVozAndGemmaCoResident(
+                vozAlreadyLoaded = voz != null,
+                gemmaAlreadyLoaded = true
+            )
+            if (dynamicStageRelease || postGemmaMem.systemAvailMb < 950L || cannotKeepAlongsideVoz) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Releasing Gemma 4 E2B session after pass to preserve system RAM headroom (sysAvail=${postGemmaMem.systemAvailMb}MB)"
+                    "Releasing Gemma 4 E2B session after pass so Voz & system RAM stay healthy (sysAvail=${postGemmaMem.systemAvailMb}MB)"
                 )
                 closeGemmaLocked()
                 System.gc()
@@ -1556,6 +1796,50 @@ class SmartPipeline(
     }
 }
 
+internal data class ChunkSliceRange(val start: Int, val endExclusive: Int)
+
+internal fun computeSmartChunkRanges(
+    samples: FloatArray,
+    maxChunkSamples: Int = SmartPipeline.DEFAULT_MAX_CHUNK_SAMPLES,
+    minChunkSamples: Int = SmartPipeline.DEFAULT_MIN_CHUNK_SAMPLES,
+    pauseWindowSamples: Int = 1_280, // minimum pause length (80 ms @ 16 kHz)
+    silenceThreshold: Float = DEFAULT_SILENCE_RMS
+): List<ChunkSliceRange> {
+    if (samples.isEmpty()) return emptyList()
+    val safeMax = max(3_200, maxChunkSamples)
+    if (samples.size <= safeMax) return listOf(ChunkSliceRange(0, samples.size))
+
+    val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
+    val minPauseFrames = max(2, pauseWindowSamples.coerceIn(320, 16_000) / CHUNK_FRAME_SAMPLES)
+    // Never leave a sub-second orphan tail: a few hundred samples fed to Clear/Voz yields hallucinated or empty text.
+    // Bounded by (safeMax - safeMin) so the split range below can never become empty.
+    val minTailSamples = min(8_000, safeMax - safeMin)
+    val ranges = ArrayList<ChunkSliceRange>((samples.size / safeMin) + 2)
+
+    var cursor = 0
+    while (cursor < samples.size) {
+        val remaining = samples.size - cursor
+        if (remaining <= safeMax) {
+            ranges.add(ChunkSliceRange(cursor, samples.size))
+            break
+        }
+
+        val searchStart = cursor + safeMin
+        val latestSplit = min(cursor + safeMax, samples.size - minTailSamples)
+        val bestSplitIndex = if (searchStart < latestSplit) {
+            findBestSplitPoint(samples, searchStart, latestSplit, silenceThreshold, minPauseFrames)
+        } else {
+            latestSplit
+        }
+
+        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, latestSplit)
+        ranges.add(ChunkSliceRange(cursor, splitAt))
+        cursor = splitAt
+    }
+
+    return ranges
+}
+
 /**
  * Splits a long 16 kHz PCM [samples] buffer into natural speech segments of at most [maxChunkSamples].
  *
@@ -1578,35 +1862,20 @@ fun splitAudioIntoSmartChunks(
     val safeMax = max(3_200, maxChunkSamples)
     if (samples.size <= safeMax) return listOf(samples)
 
-    val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
-    val minPauseFrames = max(2, pauseWindowSamples.coerceIn(320, 16_000) / CHUNK_FRAME_SAMPLES)
-    // Never leave a sub-second orphan tail: a few hundred samples fed to Clear/Voz yields hallucinated or empty text.
-    // Bounded by (safeMax - safeMin) so the split range below can never become empty.
-    val minTailSamples = min(8_000, safeMax - safeMin)
-    val chunks = mutableListOf<FloatArray>()
-
-    var cursor = 0
-    while (cursor < samples.size) {
-        val remaining = samples.size - cursor
-        if (remaining <= safeMax) {
-            chunks.add(samples.copyOfRange(cursor, samples.size))
-            break
-        }
-
-        val searchStart = cursor + safeMin
-        val latestSplit = min(cursor + safeMax, samples.size - minTailSamples)
-        val bestSplitIndex = if (searchStart < latestSplit) {
-            findBestSplitPoint(samples, searchStart, latestSplit, silenceThreshold, minPauseFrames)
+    val ranges = computeSmartChunkRanges(
+        samples = samples,
+        maxChunkSamples = maxChunkSamples,
+        minChunkSamples = minChunkSamples,
+        pauseWindowSamples = pauseWindowSamples,
+        silenceThreshold = silenceThreshold
+    )
+    return ranges.map { range ->
+        if (range.start == 0 && range.endExclusive == samples.size) {
+            samples
         } else {
-            latestSplit
+            samples.copyOfRange(range.start, range.endExclusive)
         }
-
-        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, latestSplit)
-        chunks.add(samples.copyOfRange(cursor, splitAt))
-        cursor = splitAt
     }
-
-    return chunks
 }
 
 /**
@@ -1717,7 +1986,8 @@ fun prepareChunkForInference(
  * 3. **Soft-Knee Limiting:** Smoothly limits peaks above `0.85f` into `[0.85f, 0.96f]` so boosted speech
  *    never hard-clips.
  */
-fun conditionAudioWhenClearDisabled(samples: FloatArray): FloatArray {
+@JvmOverloads
+fun conditionAudioWhenClearDisabled(samples: FloatArray, inPlace: Boolean = false): FloatArray {
     if (samples.isEmpty()) return samples
     val frameLen = CHUNK_FRAME_SAMPLES // 320 samples = 20 ms @ 16 kHz
     val numFrames = samples.size / frameLen
@@ -1839,7 +2109,8 @@ fun conditionAudioWhenClearDisabled(samples: FloatArray): FloatArray {
     }
 
     // 6. Apply linearly interpolated gain + soft-knee limiter above 0.85f
-    val out = FloatArray(samples.size)
+    // When `inPlace == true` (e.g. freshly allocated `preparedChunk`), mutate `samples` directly to avoid a duplicate MB-scale FloatArray!
+    val out = if (inPlace) samples else FloatArray(samples.size)
     for (f in 0 until numFrames) {
         val g0 = smoothedGain[f]
         val g1 = if (f + 1 < numFrames) smoothedGain[f + 1] else g0
