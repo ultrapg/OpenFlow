@@ -209,6 +209,7 @@ data class ModelSettings(
     val earEnabled: Boolean = true,
     val punctEnabled: Boolean = false,
     val gemmaEnabled: Boolean = false,
+    val gemmaDisableThinking: Boolean = false,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
     val preferredLanguage: String = defaultPreferredLanguage(),
@@ -276,6 +277,7 @@ data class ModelSettings(
         const val KEY_EAR_ENABLED = "ear_enabled"
         const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
+        const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
         const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
@@ -312,6 +314,7 @@ data class ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false),
+                gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, false),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
                 preferredLanguage = sanitizedLang,
@@ -339,6 +342,7 @@ data class ModelSettings(
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
+                .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
                 .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)

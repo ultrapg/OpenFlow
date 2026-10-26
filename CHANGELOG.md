@@ -2,6 +2,14 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.7.1] - 2026-10-26
+
+### Added & Improved
+- **Optional `"Disable Model Thinking"` Toggle for Experimental `Gemma 4 E2B` (`ModelSettings`, `SpeechRecognitionSettingsSection`, `GemmaTextProcessor`, `SmartPipeline`):**
+  - Added a **`Disable Model Thinking`** switch (**disabled / OFF by default**, `gemmaDisableThinking = false`) inside the Experimental **Gemma 4 E2B — AI Post-Processing** settings card.
+  - **Default (`Disable Model Thinking` OFF):** Enables Gemma 4 E2B's native reasoning channel (`ThinkingConfig(enableThinking = true)` + `extraContext = mapOf("enable_thinking" to true)`) with NPU-compatible unconstrained decoding, an expanded `4,096`-token KV context window (with automatic per-backend `2,048`-token fallback), reasoning-aware output token headroom, and automatic single-turn non-thinking retry if a long reasoning trace exhausts the token cap—delivering maximum accuracy on complex backtracks, numbers, and structural edits.
+  - **Fast Mode (`Disable Model Thinking` ON):** Skips Gemma 4's reasoning channel (`ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)` + `extraContext = mapOf("enable_thinking" to false)`) so tokens stream directly into the cleaned transcript, significantly speeding up post-processing at the potential cost of reduced accuracy on complex edits.
+
 ## [2.7.0] - 2026-10-26
 
 ### Improved

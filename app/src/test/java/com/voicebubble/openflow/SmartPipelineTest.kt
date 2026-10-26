@@ -109,6 +109,7 @@ class SmartPipelineTest {
         assertTrue(defaultSettings.earEnabled)
         assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
         assertFalse("Gemma 4 E2B must be OFF by default (Experimental)", defaultSettings.gemmaEnabled)
+        assertFalse("Disable Model Thinking must be OFF by default", defaultSettings.gemmaDisableThinking)
         assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
         assertEquals(
             com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
@@ -1297,5 +1298,44 @@ class SmartPipelineTest {
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
             )
         )
+    }
+
+    @Test
+    fun `GemmaTextProcessor disableThinking option adjusts token budget and system prompt while defaulting to off`() {
+        val sampleTranscript = "um hey alex let's meet wednesday at three thirty pm to check the eight gigabyte ram headroom"
+
+        val fastNoThinkTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sampleTranscript,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true,
+            maxContextTokens = 4_096
+        )
+        val defaultThinkingTokens4k = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sampleTranscript,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            maxContextTokens = 4_096
+        )
+        val defaultThinkingTokens2k = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sampleTranscript,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            maxContextTokens = 2_048
+        )
+
+        assertTrue("No-thinking budget should stay tight for speed", fastNoThinkTokens in 96..256)
+        assertEquals(fastNoThinkTokens + 640, defaultThinkingTokens4k)
+        assertEquals(fastNoThinkTokens + 384, defaultThinkingTokens2k)
+
+        val defaultInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false
+        )
+        val disabledThinkingInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true
+        )
+        assertTrue(defaultInstruction.contains("Keep internal reasoning brief"))
+        assertFalse(disabledThinkingInstruction.contains("Keep internal reasoning brief"))
     }
 }

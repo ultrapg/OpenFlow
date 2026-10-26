@@ -1360,10 +1360,11 @@ class SmartPipeline(
 
         return try {
             val presetLabel = activeSettings.gemmaPromptPreset.shortLabel
+            val thinkingLabel = if (activeSettings.gemmaDisableThinking) "No-Think" else "Thinking"
             setModelActiveStatusLocked(
                 activeSettings,
                 DesertAntModel.GEMMA_4_E2B,
-                "Reformatting with Gemma 4 E2B ($presetLabel • ${instance.activeBackendSummary})..."
+                "Reformatting with Gemma 4 E2B ($presetLabel • $thinkingLabel • ${instance.activeBackendSummary})..."
             )
             onStageProgress?.invoke("Gemma 4 E2B")
             val processed = instance.process(
@@ -1371,7 +1372,8 @@ class SmartPipeline(
                 preset = activeSettings.gemmaPromptPreset,
                 customPrompt = activeSettings.gemmaCustomPrompt,
                 languageCode = language,
-                customVocabulary = activeSettings.customVocabulary
+                customVocabulary = activeSettings.customVocabulary,
+                disableThinking = activeSettings.gemmaDisableThinking
             )
             gemmaWarmedUp = true
             val postGemmaMem = evaluateMemoryPressure()

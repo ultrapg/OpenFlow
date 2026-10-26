@@ -618,6 +618,43 @@ fun SpeechRecognitionSettingsSection(
 
                 HorizontalDivider()
 
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            persistAndReload(settings.copy(gemmaDisableThinking = !settings.gemmaDisableThinking))
+                        }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 12.dp)
+                    ) {
+                        Text(
+                            text = "Disable Model Thinking",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Significantly speeds up cleanup and reformatting by skipping Gemma 4's reasoning step, though accuracy on complex edits may decrease. Off by default.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.gemmaDisableThinking,
+                        onCheckedChange = { disableThinking ->
+                            persistAndReload(settings.copy(gemmaDisableThinking = disableThinking))
+                        }
+                    )
+                }
+
+                HorizontalDivider()
+
                 Text(
                     text = "System Prompt Preset",
                     style = MaterialTheme.typography.titleSmall,
