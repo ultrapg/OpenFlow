@@ -1028,4 +1028,274 @@ class SmartPipelineTest {
         assertEquals("$s1 $s2", split[0])
         assertEquals(s3, split[1])
     }
+
+    @Test
+    fun `GemmaTextProcessor classifyAppPackage and analyzeFieldContext detect app styles and cursor states`() {
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.EMAIL,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("com.google.android.gm")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.EMAIL,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("ch.protonmail.android")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.WORK_MESSAGING,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("com.Slack")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.PERSONAL_MESSAGING,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("com.whatsapp")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.CODE_AND_DEV,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("com.termux")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.NOTES_AND_DOCS,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("md.obsidian")
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.AppContextCategory.GENERAL,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.classifyAppPackage("com.voicebubble.openflow")
+        )
+
+        // Open clause on same line -> mid-sentence continuation
+        val midClause = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "com.whatsapp",
+            textBeforeCursor = "I spoke with Sarah and "
+        )
+        assertEquals(com.voicebubble.openflow.core.speech.AppContextCategory.PERSONAL_MESSAGING, midClause.appCategory)
+        assertTrue(midClause.isMidSentenceContinuation)
+        assertEquals(null, midClause.continuingNumberedListFrom)
+
+        // Completed sentence on same line -> new sentence (keep capitalized)
+        val afterPeriod = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "com.whatsapp",
+            textBeforeCursor = "I spoke with Sarah. "
+        )
+        assertFalse(afterPeriod.isMidSentenceContinuation)
+
+        // Fresh line below numbered list item -> continue numbering at #3
+        val listNewLine = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "md.obsidian",
+            textBeforeCursor = "1. Build release APK\n2. Run unit tests\n"
+        )
+        assertEquals(2, listNewLine.continuingNumberedListFrom)
+        assertFalse(listNewLine.isMidSentenceContinuation)
+
+        // Same line inside numbered list item -> mid-sentence continuation, NOT a new list item
+        val listSameLine = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "md.obsidian",
+            textBeforeCursor = "1. Test NPU latency "
+        )
+        assertEquals(null, listSameLine.continuingNumberedListFrom)
+        assertTrue(listSameLine.isMidSentenceContinuation)
+
+        // Editor already auto-inserted bare "3. " marker -> neither mid-sentence lowercase nor duplicate marker
+        val autoInsertedMarker = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "md.obsidian",
+            textBeforeCursor = "1. Build APK\n2. Run tests\n3. "
+        )
+        assertEquals(null, autoInsertedMarker.continuingNumberedListFrom)
+        assertFalse(autoInsertedMarker.isMidSentenceContinuation)
+
+        // Fresh line below bullet item -> continue bullet list
+        val bulletNewLine = com.voicebubble.openflow.core.speech.GemmaTextProcessor.analyzeFieldContext(
+            packageName = "notion.id",
+            textBeforeCursor = "- Check NPU memory\n"
+        )
+        assertTrue(bulletNewLine.isContinuingBulletList)
+        assertFalse(bulletNewLine.isMidSentenceContinuation)
+    }
+
+    @Test
+    fun `GemmaTextProcessor preNormalizeSpokenConstructs converts spoken emails and layout cues without prose false positives`() {
+        // Unambiguous spoken email addresses (EN + DE)
+        assertEquals(
+            "Send logs to john.doe@gmail.com right away.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Send logs to John dot Doe at Gmail dot com right away."
+            )
+        )
+        assertEquals(
+            "Schreib bitte an max.mustermann@firma.de.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Schreib bitte an Max punkt Mustermann at Firma punkt de."
+            )
+        )
+        assertEquals(
+            "Reach us via support@openflow.dev anytime.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Reach us via support at openflow dot dev anytime."
+            )
+        )
+
+        // Guarded non-email prepositions ("at amazon dot com", "look at github dot com") MUST NOT become emails
+        assertEquals(
+            "I bought it at amazon dot com yesterday.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "I bought it at amazon dot com yesterday."
+            )
+        )
+        assertEquals(
+            "Look at github dot com for the source.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Look at github dot com for the source."
+            )
+        )
+
+        // Spoken layout & dash commands
+        assertEquals(
+            "Thanks for the update.\n\nLet's ship today.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Thanks for the update. New paragraph. Let's ship today."
+            )
+        )
+        assertEquals(
+            "Best regards,\nAlex",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Best regards, new line, Alex"
+            )
+        )
+        assertEquals(
+            "Latency dropped — under 120 ms.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "Latency dropped, em dash, under 120 ms."
+            )
+        )
+
+        // Guarded literal prose noun phrases MUST stay untouched
+        assertEquals(
+            "I wrote a new paragraph in the essay.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "I wrote a new paragraph in the essay."
+            )
+        )
+        assertEquals(
+            "We launched a new line of products.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "We launched a new line of products."
+            )
+        )
+        assertEquals(
+            "The next paragraph explains the API.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(
+                "The next paragraph explains the API."
+            )
+        )
+    }
+
+    @Test
+    fun `GemmaTextProcessor Wispr Flow context hints refusal guards and continuation casing work end to end`() {
+        val emailFieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(
+            appCategory = com.voicebubble.openflow.core.speech.AppContextCategory.EMAIL,
+            continuingNumberedListFrom = 2
+        )
+        val enEmailPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            languageCode = "en",
+            fieldContext = emailFieldContext
+        )
+        assertTrue(enEmailPrompt.contains("Course-correction & backtracks"))
+        assertTrue(enEmailPrompt.contains("Smart list detection"))
+        assertTrue(enEmailPrompt.contains("Email Composer"))
+        assertTrue(enEmailPrompt.contains("start numbering at 3"))
+        assertTrue(enEmailPrompt.contains("Example 1 Output: Hey Alex, let's meet Wednesday at 3:30 PM"))
+
+        // Unprompted chatbot refusal falls back safely to raw transcript
+        val questionInput = "Hey John, what time is our flight to Munich tomorrow?"
+        assertEquals(
+            questionInput,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "I'm sorry, I don't have access to your personal schedule or flight information.",
+                fallbackInput = questionInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+        assertEquals(
+            questionInput,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "As an AI assistant, I cannot check your flight time.",
+                fallbackInput = questionInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Legitimate user dictation mentioning "dont have access" is KEPT (not mistaken for AI refusal!)
+        val legitAccessInput = "um hey team i dont have access to the staging server right now"
+        assertEquals(
+            "Hey team, I don't have access to the staging server right now.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "Hey team, I don't have access to the staging server right now.",
+                fallbackInput = legitAccessInput,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Echoed preceding-segment continuity tail is stripped cleanly
+        assertEquals(
+            "3. Update GitHub release notes",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "2. Verify 6 GB RAM headroom\n3. Update GitHub release notes",
+                fallbackInput = "and third update github release notes",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                precedingSegmentTail = "1. Test NPU latency\n2. Verify 6 GB RAM headroom"
+            )
+        )
+
+        // Mid-sentence cursor continuation casing
+        assertEquals(
+            "she said the build is green.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "She said the build is green.",
+                languageCode = "en"
+            )
+        )
+        assertEquals(
+            "I'm heading out now.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "I'm heading out now.",
+                languageCode = "en"
+            )
+        )
+        assertEquals(
+            "Wednesday at 3:30 PM works.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "Wednesday at 3:30 PM works.",
+                languageCode = "en"
+            )
+        )
+        assertEquals(
+            "OpenFlow runs on the NPU.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "OpenFlow runs on the NPU.",
+                languageCode = "en",
+                customVocabulary = listOf("OpenFlow")
+            )
+        )
+        assertEquals(
+            "Optimierung der NPU läuft stabil.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "Optimierung der NPU läuft stabil.",
+                languageCode = "de"
+            )
+        )
+        assertEquals(
+            "weil das Update schneller läuft.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyCursorContinuationCasing(
+                text = "Weil das Update schneller läuft.",
+                languageCode = "de"
+            )
+        )
+
+        // Multi-segment list joining uses single newline between contiguous list items
+        assertEquals(
+            "1. Test NPU\n2. Check RAM\n3. Ship release",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.joinFormattedSegments(
+                segments = listOf("1. Test NPU\n2. Check RAM", "3. Ship release"),
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
 }

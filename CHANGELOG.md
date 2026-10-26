@@ -2,6 +2,19 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.7.0] - 2026-10-26
+
+### Improved
+- **Wispr Flow–Style On-Device Formatting & Auto-Editing Engine (`GemmaTextProcessor`, `GemmaPromptPreset`):**
+  - Re-architected the `Gemma 4 E2B` formatting engine exclusively (keeping audio recording, chunking, `Voz`/`Ear`/`Punct`, floating bubble UI, and accessibility injection untouched) to match Wispr Flow's end-to-end auto-editing pipeline:
+    - **Mid-Sentence Course-Correction & Backtrack Resolution:** Recognizes verbal repair cues (`"actually"`, `"wait"`, `"no wait"`, `"sorry"`, `"I mean"`, `"scratch that"`, `"make that"`, `"oder nein"`, `"nein warte"`, `"ich meine"`, `"besser gesagt"`) and discards both the retracted phrase and the repair cue while preserving genuine logical contrasts (`"not X, but Y"`).
+    - **Context-Aware Disfluency Stripping:** Removes vocal hesitations (`"um"`, `"uh"`, `"er"`, `"ah"`, `"hmm"`, `"äh"`, `"ähm"`), stutters (`"the the"`, `"I I"`), false starts, and discourse fillers (`"like"`, `"you know"`, `"sort of"`) strictly when used as hesitation—never deleting literal verbs or comparisons (*"I really like this"*).
+    - **Automatic Implicit & Explicit List Formatting:** Detects spoken enumerations (`"first... second... third..."`, `"one... two... three..."`, `"erstens... zweitens..."`, `"bullet point..."`) and formats them into clean vertical numbered (`1. `, `2. `) or bulleted (`- `) lists with a colon (`:`) on lead-in clauses while keeping casual inline triplets inline.
+    - **App-Context Style Adaptation (`AppContextCategory`):** Reads the target focused app package (`Personal Messaging`, `Work Messaging`, `Email`, `Code & Dev`, `Notes & Docs`) to adapt layout automatically—relaxing chat messages in WhatsApp/Signal/Telegram, keeping Slack/Teams crisp with `@mentions`/`#channels`, formatting greeting/sign-off line breaks in Gmail/Outlook/ProtonMail, and preserving `camelCase`/`snake_case`/CLI syntax in Termux/GitHub.
+    - **Privacy-Safe Cursor Continuation (`FlowFieldContext`, `applyCursorContinuationCasing`):** Inspects up to 140 characters before the cursor in non-password, non-hint input fields so mid-sentence continuations automatically lowercase ordinary leading words (while preserving `"I"`/`"I'm"`, acronyms like `"NPU"`, Custom Vocabulary terms, English days/months, and capitalized German nouns) and numbered/bulleted lists continue seamlessly from the preceding item (`#N` → `#(N+1)`).
+    - **Hybrid Deterministic Pre-Pass (`preNormalizeSpokenConstructs`):** Deterministically normalizes unambiguous spoken email addresses (`"john dot doe at gmail dot com"` → `john.doe@gmail.com`, `"max punkt mustermann at firma punkt de"` → `max.mustermann@firma.de`) and article-guarded layout/dash commands (`"new paragraph"`, `"new line"`, `"em dash"`) without false positives on literal prose (`"wrote a new paragraph"`, `"new line of products"`, `"look at github dot com"`).
+    - **Few-Shot Grounding, Multi-Segment Continuity & Anti-Refusal Guard:** Added compact language-matched few-shot examples, cross-segment continuity tails with echo stripping + list-aware segment joining for long dictations, and an unprompted AI assistant-refusal fallback guard in `sanitizeGemmaOutput`.
+
 ## [2.6.9] - 2026-10-26
 
 ### Improved

@@ -94,6 +94,10 @@ enum class DesertAntModel(
 
 /**
  * Selectable system prompt presets (plus [CUSTOM]) for Experimental Gemma 4 E2B post-processing.
+ *
+ * Modeled after Wispr Flow's auto-editing architecture: mid-sentence backtrack/course-correction
+ * resolution, disfluency & stutter stripping, automatic spoken list detection, context-aware
+ * layout, and natural prose vs. technical number formatting while keeping authentic speaker voice.
  */
 enum class GemmaPromptPreset(
     val id: String,
@@ -104,49 +108,50 @@ enum class GemmaPromptPreset(
 ) {
     CLEAN_AND_POLISH(
         id = "clean_polish",
-        title = "Clean & Polish (Default)",
-        shortLabel = "Clean & Polish",
-        subtitle = "Removes fillers & false starts; formats spoken numbers, dates, currencies, versions, units, paragraphs & punctuation",
-        defaultSystemPrompt = """Clean and format the raw spoken dictation into natural, ready-to-send written text while keeping the speaker's exact language, voice, and meaning:
-- Disfluencies & pauses: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'äh', 'ähm', 'hm', filler 'like', 'you know'), stutters, accidental repetitions, and spoken self-corrections (keep only the intended correction). Fix false mid-sentence periods and broken casing caused by pauses.
-- Numbers, dates & units: Convert spoken numbers into proper digits following the transcript language's conventions — including decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$50', '49,99 €'), dates, clock times ('14:30', '3:30 PM'), version numbers ('2.6.9'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C'). Keep small idiomatic number words spelled out when digits would look unnatural (e.g., 'one of the', 'a couple of', 'ein paar').
-- Acronyms & symbols: Properly capitalize acronyms and tech terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'USB', 'OK') and format clearly dictated email addresses, URLs, or symbols ('name@example.com').
-- Structure & punctuation: Fix punctuation and capitalization, apply explicit spoken formatting cues ('new line' / 'neue Zeile', 'new paragraph' / 'neuer Absatz') as actual breaks (removing the spoken cue), group distinct topics into clean paragraphs, and format clear spoken enumerations cleanly without adding new information."""
+        title = "Wispr Flow Auto-Edit (Default)",
+        shortLabel = "Auto-Edit",
+        subtitle = "Resolves mid-sentence backtracks, strips fillers, auto-formats spoken lists, numbers, dates, emails & app-aware layout",
+        defaultSystemPrompt = """Transform raw spoken dictation into clean, natural, ready-to-send written text — exactly as the speaker intended it to read — while preserving their authentic voice, tone, word choice, and language:
+- Course-correction & backtracks: When the speaker changes their mind mid-thought ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine', 'besser gesagt'), discard BOTH the retracted phrase and the repair cue, keeping only the final intended words. Keep genuine logical contrasts ('not X, but Y').
+- Disfluencies & pauses: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), abandoned false starts, and discourse fillers ('like', 'you know', 'sort of' ONLY when used as hesitation — never remove literal verbs or comparisons like 'I like this' or 'looks like'). Repair false mid-sentence pause periods and broken capitalization.
+- Smart list detection: Automatically format clear spoken sequences ('first... second... third...', 'one... two... three...', '1... 2... 3...', 'erstens... zweitens...') as vertical numbered lists ('1. ', '2. ') with a colon (':') on any lead-in clause, and spoken bullet cues ('bullet point', 'dash item') as '- ' bullet lists. Keep short casual inline series ('milk, eggs, and bread') inline.
+- Numbers, dates & units: Spell out standalone counts one through nine in ordinary prose (and idioms like 'one of the', 'a couple of', 'ein paar'), and convert 10+ plus all decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), version numbers ('2.7.0'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C') into clean digits matching the transcript language.
+- Tech terms, emails & structure: Capitalize acronyms and code identifiers accurately ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format dictated email addresses and URLs ('name@example.com'), apply explicit spoken cues ('new line' / 'neue Zeile', 'new paragraph' / 'neuer Absatz') as real breaks (removing the cue), separate spoken greetings/sign-offs cleanly, and never inject corporate buzzwords or unrequested formality."""
     ),
     STRICT_CLEANUP(
         id = "strict_cleanup",
-        title = "Strict Filler & Grammar Fix",
-        shortLabel = "Strict Cleanup",
-        subtitle = "Minimalist cleanup: strips vocal hesitations, formats spoken numbers/units & fixes punctuation with zero rephrasing",
-        defaultSystemPrompt = "Perform strictly minimal dictation cleanup: remove obvious vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm') and stutters, convert clearly spoken numbers, decimals, percentages, currencies, dates, times, version numbers, and units into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM'), and repair broken punctuation, mid-sentence periods, and capitalization. Do not rephrase, reorder, summarize, or change the speaker's word choice."
+        title = "Light Cleanup (Verbatim)",
+        shortLabel = "Light Cleanup",
+        subtitle = "Verbatim cleanup: strips fillers, stutters & obvious backtracks, formats numbers/units & fixes punctuation with zero rephrasing",
+        defaultSystemPrompt = "Perform light, verbatim dictation cleanup: remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and obvious mid-phrase self-corrections (keeping only the intended correction), convert spoken decimals, percentages, currencies, dates, times, version numbers, measurements, and 10+ counts into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and repair broken punctuation, mid-sentence pause periods, and capitalization. Never rephrase, reorder, summarize, or alter the speaker's vocabulary."
     ),
     CONCISE_DIRECT(
         id = "concise_direct",
-        title = "Concise & Direct",
-        shortLabel = "Concise",
-        subtitle = "Tightens rambling spoken thoughts into clear, crisp sentences with clean number & unit formatting",
-        defaultSystemPrompt = "Rewrite the spoken dictation into clear, concise, direct prose. Remove all vocal fillers, hedging, tangents, and redundant phrasing, and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units cleanly as digits while preserving every fact, name, and the speaker's original language."
+        title = "Crisp & Direct",
+        shortLabel = "Crisp",
+        subtitle = "Resolves backtracks and tightens rambling spoken thoughts into crisp, scannable sentences, lists & clean numbers",
+        defaultSystemPrompt = "Edit the spoken dictation into crisp, concise, scannable text. Resolve all mid-sentence backtracks and self-corrections, strip vocal fillers, hedging, and redundant phrasing, format multi-item enumerations as clean lists, and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units accurately while preserving every fact, name, and the speaker's original language."
     ),
     PROFESSIONAL_MESSAGE(
         id = "professional_message",
-        title = "Professional Message / Email",
-        shortLabel = "Professional",
-        subtitle = "Formats dictation into a polished, well-structured professional message or email with clean paragraphs & numbers",
-        defaultSystemPrompt = "Format the spoken dictation into a polished, natural, well-structured professional message or email. Remove all spoken hesitations and false starts, convert spoken numbers, dates, times, currencies, versions, and units cleanly into standard written digits, organize distinct thoughts into clean paragraphs, and maintain a courteous, professional tone in the speaker's original language without inventing placeholders."
+        title = "Email & Work Message",
+        shortLabel = "Email / Work",
+        subtitle = "Structures emails & work messages with clean greeting/sign-off spacing, paragraphs, action lists & accurate numbers",
+        defaultSystemPrompt = "Format the spoken dictation into a natural, well-structured email or work message. Resolve all mid-sentence self-corrections and remove vocal hesitations, place spoken greetings (e.g., 'Hi Sarah,') and sign-offs (e.g., 'Best,\\nAlex') on separate lines with clean paragraph breaks, format multi-step action items as numbered or bulleted lists, and convert spoken numbers, dates, times, currencies, versions, and units into clean written digits in the speaker's original language without inventing placeholders or greetings that were not spoken."
     ),
     STRUCTURED_NOTES(
         id = "structured_notes",
-        title = "Bullet Points & Action Items",
-        shortLabel = "Bullet Points",
-        subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean, scannable bullet points",
-        defaultSystemPrompt = "Transform the spoken dictation into a clean, well-organized list of concise bullet points using '- '. Remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related ideas or action items clearly, and keep the speaker's original language."
+        title = "Structured Lists & Notes",
+        shortLabel = "Lists & Notes",
+        subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean bulleted or numbered lists with backtrack cleanup",
+        defaultSystemPrompt = "Transform the spoken dictation into a clean, scannable set of structured notes using '- ' bullet points (or '1. ' numbered steps when sequential). Resolve mid-sentence self-corrections, remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related action items logically, and preserve the speaker's original language."
     ),
     CUSTOM(
         id = "custom",
         title = "Custom System Prompt",
         shortLabel = "Custom",
         subtitle = "Write your own custom system instruction for how Gemma 4 E2B transforms dictated speech",
-        defaultSystemPrompt = "Remove vocal fillers ('um', 'uh', 'like'), stutters, and false starts, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning."
+        defaultSystemPrompt = "Resolve mid-sentence self-corrections, remove vocal fillers ('um', 'uh', 'like') and stutters, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning."
     );
 
     companion object {
