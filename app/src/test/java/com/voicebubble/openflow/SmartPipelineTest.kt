@@ -925,6 +925,11 @@ class SmartPipelineTest {
         assertTrue(builtInInstruction.contains("Never translate into another language"))
         assertTrue(builtInInstruction.contains("OpenFlow, LiteRT-LM"))
         assertTrue(builtInInstruction.contains("<transcript>"))
+        assertTrue(builtInInstruction.contains("Numbers, dates & units"))
+        assertTrue(builtInInstruction.contains("percentages"))
+        assertTrue(builtInInstruction.contains("currencies"))
+        assertTrue(builtInInstruction.contains("version numbers"))
+        assertTrue(builtInInstruction.contains("new paragraph"))
 
         val customInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,

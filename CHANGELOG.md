@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.6.9] - 2026-10-26
+
+### Improved
+- **Smarter Default `Gemma 4 E2B` System Prompt — Numbers, Units & Structural Formatting (`GemmaPromptPreset`, `GemmaTextProcessor`):**
+  - Upgraded the default **`Clean & Polish`** system prompt (and number-handling rules across all built-in presets) with explicit **Inverse Text Normalization (ITN)** and formatting directives:
+    - **Numbers, Dates & Units:** Converts spoken numbers into natural written digits matching the transcript language's conventions (e.g., `'3.5'` / `'3,5'`, percentages `'25%'`, currencies `'$50'` / `'49,99 €'`, dates, clock times `'14:30'` / `'3:30 PM'`, version numbers `'2.6.9'`, ranges `'10–15'`, and technical/measurement units `'8 GB'`, `'500 ms'`, `'16 kHz'`, `'24 °C'`), while keeping small idiomatic number words spelled out (`'one of the'`, `'a couple of'`, `'ein paar'`).
+    - **Acronyms & Symbols:** Properly capitalizes standard technical acronyms (`NPU`, `GPU`, `CPU`, `RAM`, `LLM`, `API`, `USB`, `OK`) and formats clearly dictated email addresses, URLs, and symbols.
+    - **Spoken Formatting Cues & Paragraphs:** Repairs false mid-sentence pause periods, converts explicit spoken formatting cues (`'new line'` / `'neue Zeile'`, `'new paragraph'` / `'neuer Absatz'`) into real line/paragraph breaks, groups distinct topics into clean paragraphs, and refines multi-segment joining for long dictations (`\n` for bullet lists, `\n\n` for paragraph-structured passes).
+
 ## [2.6.8] - 2026-10-26
 
 ### Added

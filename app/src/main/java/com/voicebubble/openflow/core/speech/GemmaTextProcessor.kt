@@ -75,7 +75,7 @@ class GemmaTextProcessor(
 
         private const val DEFAULT_MAX_CONTEXT_TOKENS = 2_048
         private const val LOW_MEM_MAX_CONTEXT_TOKENS = 1_536
-        private const val MAX_CHARS_PER_PASS = 2_200
+        private const val MAX_CHARS_PER_PASS = 2_000
 
         private val CHANNEL_BLOCK_REGEX = Regex("<\\|channel>.*?<channel\\|>", setOf(RegexOption.DOT_MATCHES_ALL))
         private val UNCLOSED_CHANNEL_REGEX = Regex("<\\|channel>.*$", setOf(RegexOption.DOT_MATCHES_ALL))
@@ -148,7 +148,7 @@ class GemmaTextProcessor(
             val normalizedLang = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
             val langName = normalizedLang?.let { LANGUAGE_NAMES_EN[it] }
             val langHint = when {
-                langName != null && normalizedLang != null -> " (detected spoken language: $langName [$normalizedLang])"
+                langName != null -> " (detected spoken language: $langName [$normalizedLang])"
                 normalizedLang != null -> " (detected spoken language code: $normalizedLang)"
                 else -> ""
             }
@@ -562,12 +562,12 @@ class GemmaTextProcessor(
             transformedSegments.add(transformed)
         }
 
-        val joinSeparator = if (preset == GemmaPromptPreset.STRUCTURED_NOTES ||
-            preset == GemmaPromptPreset.PROFESSIONAL_MESSAGE
-        ) {
-            "\n\n"
-        } else {
-            " "
+        val joinSeparator = when {
+            preset == GemmaPromptPreset.STRUCTURED_NOTES -> "\n"
+            preset == GemmaPromptPreset.PROFESSIONAL_MESSAGE ||
+                preset == GemmaPromptPreset.CLEAN_AND_POLISH ||
+                transformedSegments.any { it.contains('\n') } -> "\n\n"
+            else -> " "
         }
 
         val combined = transformedSegments

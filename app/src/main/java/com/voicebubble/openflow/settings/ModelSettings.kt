@@ -106,43 +106,47 @@ enum class GemmaPromptPreset(
         id = "clean_polish",
         title = "Clean & Polish (Default)",
         shortLabel = "Clean & Polish",
-        subtitle = "Removes 'um', 'uh', 'ähm', 'like', stutters & false starts; fixes grammar and punctuation while keeping your voice",
-        defaultSystemPrompt = "Remove vocal fillers (such as 'um', 'uh', 'er', 'ah', 'äh', 'ähm', 'hm', filler 'like', 'you know'), stutters, accidental word repetitions, and spoken self-corrections (keep only the speaker's intended correction). Fix punctuation, capitalization, and natural sentence or paragraph breaks. Keep the speaker's exact language, tone, meaning, and vocabulary without adding new information."
+        subtitle = "Removes fillers & false starts; formats spoken numbers, dates, currencies, versions, units, paragraphs & punctuation",
+        defaultSystemPrompt = """Clean and format the raw spoken dictation into natural, ready-to-send written text while keeping the speaker's exact language, voice, and meaning:
+- Disfluencies & pauses: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'äh', 'ähm', 'hm', filler 'like', 'you know'), stutters, accidental repetitions, and spoken self-corrections (keep only the intended correction). Fix false mid-sentence periods and broken casing caused by pauses.
+- Numbers, dates & units: Convert spoken numbers into proper digits following the transcript language's conventions — including decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$50', '49,99 €'), dates, clock times ('14:30', '3:30 PM'), version numbers ('2.6.9'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C'). Keep small idiomatic number words spelled out when digits would look unnatural (e.g., 'one of the', 'a couple of', 'ein paar').
+- Acronyms & symbols: Properly capitalize acronyms and tech terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'USB', 'OK') and format clearly dictated email addresses, URLs, or symbols ('name@example.com').
+- Structure & punctuation: Fix punctuation and capitalization, apply explicit spoken formatting cues ('new line' / 'neue Zeile', 'new paragraph' / 'neuer Absatz') as actual breaks (removing the spoken cue), group distinct topics into clean paragraphs, and format clear spoken enumerations cleanly without adding new information."""
     ),
     STRICT_CLEANUP(
         id = "strict_cleanup",
         title = "Strict Filler & Grammar Fix",
         shortLabel = "Strict Cleanup",
-        subtitle = "Minimalist cleanup: strips vocal hesitations and fixes broken punctuation/casing with zero rephrasing",
-        defaultSystemPrompt = "Perform strictly minimal dictation cleanup: remove only obvious vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm') and stutters, and repair broken punctuation, mid-sentence periods, and capitalization. Do not rephrase, reorder, summarize, or change the speaker's word choice."
+        subtitle = "Minimalist cleanup: strips vocal hesitations, formats spoken numbers/units & fixes punctuation with zero rephrasing",
+        defaultSystemPrompt = "Perform strictly minimal dictation cleanup: remove obvious vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm') and stutters, convert clearly spoken numbers, decimals, percentages, currencies, dates, times, version numbers, and units into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM'), and repair broken punctuation, mid-sentence periods, and capitalization. Do not rephrase, reorder, summarize, or change the speaker's word choice."
     ),
     CONCISE_DIRECT(
         id = "concise_direct",
         title = "Concise & Direct",
         shortLabel = "Concise",
-        subtitle = "Tightens rambling spoken thoughts into clear, crisp, easy-to-read sentences",
-        defaultSystemPrompt = "Rewrite the spoken dictation into clear, concise, direct prose. Remove all vocal fillers, hedging, tangents, and redundant phrasing while preserving every fact, name, number, and the speaker's original language."
+        subtitle = "Tightens rambling spoken thoughts into clear, crisp sentences with clean number & unit formatting",
+        defaultSystemPrompt = "Rewrite the spoken dictation into clear, concise, direct prose. Remove all vocal fillers, hedging, tangents, and redundant phrasing, and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units cleanly as digits while preserving every fact, name, and the speaker's original language."
     ),
     PROFESSIONAL_MESSAGE(
         id = "professional_message",
         title = "Professional Message / Email",
         shortLabel = "Professional",
-        subtitle = "Formats dictation into a polished, well-structured professional message or email with clean paragraphs",
-        defaultSystemPrompt = "Format the spoken dictation into a polished, natural, well-structured professional message or email. Remove all spoken hesitations and false starts, organize distinct thoughts into clean paragraphs, and maintain a courteous, professional tone in the speaker's original language without inventing placeholders."
+        subtitle = "Formats dictation into a polished, well-structured professional message or email with clean paragraphs & numbers",
+        defaultSystemPrompt = "Format the spoken dictation into a polished, natural, well-structured professional message or email. Remove all spoken hesitations and false starts, convert spoken numbers, dates, times, currencies, versions, and units cleanly into standard written digits, organize distinct thoughts into clean paragraphs, and maintain a courteous, professional tone in the speaker's original language without inventing placeholders."
     ),
     STRUCTURED_NOTES(
         id = "structured_notes",
         title = "Bullet Points & Action Items",
         shortLabel = "Bullet Points",
         subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean, scannable bullet points",
-        defaultSystemPrompt = "Transform the spoken dictation into a clean, well-organized list of concise bullet points using '- '. Remove all vocal fillers and repetitions, group related ideas or action items clearly, and keep the speaker's original language."
+        defaultSystemPrompt = "Transform the spoken dictation into a clean, well-organized list of concise bullet points using '- '. Remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related ideas or action items clearly, and keep the speaker's original language."
     ),
     CUSTOM(
         id = "custom",
         title = "Custom System Prompt",
         shortLabel = "Custom",
         subtitle = "Write your own custom system instruction for how Gemma 4 E2B transforms dictated speech",
-        defaultSystemPrompt = "Remove vocal fillers ('um', 'uh', 'like'), stutters, and false starts, and format the text cleanly while keeping the original meaning."
+        defaultSystemPrompt = "Remove vocal fillers ('um', 'uh', 'like'), stutters, and false starts, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning."
     );
 
     companion object {
