@@ -2,6 +2,23 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.12.0] - 2026-10-27
+
+### Added, Improved & Fixed
+- **Zero-Wait Parallel Model Loading & Live Transcription While Recording (`SmartPipeline`, `StreamingDictationSession`, `FloatingBubbleService`, `AudioRecordingController`, `DictationChunkSettings`):**
+  - **`t = 0 ms` Parallel Model Load on Bubble Tap:** Starts `SmartPipeline.onRecordingStartedAsync()` simultaneously with `AudioRecord` hardware initialization (`80–160 ms` head start), prioritizing `Ear` (`10 MB`) + `Voz` (`1.19 GB`) with a fast `100 ms` (`1,600`-sample) accelerator warm-up.
+  - **Lock-Free Inference Preemption (`pendingInferenceRequests`):** Increments `pendingInferenceRequests` *before* acquiring `pipelineMutex` so live audio chunks and Stop-tap transcriptions preempt background synthetic warm-up, LLM loading, and system-prompt pre-warming in `0 ms`—never blocking speech transcription behind multi-GB model loading.
+  - **Live Mid-Sentence `Ear` Language Pre-Detection:** Peeks at the leading `~1.8s–3.5s` of live speech (`AudioRecordingController.peekLeadingSamples`) while you are still speaking your first sentence so `Ear` resolves spoken language *before* Chunk `#0` is even cut.
+  - **Deferred & Inter-Chunk Post-Processor Overlap + Snappier Chunking Defaults (`DEFAULTS_VERSION = 4`):** Defers opportunistic co-resident LLM / `Punct` loading by `2.0s` while recording (keeping `< 2s` quick replies on the `< 1 ms` Zero-LLM Fast Path at `0 MB` LLM RAM), prepares/pre-warms the post-processor during inter-chunk idle gaps, supports live prefix cleanup for both `LiteRT-LM` and `Punct`, coalesces speech while `Voz` cold-loads, uses adaptive buffer-aware polling (`110 ms` active / `450 ms` buffer-fill sleep), and tunes default live chunking to `4.0s` min chunk, `550 ms` pause, and `16.0s` max chunk.
+- **Background Efficiency & Deep-Sleep Battery Optimization (`SmartPipeline`, `FloatingBubbleService`, `TextInjectionAccessibilityService`):**
+  - **Fixed `TRIM_MEMORY_UI_HIDDEN` False Eviction Bug (`classifyTrimMemoryAction`):** Fixed Android's two-band `ComponentCallbacks2` level comparison where leaving OpenFlow Settings (`TRIM_MEMORY_UI_HIDDEN == 20 > TRIM_MEMORY_RUNNING_LOW == 10`) unintentionally triggered low-memory model eviction when switching into a chat app; `UI_HIDDEN` now drops only standby KV cache while preserving loaded weights.
+  - **45-Second Screen-Off Deep-Sleep Auto-Unload (`onScreenInteractiveChanged`):** Turning the display OFF immediately drops standby LLM KV cache and caps idle model retention at `45s` (`computeEffectiveIdleTimeoutMs`), releasing NPU/GPU/CPU sessions for deep sleep without penalizing brief lock/unlock checks.
+  - **Adaptive Main-Looper Heartbeat & Deduplicated Window Polling:** Scaled `FloatingBubbleService` heartbeat (`300 ms` active dictation / `550 ms` visible bubble / `1,100 ms` hidden standby, `0%` CPU when screen is OFF) and switched `TextInjectionAccessibilityService` to lightweight `3.5s` watchdog mode whenever `FloatingBubbleService` is active, eliminating duplicate `getWindows()` IPC polling.
+- **Bulletproof Focused Text-Field Auto-Paste (`TextInjectionAccessibilityService`, `GemmaTextProcessor`, `accessibility_service_config.xml`):**
+  - **5-Tier Focused Input Resolution + Focus Pinning:** Captures the active editable target at `t = 0 ms` on bubble tap (`captureTargetNodeForDictation`), tracks focus/click/selection/text-changed events, skips `TYPE_APPLICATION_OVERLAY` and `TYPE_INPUT_METHOD` windows, drills into `WebView` / `AndroidComposeView` subtrees via bounded BFS (`<= 420` nodes) to find inner `<input>`, `contenteditable`, and Jetpack Compose `TextField`/`BasicTextField` nodes, and falls back to pinned/recent nodes or sole visible editable inputs when OEM ROMs momentarily drop `FOCUS_INPUT`.
+  - **Eliminated `AccessibilityNodeInfo.recycle()` Cache Poisoning:** Removed deprecated `.recycle()` calls in `GemmaTextProcessor.inspectActiveFieldContextStatic` and `TextInjectionAccessibilityService` that mutated shared `AccessibilityCache` nodes right before text injection.
+  - **Direct `ACTION_SET_TEXT` Priority + Placeholder Hint Protection + Smart Spacing:** Clears `isShowingHintText` placeholder hints (`"Message"`, `"Search..."`) so hint strings are never concatenated, uses direct Accessibility IPC `ACTION_SET_TEXT` + `ACTION_SET_SELECTION` first on empty and cursor-known fields (completely bypassing Android 12–15 background clipboard restrictions) with automatic `ACTION_PASTE` fallback (`750 ms` async clipboard restore), smart boundary spacing (`spliceTextForSetText`), and automatic `ACTION_FOCUS` restoration + `90 ms` transition retry.
+
 ## [2.11.1] - 2026-10-27
 
 ### Fixed

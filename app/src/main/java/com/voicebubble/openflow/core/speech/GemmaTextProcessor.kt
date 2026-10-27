@@ -21,8 +21,6 @@ import android.os.Build
 import android.os.SystemClock
 import android.text.InputType
 import android.util.Log
-import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityWindowInfo
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.BackendType
 import com.google.ai.edge.litertlm.Contents
@@ -1980,106 +1978,40 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         /**
          * Static privacy-safe active field inspector so [SmartPipeline] can evaluate [canBypassLlmFastPath]
          * before dynamically loading an unloaded LLM into RAM.
+         *
+         * IMPORTANT: Never call `recycle()` on the returned `AccessibilityNodeInfo` — Android's
+         * `AccessibilityCache` shares node instances across callers, so recycling here would poison
+         * [TextInjectionAccessibilityService.injectTextSuspend] milliseconds later!
          */
         fun inspectActiveFieldContextStatic(context: Context): FlowFieldContext {
             return try {
                 val service = TextInjectionAccessibilityService.getSharedInstance() ?: return FlowFieldContext.NONE
-                val focusedNode = findTargetFocusedInputNodeStatic(context.packageName, service) ?: return FlowFieldContext.NONE
-                try {
-                    val pkg = focusedNode.packageName?.toString()
-                    val isPassword = focusedNode.isPassword || isPasswordInputType(focusedNode.inputType)
-                    val isShowingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusedNode.isShowingHintText
+                val focusedNode = service.resolveBestTargetInputNode(
+                    ownPkg = context.packageName,
+                    allowPinnedFallback = true
+                ) ?: return FlowFieldContext.NONE
 
-                    val textBeforeCursor = if (!isPassword && !isShowingHint) {
-                        val nodeText = focusedNode.text?.toString().orEmpty()
-                        if (nodeText.isEmpty()) {
-                            ""
-                        } else {
-                            val selStart = focusedNode.textSelectionStart
-                            val cursorEnd = if (selStart in 0..nodeText.length) selStart else nodeText.length
-                            val sliceStart = (cursorEnd - MAX_CURSOR_CONTEXT_CHARS).coerceAtLeast(0)
-                            nodeText.substring(sliceStart, cursorEnd)
-                        }
-                    } else {
+                val pkg = focusedNode.packageName?.toString()
+                val isPassword = focusedNode.isPassword || isPasswordInputType(focusedNode.inputType)
+                val isShowingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusedNode.isShowingHintText
+
+                val textBeforeCursor = if (!isPassword && !isShowingHint) {
+                    val nodeText = focusedNode.text?.toString().orEmpty()
+                    if (nodeText.isEmpty()) {
                         ""
+                    } else {
+                        val selStart = focusedNode.textSelectionStart
+                        val cursorEnd = if (selStart in 0..nodeText.length) selStart else nodeText.length
+                        val sliceStart = (cursorEnd - MAX_CURSOR_CONTEXT_CHARS).coerceAtLeast(0)
+                        nodeText.substring(sliceStart, cursorEnd)
                     }
-
-                    analyzeFieldContext(pkg, textBeforeCursor)
-                } finally {
-                    recycleNodeQuietlyStatic(focusedNode)
+                } else {
+                    ""
                 }
+
+                analyzeFieldContext(pkg, textBeforeCursor)
             } catch (_: Throwable) {
                 FlowFieldContext.NONE
-            }
-        }
-
-        private fun findTargetFocusedInputNodeStatic(
-            ownPkg: String,
-            service: TextInjectionAccessibilityService
-        ): AccessibilityNodeInfo? {
-            try {
-                val activeRoot = service.rootInActiveWindow
-                if (activeRoot != null) {
-                    val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                    val focusedPkg = focused?.packageName?.toString()
-                    if (focused != null && focusedPkg != ownPkg) {
-                        recycleNodeQuietlyStatic(activeRoot)
-                        return focused
-                    }
-                    recycleNodeQuietlyStatic(focused)
-                    recycleNodeQuietlyStatic(activeRoot)
-                }
-            } catch (_: Throwable) {
-            }
-
-            return try {
-                val allWindows = service.windows ?: return null
-                var editableCandidate: AccessibilityNodeInfo? = null
-                var fallbackCandidate: AccessibilityNodeInfo? = null
-
-                for (window in allWindows) {
-                    if (editableCandidate == null && window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
-                        val root = try {
-                            window.root
-                        } catch (_: Throwable) {
-                            null
-                        }
-                        if (root != null) {
-                            val candidate = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                            val candidatePkg = candidate?.packageName?.toString()
-                            if (candidate != null && candidatePkg != ownPkg) {
-                                if (candidate.isEditable) {
-                                    editableCandidate = candidate
-                                } else if (fallbackCandidate == null) {
-                                    fallbackCandidate = candidate
-                                } else {
-                                    recycleNodeQuietlyStatic(candidate)
-                                }
-                            } else {
-                                recycleNodeQuietlyStatic(candidate)
-                            }
-                            recycleNodeQuietlyStatic(root)
-                        }
-                    }
-                }
-
-                if (editableCandidate != null) {
-                    recycleNodeQuietlyStatic(fallbackCandidate)
-                    editableCandidate
-                } else {
-                    fallbackCandidate
-                }
-            } catch (_: Throwable) {
-                null
-            }
-        }
-
-        @Suppress("DEPRECATION")
-        private fun recycleNodeQuietlyStatic(node: AccessibilityNodeInfo?) {
-            if (node == null) return
-            try {
-                node.recycle()
-            } catch (_: Throwable) {
             }
         }
 

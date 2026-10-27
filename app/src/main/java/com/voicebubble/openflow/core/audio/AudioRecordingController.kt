@@ -47,7 +47,37 @@ class AudioRecordingController {
 
     private val bufferLock = Any()
     private var pcmBuffer: FloatArray? = null
+    @Volatile
     private var pcmSize: Int = 0
+
+    /**
+     * Lock-free snapshot of the number of unread PCM samples currently buffered in [pcmBuffer].
+     * Used by [com.voicebubble.openflow.core.speech.StreamingDictationSession] to sleep until enough
+     * audio has accumulated to form a valid chunk without waking a background thread every 150 ms.
+     */
+    fun bufferedSampleCount(): Int = pcmSize
+
+    /**
+     * Non-destructively copies up to [maxSamples] leading samples from the live capture buffer without
+     * advancing or modifying [pcmBuffer]. Used to run early `Ear` spoken-language identification while
+     * the user is still speaking their first sentence before any pause cut occurs.
+     */
+    fun peekLeadingSamples(maxSamples: Int): FloatArray? {
+        if (maxSamples <= 0) return null
+        synchronized(bufferLock) {
+            val buf = pcmBuffer ?: return null
+            val copyLen = min(pcmSize, min(maxSamples, buf.size))
+            if (copyLen <= 0) return null
+            if (jvmFreeHeadroomBytes() < copyLen.toLong() * 4L + (12L * 1024L * 1024L)) {
+                return null
+            }
+            return try {
+                buf.copyOfRange(0, copyLen)
+            } catch (_: OutOfMemoryError) {
+                null
+            }
+        }
+    }
 
     private val _rmsLevel = MutableStateFlow(0.0f)
     val rmsLevel: StateFlow<Float> = _rmsLevel.asStateFlow()

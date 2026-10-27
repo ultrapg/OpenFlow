@@ -358,6 +358,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val interactive = checkScreenInteractive()
         isScreenInteractive.value = interactive
         TextInjectionAccessibilityService.isScreenInteractive.value = interactive
+        smartPipeline.onScreenInteractiveChanged(interactive)
 
         val settingsPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         bubbleSizeFlow.value = settingsPrefs.getFloat("bubble_size", 52f).coerceIn(36f, 80f)
@@ -418,7 +419,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     continue
                 }
 
-                delay(250L)
+                val heartbeatMs = when {
+                    bubbleState.value != OverlayBubbleState.IDLE -> 300L
+                    isBubbleVisibleFlow.value -> 550L
+                    else -> 1_100L
+                }
+                delay(heartbeatMs)
 
                 val stillInteractive = checkScreenInteractive()
                 if (!stillInteractive) {
@@ -429,8 +435,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 if (!isScreenInteractive.value) {
                     onScreenTurnedOn()
                 } else {
-                    // Always refresh IME window visibility on the Main Looper so OEM ROMs (Samsung One UI, etc.)
-                    // never miss a soft-keyboard open/close transition even when the bubble is currently hidden.
+                    // Refresh IME window visibility on the Main Looper at an adaptive cadence so OEM ROMs
+                    // (Samsung One UI, etc.) stay in sync while minimizing background IPC & battery drain.
                     TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
                     syncBubbleVisibility()
                     syncScreenKeepAwakeState()
@@ -464,6 +470,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val interactive = checkScreenInteractive()
         isScreenInteractive.value = interactive
         TextInjectionAccessibilityService.isScreenInteractive.value = interactive
+        smartPipeline.onScreenInteractiveChanged(interactive)
         ensureOverlayAttached()
         syncBubbleVisibility()
 
@@ -562,6 +569,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         // Synchronously hide WindowManager overlay surface and clear FLAG_KEEP_SCREEN_ON with 0ms delay
         setOverlayWindowVisibleAndTouchable(visible = false, touchable = false, forceUpdate = true)
+
+        if (::smartPipeline.isInitialized) {
+            smartPipeline.onScreenInteractiveChanged(false)
+        }
     }
 
     /**
@@ -571,8 +582,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     private fun onScreenTurnedOn() {
         isScreenInteractive.value = true
         TextInjectionAccessibilityService.isScreenInteractive.value = true
+        if (::smartPipeline.isInitialized) {
+            smartPipeline.onScreenInteractiveChanged(true)
+        }
         ensureOverlayAttached()
-        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow(force = true)
         syncBubbleVisibility()
 
         screenWakeRefreshJob?.cancel()
@@ -582,7 +596,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 if (!checkScreenInteractive()) break
                 isScreenInteractive.value = true
                 TextInjectionAccessibilityService.isScreenInteractive.value = true
-                TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                TextInjectionAccessibilityService.getSharedInstance()?.refreshNow(force = true)
                 syncBubbleVisibility()
             }
         }
@@ -965,6 +979,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 ).show()
                                 return@BubbleOverlayComponent
                             }
+                            // Pin the currently focused editable field at t=0ms before overlay/recording state changes
+                            TextInjectionAccessibilityService.getSharedInstance()?.captureTargetNodeForDictation()
+
                             // Ensure MICROPHONE foreground service type is active on user tap (if started on boot as SPECIAL_USE)
                             startCustomForeground(smartPipeline.pipelineStatus.value)
                             acquireDictationWakeLock()
@@ -972,6 +989,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             syncScreenKeepAwakeState(forceRefreshWakeLock = true)
+
+                            // Start loading Ear + Voz at t=0ms in parallel with AudioRecord hardware init!
+                            smartPipeline.onRecordingStartedAsync()
 
                             // "Transcribe while recording": create the session now, start it before the mic so a very
                             // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
@@ -994,11 +1014,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                             serviceScope.launch {
                                 val started = audioController.startRecording(this)
-                                if (started) {
-                                    // Lazily load unloaded audio/LLM models into RAM while the user speaks
-                                    // and pre-fill the LLM system-prompt KV cache if headroom allows.
-                                    smartPipeline.onRecordingStartedAsync()
-                                } else {
+                                if (!started) {
                                     smartPipeline.onRecordingStopped()
                                     session?.cancel()
                                     if (streamingSession === session) streamingSession = null

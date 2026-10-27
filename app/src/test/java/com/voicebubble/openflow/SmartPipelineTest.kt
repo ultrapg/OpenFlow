@@ -2258,7 +2258,8 @@ class SmartPipelineTest {
             com.voicebubble.openflow.core.speech.SmartPipeline::class.java,
             com.voicebubble.openflow.core.speech.PunctuationRestorer::class.java,
             com.voicebubble.openflow.core.speech.StreamingDictationSession::class.java,
-            com.voicebubble.openflow.overlay.FloatingBubbleService::class.java
+            com.voicebubble.openflow.overlay.FloatingBubbleService::class.java,
+            com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService::class.java
         )
 
         fun extractLookbehindBodies(pattern: String): List<String> {
@@ -2358,5 +2359,114 @@ class SmartPipelineTest {
             }
         }
         assertTrue("Expected to audit >= 25 Regex fields, got $auditedRegexCount", auditedRegexCount >= 25)
+    }
+
+    @Test
+    @Suppress("DEPRECATION")
+    fun `SmartPipeline background memory trim classifier and screen-off deep-sleep timeout work accurately`() {
+        // Leaving OpenFlow UI for a chat app fires TRIM_MEMORY_UI_HIDDEN (20): must NOT unload loaded models!
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.DROP_KV_CACHE_ONLY,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+            )
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.DROP_KV_CACHE_ONLY,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE
+            )
+        )
+        // Genuine low-memory / background LRU bands unload optional models cleanly
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.EVICT_OPTIONAL_MODELS,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+            )
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.EVICT_OPTIONAL_MODELS,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+            )
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.SEVERE_EVICT,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+            )
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.Companion.TrimMemoryAction.SEVERE_EVICT,
+            com.voicebubble.openflow.core.speech.SmartPipeline.classifyTrimMemoryAction(
+                android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+            )
+        )
+
+        // Screen-ON vs Screen-OFF idle unload timer resolution
+        assertEquals(
+            5 * 60_000L,
+            com.voicebubble.openflow.core.speech.SmartPipeline.computeEffectiveIdleTimeoutMs(
+                unloadMinutes = 5,
+                isScreenInteractive = true
+            )
+        )
+        assertEquals(
+            com.voicebubble.openflow.core.speech.SmartPipeline.SCREEN_OFF_DEEP_SLEEP_UNLOAD_MS,
+            com.voicebubble.openflow.core.speech.SmartPipeline.computeEffectiveIdleTimeoutMs(
+                unloadMinutes = 5,
+                isScreenInteractive = false
+            )
+        )
+        assertEquals(
+            0L,
+            com.voicebubble.openflow.core.speech.SmartPipeline.computeEffectiveIdleTimeoutMs(
+                unloadMinutes = ModelSettings.AUTO_UNLOAD_IMMEDIATELY,
+                isScreenInteractive = false
+            )
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.SmartPipeline.computeEffectiveIdleTimeoutMs(
+                unloadMinutes = ModelSettings.AUTO_UNLOAD_NEVER,
+                isScreenInteractive = false
+            )
+        )
+    }
+
+    @Test
+    fun `Focused text-field splice helper handles empty hint fields, cursor insertion, smart spacing, and selection replacement`() {
+        val splice = com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService::spliceTextForSetText
+
+        // 1. Empty / placeholder-cleared field
+        val emptyRes = splice("", -1, -1, "Hello world.")
+        assertEquals("Hello world.", emptyRes.newText)
+        assertEquals(12, emptyRes.newCursorPosition)
+
+        // 2. Appending a new sentence at end of existing text without trailing space -> adds single space
+        val appendEnd = splice("Hello world.", 12, 12, "This is OpenFlow.")
+        assertEquals("Hello world. This is OpenFlow.", appendEnd.newText)
+        assertEquals("Hello world. This is OpenFlow.".length, appendEnd.newCursorPosition)
+
+        // 3. Appending when existing text already ends with a space -> no double space
+        val appendAfterSpace = splice("Hello ", 6, 6, "there!")
+        assertEquals("Hello there!", appendAfterSpace.newText)
+        assertEquals("Hello there!".length, appendAfterSpace.newCursorPosition)
+
+        // 4. Mid-sentence cursor splice ("That is a |car" at index 10) -> adds trailing space before "car"
+        val midInsert = splice("That is a car", 10, 10, "really fast")
+        assertEquals("That is a really fast car", midInsert.newText)
+        assertEquals("That is a really fast".length, midInsert.newCursorPosition)
+
+        // 5. Replacing a highlighted selection ("Buy apples today" -> replace "apples" [4..10])
+        val replaceSel = splice("Buy apples today", 4, 10, "fresh oranges")
+        assertEquals("Buy fresh oranges today", replaceSel.newText)
+        assertEquals("Buy fresh oranges".length, replaceSel.newCursorPosition)
+
+        // 6. Inserting inside parentheses or after newline does not inject unwanted leading space
+        val afterParen = splice("Note (", 6, 6, "urgent")
+        assertEquals("Note (urgent", afterParen.newText)
+        val afterNewline = splice("Line 1\n", 7, 7, "Line 2")
+        assertEquals("Line 1\nLine 2", afterNewline.newText)
     }
 }

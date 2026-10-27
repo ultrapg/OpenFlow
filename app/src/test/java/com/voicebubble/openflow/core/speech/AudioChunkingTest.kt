@@ -228,17 +228,17 @@ class AudioChunkingTest {
         val d = DictationChunkSettings()
         assertTrue(d.chunkingEnabled)
         assertTrue(d.liveActive)
-        assertEquals(650, d.pauseMs)
-        assertEquals(5f, d.minLiveChunkSeconds, 0.0001f)
-        assertEquals(20f, d.maxChunkSeconds, 0.0001f)
+        assertEquals(550, d.pauseMs)
+        assertEquals(4f, d.minLiveChunkSeconds, 0.0001f)
+        assertEquals(16f, d.maxChunkSeconds, 0.0001f)
         assertTrue(d.adaptivePause)
         assertEquals(d, d.sanitized())
 
         val off = d.copy(chunkingEnabled = false)
         assertFalse("live transcription needs chunking", off.liveActive)
         assertEquals("one piece up to the 60 s safety ceiling", 60 * sr, off.effectiveMaxChunkSamples)
-        assertEquals(20 * sr, off.maxChunkSamples)
-        assertEquals(20 * sr, d.effectiveMaxChunkSamples)
+        assertEquals(16 * sr, off.maxChunkSamples)
+        assertEquals(16 * sr, d.effectiveMaxChunkSamples)
     }
 
     @Test

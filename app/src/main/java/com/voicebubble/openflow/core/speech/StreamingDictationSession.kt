@@ -52,6 +52,8 @@ class StreamingDictationSession(
     private val recordedSamples = AtomicLong(0L)
     private val liveChunkCount = AtomicInteger(0)
     private val stopRequested = AtomicBoolean(false)
+    private val preDetectInFlight = AtomicBoolean(false)
+    private val preDetectAttempts = AtomicInteger(0)
 
     // Accessed strictly serially by workerJob while running, then by finish() after workerJob.join()
     private val preCleanedSegments = ArrayList<String>()
@@ -63,6 +65,7 @@ class StreamingDictationSession(
 
     private var pollerJob: Job? = null
     private var workerJob: Job? = null
+    private var preDetectJob: Job? = null
 
     /** Total number of speech samples handed to the pipeline so far (live chunks + tail). */
     val totalSamples: Long get() = recordedSamples.get()
@@ -96,6 +99,9 @@ class StreamingDictationSession(
                     } else {
                         results[chunk.index] = text
                         tryOverlapCleanFinalizedPrefix(currentIndex = chunk.index, lookaheadText = text)
+                        if (!stopRequested.get() && inFlightChunks.get() <= 1) {
+                            pipeline.preparePostProcessorWhileRecordingAsync(initialDelayMs = 0L)
+                        }
                     }
                 } finally {
                     inFlightChunks.decrementAndGet()
@@ -103,8 +109,41 @@ class StreamingDictationSession(
             }
         }
         pollerJob = scope.launch(Dispatchers.Default) {
-            while (isActive) {
-                delay(POLL_INTERVAL_MS)
+            val readinessCoalesceCap = ((config.maxChunkSamples.toLong() * 85L) / 100L).toInt()
+            val nearMinChunkSamples = (config.minLiveChunkSamples - POLL_APPROACH_MARGIN_SAMPLES).coerceAtLeast(0)
+            while (isActive && !stopRequested.get()) {
+                val buffered = audio.bufferedSampleCount()
+                maybeScheduleEarlyLanguagePreDetect(buffered)
+
+                // If Voz is still cold-loading on the very first chunk, coalesce speech inside the single
+                // PCM buffer until Voz becomes ready (unless approaching maxChunkSamples).
+                if (!pipeline.isVozReady && buffered < readinessCoalesceCap) {
+                    delay(COLD_LOAD_POLL_INTERVAL_MS)
+                    continue
+                }
+
+                // Adaptive buffer-aware sleep: avoid scanning RMS windows while buffered audio is still
+                // well below minLiveChunkSamples (waking early if live Ear pre-detection needs a peek).
+                if (buffered < nearMinChunkSamples) {
+                    val nextWakeTarget = when {
+                        config.reuseLanguage && language == null &&
+                            preDetectAttempts.get() == 0 && PRE_DETECT_FIRST_TRY_SAMPLES < nearMinChunkSamples ->
+                            PRE_DETECT_FIRST_TRY_SAMPLES
+                        config.reuseLanguage && language == null &&
+                            preDetectAttempts.get() == 1 && PRE_DETECT_SECOND_TRY_SAMPLES < nearMinChunkSamples ->
+                            PRE_DETECT_SECOND_TRY_SAMPLES
+                        else -> nearMinChunkSamples
+                    }
+                    if (buffered < nextWakeTarget) {
+                        val remainingMs = ((nextWakeTarget - buffered).toLong() * 1000L) / DictationChunkSettings.SAMPLE_RATE
+                        delay(remainingMs.coerceIn(ACTIVE_POLL_INTERVAL_MS, MAX_IDLE_BUFFER_SLEEP_MS))
+                        continue
+                    }
+                }
+
+                delay(ACTIVE_POLL_INTERVAL_MS)
+                if (stopRequested.get()) break
+
                 // Backpressure: if the inference worker already has MAX_IN_FLIGHT_LIVE_CHUNKS queued or memory
                 // is critically tight, keep new speech inside AudioRecordingController's single PCM buffer.
                 if (inFlightChunks.get() >= MAX_IN_FLIGHT_LIVE_CHUNKS || pipeline.isMemoryCriticallyTight()) {
@@ -127,6 +166,40 @@ class StreamingDictationSession(
                     )
                     enqueue(chunk)
                 }
+            }
+        }
+    }
+
+    /**
+     * Peeks at the leading live microphone buffer (~1.8s / ~3.5s) while the user is still speaking
+     * their first sentence so `Ear` resolves the spoken language before Chunk #0 is even cut.
+     */
+    private fun maybeScheduleEarlyLanguagePreDetect(bufferedSamples: Int) {
+        if (!config.reuseLanguage || language != null || stopRequested.get()) return
+        if (!pipeline.isVozReady || inFlightChunks.get() > 0) return
+        val attempts = preDetectAttempts.get()
+        val threshold = when (attempts) {
+            0 -> PRE_DETECT_FIRST_TRY_SAMPLES
+            1 -> PRE_DETECT_SECOND_TRY_SAMPLES
+            else -> return
+        }
+        if (bufferedSamples < threshold) return
+        if (!preDetectInFlight.compareAndSet(false, true)) return
+        preDetectAttempts.incrementAndGet()
+
+        preDetectJob = scope.launch(Dispatchers.Default) {
+            try {
+                if (stopRequested.get() || language != null || inFlightChunks.get() > 0) return@launch
+                val preview = audio.peekLeadingSamples(PRE_DETECT_PEEK_MAX_SAMPLES) ?: return@launch
+                val detected = pipeline.tryPreDetectLanguageWhileRecording(preview)
+                if (detected != null && language == null) {
+                    language = detected
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+            } finally {
+                preDetectInFlight.set(false)
             }
         }
     }
@@ -206,6 +279,8 @@ class StreamingDictationSession(
     /** Stops looking for new pauses. Must be called (and awaited) before `audio.stopRecording()`. */
     suspend fun stopPolling() {
         stopRequested.set(true)
+        preDetectJob?.cancel()
+        preDetectJob = null
         pollerJob?.cancelAndJoin()
         pollerJob = null
     }
@@ -303,6 +378,8 @@ class StreamingDictationSession(
     fun cancel() {
         stopRequested.set(true)
         pipeline.onRecordingStopped()
+        preDetectJob?.cancel()
+        preDetectJob = null
         pollerJob?.cancel()
         pollerJob = null
         workerJob?.cancel()
@@ -328,7 +405,11 @@ class StreamingDictationSession(
         return try {
             pipeline.transcribe(
                 samples = chunk.samples,
-                onStageProgress = onStageProgress,
+                onStageProgress = { stage ->
+                    if (stopRequested.get()) {
+                        onStageProgress(stage)
+                    }
+                },
                 languageHint = if (config.reuseLanguage && allowLanguageHint) language else null,
                 onLanguageResolved = { detected ->
                     if (config.reuseLanguage && language == null) language = detected
@@ -346,7 +427,13 @@ class StreamingDictationSession(
 
     companion object {
         private const val TAG = "StreamingDictation"
-        private const val POLL_INTERVAL_MS = 150L
+        private const val ACTIVE_POLL_INTERVAL_MS = 110L
+        private const val COLD_LOAD_POLL_INTERVAL_MS = 180L
+        private const val MAX_IDLE_BUFFER_SLEEP_MS = 450L
+        private const val POLL_APPROACH_MARGIN_SAMPLES = 4_800 // 300ms before minLiveChunkSamples
+        private const val PRE_DETECT_FIRST_TRY_SAMPLES = 28_800 // ~1.8s of audio
+        private const val PRE_DETECT_SECOND_TRY_SAMPLES = 56_000 // ~3.5s of audio
+        private const val PRE_DETECT_PEEK_MAX_SAMPLES = 56_000
         private const val MAX_IN_FLIGHT_LIVE_CHUNKS = 4
         private const val MAX_FAILED_RETRY_SAMPLES = 45L * DictationChunkSettings.SAMPLE_RATE
         private val LIST_LINE_REGEX = Regex("^\\s*(?:[-*•]|\\d+[.)])\\s+\\S.*$")
