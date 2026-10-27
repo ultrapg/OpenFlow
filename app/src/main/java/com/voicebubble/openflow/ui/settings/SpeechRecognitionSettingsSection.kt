@@ -741,6 +741,45 @@ fun SpeechRecognitionSettingsSection(
                     )
                 }
 
+                if (supportsThinking) {
+                    val adaptiveSwitchEnabled = !settings.gemmaDisableThinking
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = adaptiveSwitchEnabled) {
+                                persistAndReload(settings.copy(gemmaAdaptiveThinking = !settings.gemmaAdaptiveThinking))
+                            }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp)
+                        ) {
+                            Text(
+                                text = "Adaptive Smart Thinking (Faster)",
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "Skips reasoning tokens on everyday sentences, fillers & numbers for 2×–4× faster cleanup, and automatically enables thinking only on self-corrections, spoken lists, or structural rewrites. On by default.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = settings.gemmaAdaptiveThinking && !settings.gemmaDisableThinking,
+                            enabled = adaptiveSwitchEnabled,
+                            onCheckedChange = { adaptive ->
+                                persistAndReload(settings.copy(gemmaAdaptiveThinking = adaptive))
+                            }
+                        )
+                    }
+                }
+
                 HorizontalDivider()
 
                 Text(

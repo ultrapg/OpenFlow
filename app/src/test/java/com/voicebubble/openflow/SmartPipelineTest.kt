@@ -1676,4 +1676,316 @@ class SmartPipelineTest {
             )
         )
     }
+
+    @Test
+    fun `Pillar 1 zero-LLM fast path bypasses clean concise speech while catching every edit trigger`() {
+        val cleanEn = "Can you review the pull request before lunch?"
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.canBypassLlmFastPath(
+                text = cleanEn,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+        assertEquals(
+            "can you review the OpenFlow pull request before lunch?",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyDeterministicFastPathCleanup(
+                text = "Can you review the openflow pull request before lunch?",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                languageCode = "en",
+                customVocabulary = listOf("OpenFlow"),
+                fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(
+                    isMidSentenceContinuation = true
+                )
+            )
+        )
+
+        val cleanDe = "Ich schicke dir die Unterlagen heute Abend."
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.canBypassLlmFastPath(
+                text = cleanDe,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRICT_CLEANUP
+            )
+        )
+
+        // Triggers that MUST route to the LLM (never bypass):
+        val mustUseLlmSamples = listOf(
+            "Um, can you review the pull request?",
+            "Ähm, ich schicke dir die Unterlagen.",
+            "I I think the build is green.",
+            "Let's meet Tuesday, actually Wednesday.",
+            "See you tomorrow at five pm.",
+            "Wir treffen uns um drei Uhr.",
+            "Please check the npu benchmark.",
+            "Because of the traffic. We arrived late.",
+            "can you review the pull request" // missing capitalization & terminal punctuation
+        )
+        for (dirty in mustUseLlmSamples) {
+            assertFalse(
+                "Expected LLM path for: $dirty",
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.canBypassLlmFastPath(
+                    text = dirty,
+                    preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+                )
+            )
+        }
+
+        // Email salutation requires paragraph break after greeting ("Hi Sarah,\n\nThanks...")
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.canBypassLlmFastPath(
+                text = "Hi Sarah, thanks for the update.",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(
+                    appCategory = com.voicebubble.openflow.core.speech.AppContextCategory.EMAIL
+                )
+            )
+        )
+    }
+
+    @Test
+    fun `Pillar 2 adaptive smart thinking skips reasoning on fillers and numbers but enables on repairs and lists`() {
+        val defaults = ModelSettings()
+        assertFalse("gemmaDisableThinking must remain false by default", defaults.gemmaDisableThinking)
+        assertTrue("gemmaAdaptiveThinking must be enabled by default", defaults.gemmaAdaptiveThinking)
+
+        // Everyday fillers + spoken numbers/times -> skip <think> (0 thought tokens!)
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "um hey Lukas let's meet tomorrow at three thirty pm and bring twenty euros",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            )
+        )
+
+        // Mid-sentence self-correction -> dynamically enable <think>!
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "send the invite to Thomas, wait no scratch that, send it to Hannah instead",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            )
+        )
+
+        // Spoken list sequence -> dynamically enable <think>!
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "we have three priorities first fix login second test payments third tag release",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            )
+        )
+
+        // Structural presets enable thinking on thinking models, but stay false on direct Qwen 2.5
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "Quick note about tomorrow.",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_1_7B
+            )
+        )
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "send it to Thomas, wait no scratch that, Hannah",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+            )
+        )
+    }
+
+    @Test
+    fun `Pillar 3 streaming prefix overlap commits closed sentences and holds cross-chunk repairs`() {
+        val p1 = "We finished testing the new audio pipeline."
+        val c2Clean = "Everything looks ready for the release build."
+        assertTrue(
+            com.voicebubble.openflow.core.speech.StreamingDictationSession.canCommitStreamingPrefixForOverlap(
+                prefixStitched = p1,
+                lookaheadChunk = c2Clean,
+                combinedStitched = "$p1 $c2Clean"
+            )
+        )
+
+        // Cross-chunk English backtrack -> must hold prefix!
+        val c2RepairEn = "Actually let's run one more regression test first."
+        assertFalse(
+            com.voicebubble.openflow.core.speech.StreamingDictationSession.canCommitStreamingPrefixForOverlap(
+                prefixStitched = p1,
+                lookaheadChunk = c2RepairEn,
+                combinedStitched = "$p1 $c2RepairEn"
+            )
+        )
+
+        // Cross-chunk German backtrack -> must hold prefix!
+        val pDe = "Wir treffen uns am Dienstag."
+        val c2RepairDe = "Oder besser am Mittwoch um zehn Uhr."
+        assertFalse(
+            com.voicebubble.openflow.core.speech.StreamingDictationSession.canCommitStreamingPrefixForOverlap(
+                prefixStitched = pDe,
+                lookaheadChunk = c2RepairDe,
+                combinedStitched = "$pDe $c2RepairDe"
+            )
+        )
+
+        // Unclosed prefix without terminal punctuation -> must hold prefix!
+        assertFalse(
+            com.voicebubble.openflow.core.speech.StreamingDictationSession.canCommitStreamingPrefixForOverlap(
+                prefixStitched = "When we finish testing the new audio pipeline",
+                lookaheadChunk = c2Clean,
+                combinedStitched = "When we finish testing the new audio pipeline $c2Clean"
+            )
+        )
+
+        assertEquals(
+            "We finished testing the new audio pipeline. Everything looks ready for the release build.",
+            com.voicebubble.openflow.core.speech.StreamingDictationSession.joinStreamingCleanedSegments(
+                segments = listOf(p1, c2Clean),
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
+
+    @Test
+    fun `Pillar 4 compact span-patch mode applies localized edits and falls back safely on bad anchors`() {
+        val longProse = "Yesterday afternoon our engineering team reviewed the latency telemetry from the latest mobile build, " +
+            "and um we noticed that prefill time dropped significantly across every single benchmark device while " +
+            "battery consumption during twenty five minute dictation sessions stayed remarkably low on both flagship and mid-range phones."
+
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
+                segment = longProse,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext.NONE,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_1_7B
+            )
+        )
+        assertFalse(
+            "0.6B models should stay on direct rewrite rather than span-patch anchor formatting",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
+                segment = longProse,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext.NONE,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            )
+        )
+
+        // NONE fast-exit
+        val noneRes = com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyVerifiedSpanEdits(
+            rawOutput = "<think></think>\nNONE",
+            sourceSegment = longProse
+        )
+        assertTrue(noneRes is com.voicebubble.openflow.core.speech.SpanPatchResult.NoChanges)
+
+        // Verified multi-line span patch
+        val patchOut = """
+            and um we noticed => and we noticed
+            twenty five minute => 25-minute
+        """.trimIndent()
+        val applied = com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyVerifiedSpanEdits(
+            rawOutput = patchOut,
+            sourceSegment = longProse
+        )
+        assertTrue(applied is com.voicebubble.openflow.core.speech.SpanPatchResult.Applied)
+        val patchedText = (applied as com.voicebubble.openflow.core.speech.SpanPatchResult.Applied).text
+        assertEquals(2, applied.editCount)
+        assertTrue(patchedText.contains("and we noticed that prefill time"))
+        assertTrue(patchedText.contains("during 25-minute dictation sessions"))
+
+        // Hallucinated non-existent anchor -> safe FallbackRequired
+        val badAnchor = com.voicebubble.openflow.core.speech.GemmaTextProcessor.applyVerifiedSpanEdits(
+            rawOutput = "phrase that does not exist anywhere => replacement",
+            sourceSegment = longProse
+        )
+        assertTrue(badAnchor is com.voicebubble.openflow.core.speech.SpanPatchResult.FallbackRequired)
+    }
+
+    @Test
+    fun `Pillar 5 right-sized KV windows and streaming runaway repetition detector work accurately`() {
+        val qwen06Windows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+            memoryMode = com.voicebubble.openflow.core.speech.GemmaMemoryMode.HIGH_HEADROOM,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+        )
+        assertEquals(listOf(1_536, 2_048, 4_096), qwen06Windows)
+
+        val gemma4Windows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+            memoryMode = com.voicebubble.openflow.core.speech.GemmaMemoryMode.HIGH_HEADROOM,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        )
+        assertEquals(listOf(2_048, 4_096), gemma4Windows)
+
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.hasRunawayTailRepetition(
+                "The release build finished compiling cleanly. All unit tests passed on the first run."
+            )
+        )
+        val repeatedLoop = "Here is the summary: " + "We need to ship the update today. ".repeat(3)
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.hasRunawayTailRepetition(repeatedLoop)
+        )
+    }
+
+    @Test
+    fun `Pillar 6 sentence sieve preserves clean sentences verbatim and detects optional LoRA files`() {
+        val mixedParagraph = "The database migration finished ahead of schedule. " +
+            "All integration tests passed without errors. " +
+            "Um we still need to update twenty five configuration keys before Friday. " +
+            "The deployment window opens tomorrow morning."
+
+        val spans = com.voicebubble.openflow.core.speech.GemmaTextProcessor.partitionSentenceSieve(
+            text = mixedParagraph,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+        )
+        org.junit.Assert.assertNotNull(spans)
+        assertEquals(3, spans!!.size)
+        assertFalse(spans[0].needsLlm)
+        assertEquals(
+            "The database migration finished ahead of schedule. All integration tests passed without errors.",
+            spans[0].text
+        )
+        assertTrue(spans[1].needsLlm)
+        assertEquals(
+            "Um we still need to update twenty five configuration keys before Friday.",
+            spans[1].text
+        )
+        assertFalse(spans[2].needsLlm)
+        assertEquals("The deployment window opens tomorrow morning.", spans[2].text)
+
+        // Repair-leading sentence must couple with its preceding clean sentence so backtracks aren't split
+        val coupledRepair = "The meeting is on Monday. Actually move it to Tuesday afternoon. " +
+            "Everything else on the roadmap stays unchanged. " +
+            "Please share the slides with the design team."
+        val repairSpans = com.voicebubble.openflow.core.speech.GemmaTextProcessor.partitionSentenceSieve(
+            text = coupledRepair,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+        )
+        org.junit.Assert.assertNotNull(repairSpans)
+        assertTrue("First span must couple sentence 1 + 'Actually...' sentence 2 into needsLlm=true", repairSpans!![0].needsLlm)
+        assertTrue(repairSpans[0].text.contains("The meeting is on Monday. Actually move it to Tuesday afternoon."))
+        assertFalse(repairSpans[1].needsLlm)
+
+        // Optional LoRA file detection & compact zero-example system prompt
+        val tempDir = kotlin.io.path.createTempDirectory("lora_test").toFile()
+        try {
+            assertEquals(
+                null,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveOptionalLoraFile(
+                    tempDir,
+                    com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                )
+            )
+            val loraFile = java.io.File(tempDir, "qwen3_0_6b.lora").apply { writeBytes(byteArrayOf(1, 2, 3, 4)) }
+            assertEquals(
+                loraFile,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveOptionalLoraFile(
+                    tempDir,
+                    com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                )
+            )
+            val compactLoraPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildCompactLoraSystemInstruction(
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                customVocabulary = listOf("OpenFlow", "LiteRT-LM")
+            )
+            assertTrue(compactLoraPrompt.length < 220)
+            assertTrue(compactLoraPrompt.contains("OpenFlow"))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

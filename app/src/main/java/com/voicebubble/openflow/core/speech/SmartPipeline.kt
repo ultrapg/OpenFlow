@@ -507,7 +507,8 @@ class SmartPipeline(
                         preset = activeSnap.gemmaPromptPreset,
                         customPrompt = activeSnap.gemmaCustomPrompt,
                         customVocabulary = activeSnap.customVocabulary,
-                        disableThinking = activeSnap.gemmaDisableThinking
+                        disableThinking = activeSnap.gemmaDisableThinking,
+                        adaptiveThinking = activeSnap.gemmaAdaptiveThinking
                     )
                 } else {
                     gemma.evictCachedSystemPrompt()
@@ -538,7 +539,8 @@ class SmartPipeline(
                         preset = activeSnap.gemmaPromptPreset,
                         customPrompt = activeSnap.gemmaCustomPrompt,
                         customVocabulary = activeSnap.customVocabulary,
-                        disableThinking = activeSnap.gemmaDisableThinking
+                        disableThinking = activeSnap.gemmaDisableThinking,
+                        adaptiveThinking = activeSnap.gemmaAdaptiveThinking
                     )
                 } else if (!mem.canPrewarmLlmPromptCache(selectedLlm)) {
                     gemma.evictCachedSystemPrompt()
@@ -587,7 +589,8 @@ class SmartPipeline(
                             preset = snapshot.gemmaPromptPreset,
                             customPrompt = snapshot.gemmaCustomPrompt,
                             customVocabulary = snapshot.customVocabulary,
-                            disableThinking = snapshot.gemmaDisableThinking
+                            disableThinking = snapshot.gemmaDisableThinking,
+                            adaptiveThinking = snapshot.gemmaAdaptiveThinking
                         )
                     } else {
                         currentGemma.evictCachedSystemPrompt()
@@ -912,13 +915,84 @@ class SmartPipeline(
     }
 
     /**
+     * Pillar 3: Returns `true` when an on-device LLM is enabled, downloaded, and has sufficient free RAM
+     * to run alongside `Voz` during live streaming without ever unloading `Voz` between chunks.
+     */
+    fun canOverlapStreamingLlmCleanup(): Boolean {
+        val snap = settings
+        if (!isActiveLlmReadyOnDisk(snap)) return false
+        val mem = evaluateMemoryPressure()
+        return mem.canKeepVozAndLlmCoResident(
+            llmChoice = snap.selectedLlmModel,
+            vozAlreadyLoaded = voz != null,
+            llmAlreadyLoaded = gemmaProcessor != null && loadedLlmChoice == snap.selectedLlmModel
+        )
+    }
+
+    /**
+     * Pillar 3: Cleans a finalized streaming prefix while the user continues speaking the next chunk.
+     * Returns `null` immediately (without unloading `Voz`) if co-residency RAM headroom is insufficient.
+     */
+    suspend fun postProcessStreamingSegment(
+        text: String,
+        languageHint: String?,
+        precedingCleanedTail: String?,
+        applyLeadingCursorContinuation: Boolean
+    ): String? = withContext(Dispatchers.Default) {
+        if (text.isBlank()) return@withContext text
+        val snapSettings = settings
+        if (!isActiveLlmReadyOnDisk(snapSettings)) return@withContext null
+
+        pipelineMutex.withLock {
+            val activeSettings = settings
+            if (!isActiveLlmReadyOnDisk(activeSettings)) return@withContext null
+            val selectedLlm = activeSettings.selectedLlmModel
+            val mem = evaluateMemoryPressure()
+            val canOverlap = mem.canKeepVozAndLlmCoResident(
+                llmChoice = selectedLlm,
+                vozAlreadyLoaded = voz != null,
+                llmAlreadyLoaded = gemmaProcessor != null && loadedLlmChoice == selectedLlm
+            )
+            if (!canOverlap) return@withContext null
+
+            idleEvictionJob?.cancel()
+            idleEvictionJob = null
+            llmIdleEvictionJob?.cancel()
+            llmIdleEvictionJob = null
+            promptPrewarmJob?.cancel()
+            promptPrewarmJob = null
+            isTranscribing = true
+            try {
+                val resolvedLanguage = languageHint?.takeIf { it in Voz.supportedLanguages }
+                    ?: activeSettings.preferredLanguage
+                val (cleaned, succeeded) = runGemmaLocked(
+                    text = text,
+                    language = resolvedLanguage,
+                    activeSettings = activeSettings,
+                    dynamicStageRelease = false,
+                    onStageProgress = null,
+                    precedingCleanedTail = precedingCleanedTail,
+                    applyLeadingCursorContinuation = applyLeadingCursorContinuation,
+                    keepWarmForStreamingOverlap = true
+                )
+                if (succeeded) cleaned else null
+            } finally {
+                isTranscribing = false
+                resetIdleEvictionTimerLocked()
+            }
+        }
+    }
+
+    /**
      * Runs single-model AI post-processing (or `Punct` if no LLM is active) once over the
-     * complete stitched transcript at the end of a live-streaming dictation session.
+     * complete stitched transcript (or remaining uncleaned tail) at the end of a live-streaming dictation session.
      */
     suspend fun postProcessFinalTranscript(
         text: String,
         languageHint: String? = null,
-        onStageProgress: ((String) -> Unit)? = null
+        onStageProgress: ((String) -> Unit)? = null,
+        precedingCleanedTail: String? = null,
+        applyLeadingCursorContinuation: Boolean = true
     ): String = withContext(Dispatchers.Default) {
         if (text.isBlank()) return@withContext text
         val snapSettings = settings
@@ -945,7 +1019,9 @@ class SmartPipeline(
                     resolvedLanguage = resolvedLanguage,
                     activeSettings = activeSettings,
                     dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, mem),
-                    onStageProgress = onStageProgress
+                    onStageProgress = onStageProgress,
+                    precedingCleanedTail = precedingCleanedTail,
+                    applyLeadingCursorContinuation = applyLeadingCursorContinuation
                 )
                 val postMem = evaluateMemoryPressure()
                 if (voz == null && !postMem.isCriticalPressure) {
@@ -1624,7 +1700,8 @@ class SmartPipeline(
                         preset = activeSettings.gemmaPromptPreset,
                         customPrompt = activeSettings.gemmaCustomPrompt,
                         customVocabulary = activeSettings.customVocabulary,
-                        disableThinking = activeSettings.gemmaDisableThinking
+                        disableThinking = activeSettings.gemmaDisableThinking,
+                        adaptiveThinking = activeSettings.gemmaAdaptiveThinking
                     )
                     gemmaWarmedUp = true
                 } catch (t: Throwable) {
@@ -1641,7 +1718,9 @@ class SmartPipeline(
         resolvedLanguage: String,
         activeSettings: ModelSettings,
         dynamicStageRelease: Boolean,
-        onStageProgress: ((String) -> Unit)?
+        onStageProgress: ((String) -> Unit)?,
+        precedingCleanedTail: String? = null,
+        applyLeadingCursorContinuation: Boolean = true
     ): String {
         if (text.isBlank()) return text
         var current = text
@@ -1658,7 +1737,10 @@ class SmartPipeline(
                 language = resolvedLanguage,
                 activeSettings = activeSettings,
                 dynamicStageRelease = dynamicStageRelease,
-                onStageProgress = onStageProgress
+                onStageProgress = onStageProgress,
+                precedingCleanedTail = precedingCleanedTail,
+                applyLeadingCursorContinuation = applyLeadingCursorContinuation,
+                keepWarmForStreamingOverlap = false
             )
             current = llmResult
             if (!llmSucceeded &&
@@ -1742,7 +1824,10 @@ class SmartPipeline(
         language: String,
         activeSettings: ModelSettings,
         dynamicStageRelease: Boolean,
-        onStageProgress: ((String) -> Unit)?
+        onStageProgress: ((String) -> Unit)?,
+        precedingCleanedTail: String? = null,
+        applyLeadingCursorContinuation: Boolean = true,
+        keepWarmForStreamingOverlap: Boolean = false
     ): Pair<String, Boolean> {
         if (text.isBlank()) return text to true
         val selectedLlm = activeSettings.selectedLlmModel
@@ -1755,6 +1840,38 @@ class SmartPipeline(
         // Never keep Punct loaded alongside an active LLM
         if (punctRestorer != null) {
             closePunctLocked()
+        }
+
+        // Pillar 1: Evaluate Zero-LLM Fast-Path BEFORE unloading Voz or loading an unloaded LLM into RAM!
+        val trimmed = text.trim()
+        val rawFieldCtx = GemmaTextProcessor.inspectActiveFieldContextStatic(appContext)
+        val rootFieldCtx = if (applyLeadingCursorContinuation) {
+            rawFieldCtx
+        } else {
+            rawFieldCtx.copy(
+                isMidSentenceContinuation = false,
+                continuingNumberedListFrom = null,
+                isContinuingBulletList = false
+            )
+        }
+        val fastPathFieldCtx = if (precedingCleanedTail != null && rootFieldCtx.appCategory == AppContextCategory.EMAIL) {
+            rootFieldCtx.copy(appCategory = AppContextCategory.GENERAL)
+        } else {
+            rootFieldCtx
+        }
+        if (GemmaTextProcessor.canBypassLlmFastPath(trimmed, activeSettings.gemmaPromptPreset, fastPathFieldCtx)) {
+            val bypassed = GemmaTextProcessor.applyDeterministicFastPathCleanup(
+                text = trimmed,
+                preset = activeSettings.gemmaPromptPreset,
+                languageCode = language,
+                customVocabulary = activeSettings.customVocabulary,
+                fieldContext = rootFieldCtx
+            )
+            DebugLogManager.logInfo(
+                TAG,
+                "Zero-LLM fast-path bypassed ${selectedLlm.title} in <1ms (${trimmed.length} chars; llmLoaded=${gemmaProcessor != null})"
+            )
+            return bypassed to true
         }
 
         if (gemmaProcessor == null) {
@@ -1771,6 +1888,10 @@ class SmartPipeline(
                     llmAlreadyLoaded = false
                 )
             ) {
+                if (keepWarmForStreamingOverlap) {
+                    // During live streaming overlap, never unload Voz mid-recording
+                    return text to false
+                }
                 DebugLogManager.logInfo(
                     TAG,
                     "Temporarily releasing Voz session to guarantee OOM-safe RAM headroom for ${selectedLlm.title} (sysAvail=${memAfterAux.systemAvailMb}MB, total=${memAfterAux.systemTotalMb}MB)",
@@ -1816,6 +1937,7 @@ class SmartPipeline(
             val thinkingLabel = when {
                 !selectedLlm.supportsThinking -> "Direct"
                 activeSettings.gemmaDisableThinking -> "No-Think"
+                activeSettings.gemmaAdaptiveThinking -> "Auto-Think"
                 else -> "Thinking"
             }
             setModelActiveStatusLocked(
@@ -1830,7 +1952,10 @@ class SmartPipeline(
                 customPrompt = activeSettings.gemmaCustomPrompt,
                 languageCode = language,
                 customVocabulary = activeSettings.customVocabulary,
-                disableThinking = activeSettings.gemmaDisableThinking
+                disableThinking = activeSettings.gemmaDisableThinking,
+                adaptiveThinking = activeSettings.gemmaAdaptiveThinking,
+                precedingSegmentTailOverride = precedingCleanedTail,
+                applyLeadingCursorContinuation = applyLeadingCursorContinuation
             )
             gemmaWarmedUp = true
             val postGemmaMem = evaluateMemoryPressure()
@@ -1840,13 +1965,17 @@ class SmartPipeline(
                 llmAlreadyLoaded = true
             )
             val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
-            if (dynamicStageRelease || postGemmaMem.systemAvailMb < minPostPassAvailMb || cannotKeepAlongsideVoz) {
+            if (!keepWarmForStreamingOverlap &&
+                (dynamicStageRelease || postGemmaMem.systemAvailMb < minPostPassAvailMb || cannotKeepAlongsideVoz)
+            ) {
                 DebugLogManager.logInfo(
                     TAG,
                     "Releasing ${selectedLlm.title} session after pass so Voz & system RAM stay healthy (sysAvail=${postGemmaMem.systemAvailMb}MB)"
                 )
                 closeGemmaLocked()
                 System.gc()
+            } else if (keepWarmForStreamingOverlap && postGemmaMem.isCriticalPressure) {
+                closeGemmaLocked()
             }
             processed to true
         } catch (t: Throwable) {

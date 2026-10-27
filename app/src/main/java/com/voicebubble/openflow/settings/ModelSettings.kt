@@ -173,6 +173,8 @@ enum class LlmModelChoice(
     val supportsThinking: Boolean,
     val supportsNpuBackend: Boolean,
     val promptTier: LlmPromptTier,
+    val preferredMaxContextTokens: Int,
+    val thinkingTokenBudgetCap: Int,
     val samplerTopK: Int,
     val samplerTopP: Double,
     val samplerTemperature: Double
@@ -190,6 +192,8 @@ enum class LlmModelChoice(
         supportsThinking = true,
         supportsNpuBackend = false,
         promptTier = LlmPromptTier.COMPACT_0_6B,
+        preferredMaxContextTokens = 1_536,
+        thinkingTokenBudgetCap = 48,
         samplerTopK = 10,
         samplerTopP = 0.85,
         samplerTemperature = 0.05
@@ -207,6 +211,8 @@ enum class LlmModelChoice(
         supportsThinking = true,
         supportsNpuBackend = true,
         promptTier = LlmPromptTier.COMPACT_0_6B,
+        preferredMaxContextTokens = 1_536,
+        thinkingTokenBudgetCap = 56,
         samplerTopK = 12,
         samplerTopP = 0.88,
         samplerTemperature = 0.06
@@ -224,6 +230,8 @@ enum class LlmModelChoice(
         supportsThinking = true,
         supportsNpuBackend = false,
         promptTier = LlmPromptTier.BALANCED_1_7B,
+        preferredMaxContextTokens = 2_048,
+        thinkingTokenBudgetCap = 88,
         samplerTopK = 20,
         samplerTopP = 0.90,
         samplerTemperature = 0.08
@@ -241,6 +249,8 @@ enum class LlmModelChoice(
         supportsThinking = false,
         supportsNpuBackend = false,
         promptTier = LlmPromptTier.DIRECT_INSTRUCT_1_5B,
+        preferredMaxContextTokens = 1_536,
+        thinkingTokenBudgetCap = 0,
         samplerTopK = 15,
         samplerTopP = 0.88,
         samplerTemperature = 0.08
@@ -258,6 +268,8 @@ enum class LlmModelChoice(
         supportsThinking = true,
         supportsNpuBackend = true,
         promptTier = LlmPromptTier.FLAGSHIP_GEMMA_4,
+        preferredMaxContextTokens = 2_048,
+        thinkingTokenBudgetCap = 144,
         samplerTopK = 20,
         samplerTopP = 0.90,
         samplerTemperature = 0.10
@@ -437,6 +449,7 @@ data class ModelSettings(
     val gemmaEnabled: Boolean = false,
     val selectedLlmModel: LlmModelChoice = LlmModelChoice.QWEN_3_0_6B,
     val gemmaDisableThinking: Boolean = false,
+    val gemmaAdaptiveThinking: Boolean = true,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
     val preferredLanguage: String = defaultPreferredLanguage(),
@@ -512,6 +525,7 @@ data class ModelSettings(
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
         const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
+        const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
         const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
         const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
@@ -558,6 +572,7 @@ data class ModelSettings(
                 gemmaEnabled = gemmaEnabled,
                 selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, false),
+                gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
                 preferredLanguage = sanitizedLang,
@@ -587,6 +602,7 @@ data class ModelSettings(
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
                 .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
+                .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)
                 .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
                 .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
