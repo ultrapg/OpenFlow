@@ -71,7 +71,7 @@ enum class ModelLoadState(val label: String) {
  * High-level lifecycle phase of [SmartPipeline].
  */
 enum class PipelinePhase(val label: String) {
-    UNINITIALIZED("Not Loaded"),
+    UNINITIALIZED("Standby (0 MB in RAM)"),
     LOADING("Loading Models..."),
     WARMING_UP("Warming Up Accelerator..."),
     READY("Models Loaded & Ready"),
@@ -222,7 +222,7 @@ data class PipelineStatus(
             else -> ModelLoadState.DISABLED
         }
     },
-    val statusMessage: String = "Models on disk — ready to load",
+    val statusMessage: String = "Standby — 0 MB in RAM (loads when bubble is tapped)",
     val lastInferenceMs: Long? = null,
     val lastAudioDurationMs: Long? = null,
     val lastWarmupMs: Long? = null,
@@ -280,6 +280,10 @@ class SmartPipeline(
     private var idleEvictionJob: Job? = null
     private var llmIdleEvictionJob: Job? = null
     private var promptPrewarmJob: Job? = null
+    private var recordingWarmupJob: Job? = null
+
+    @Volatile
+    private var isRecordingActive: Boolean = false
 
     @Volatile
     var settings: ModelSettings = initialSettings
@@ -443,23 +447,90 @@ class SmartPipeline(
 
     /**
      * Triggered asynchronously when the user taps the microphone bubble to start recording.
-     * Lazily loads the single selected LLM into RAM (if on-demand standby and co-residency RAM allows)
-     * and pre-fills its system-prompt KV cache (`prefillPrefaceOnInit = true`) for the currently focused app &
-     * cursor context while the user is speaking, using `pipelineMutex.tryLock()` so it never blocks or delays
-     * live `Voz` chunk transcription.
+     *
+     * Battery & RAM Saver Architecture:
+     * - Idle RAM stays at `0 MB` when all models have been auto-unloaded.
+     * - Tapping the bubble overlaps loading `Voz`, `Ear`/`Punct`, and (if co-resident RAM allows)
+     *   the active `LiteRT-LM` model + system-prompt KV cache while the user speaks.
+     * - If the user finishes a very short utterance while loading is still underway (`!isRecordingActive`),
+     *   this job yields [pipelineMutex] immediately after `Voz` is loaded so transcription starts with zero
+     *   synthetic warmup delay.
      */
     fun onRecordingStartedAsync() {
-        val snap = settings
-        if (!snap.gemmaEnabled || isTranscribing) return
+        isRecordingActive = true
+        idleEvictionJob?.cancel()
+        idleEvictionJob = null
         llmIdleEvictionJob?.cancel()
         llmIdleEvictionJob = null
         promptPrewarmJob?.cancel()
-        promptPrewarmJob = idleScope.launch {
-            if (isTranscribing || !pipelineMutex.tryLock()) return@launch
-            try {
-                if (isTranscribing) return@launch
+        promptPrewarmJob = null
+        recordingWarmupJob?.cancel()
+        recordingWarmupJob = idleScope.launch {
+            pipelineMutex.withLock {
+                if (!isRecordingActive || isTranscribing) return@withLock
                 val activeSnap = settings
-                if (!isActiveLlmReadyOnDisk(activeSnap)) return@launch
+                if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
+                    updateStatusSnapshot(
+                        activeSettings = activeSnap,
+                        phaseOverride = PipelinePhase.UNINITIALIZED,
+                        messageOverride = "Models not downloaded yet"
+                    )
+                    return@withLock
+                }
+
+                val mem = evaluateMemoryPressure()
+                applyHardwareAcceleratorSettingsLocked(activeSnap.hardwareAccelerator, mem.isAnyMemoryTight)
+
+                // 1. Load Voz immediately while the user begins speaking (deferring warmup until we check isRecordingActive)
+                if (voz == null) {
+                    updateStatusSnapshot(
+                        activeSettings = activeSnap,
+                        phaseOverride = PipelinePhase.LOADING,
+                        messageOverride = "Loading Voz speech engine ($activeAcceleratorDescription)..."
+                    )
+                    val loaded = ensureVozLocked(activeSnap, warmUp = false)
+                    if (!loaded) {
+                        updateStatusSnapshot(
+                            activeSettings = activeSnap,
+                            phaseOverride = PipelinePhase.ERROR,
+                            messageOverride = "Failed to load Voz speech model"
+                        )
+                        return@withLock
+                    }
+                }
+
+                // Yield lock immediately if user already finished a quick dictation while Voz was loading
+                if (!isRecordingActive || isTranscribing) {
+                    updateStatusSnapshot(
+                        activeSettings = activeSnap,
+                        phaseOverride = PipelinePhase.READY,
+                        messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                    )
+                    return@withLock
+                }
+
+                // 2. User is still speaking: warm up Voz and load enabled Ear / Punct auxiliary models
+                if (!vozWarmedUp && !mem.isAnyMemoryTight) {
+                    ensureVozLocked(activeSnap, warmUp = true)
+                }
+                if (isRecordingActive && !isTranscribing) {
+                    ensureAuxiliaryModelsLocked(
+                        activeSettings = activeSnap,
+                        warmUp = false,
+                        preloadLlmIfCoResident = false
+                    )
+                }
+                appliedSettingsSnapshot = activeSnap
+
+                val readyCount = countLoadedModelsLocked(activeSnap)
+                updateStatusSnapshot(
+                    activeSettings = activeSnap,
+                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "$readyCount/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                )
+
+                if (!isRecordingActive || isTranscribing || !activeSnap.gemmaEnabled) return@withLock
+                if (!isActiveLlmReadyOnDisk(activeSnap)) return@withLock
                 val selectedLlm = activeSnap.selectedLlmModel
 
                 // Never hold a stale LLM or redundant Punct model in RAM alongside the active LLM
@@ -470,9 +541,9 @@ class SmartPipeline(
                     closePunctLocked()
                 }
 
-                val mem = evaluateMemoryPressure()
+                val memBeforeLlm = evaluateMemoryPressure()
                 if (gemmaProcessor == null &&
-                    mem.canKeepVozAndLlmCoResident(
+                    memBeforeLlm.canKeepVozAndLlmCoResident(
                         llmChoice = selectedLlm,
                         vozAlreadyLoaded = voz != null,
                         llmAlreadyLoaded = false
@@ -484,7 +555,7 @@ class SmartPipeline(
                             context = appContext,
                             modelDir = modelDir,
                             accelerator = activeSnap.hardwareAccelerator,
-                            memoryMode = mem.gemmaMemoryMode,
+                            memoryMode = memBeforeLlm.gemmaMemoryMode,
                             llmChoice = selectedLlm
                         )
                         loadedLlmChoice = selectedLlm
@@ -496,18 +567,19 @@ class SmartPipeline(
                         )
                         updateStatusSnapshot(
                             activeSettings = activeSnap,
-                            phaseOverride = null,
-                            messageOverride = null
+                            phaseOverride = PipelinePhase.READY,
+                            messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                         )
                     } catch (t: Throwable) {
                         if (t is CancellationException) throw t
                         DebugLogManager.logWarn(TAG, "Deferred ${selectedLlm.title} overlap load: ${t.message}")
                         closeGemmaLocked()
-                        return@launch
+                        return@withLock
                     }
                 }
 
-                val gemma = gemmaProcessor ?: return@launch
+                if (!isRecordingActive || isTranscribing) return@withLock
+                val gemma = gemmaProcessor ?: return@withLock
                 val memAfterLoad = evaluateMemoryPressure()
                 if (memAfterLoad.canPrewarmLlmPromptCache(selectedLlm)) {
                     gemma.prewarmSystemPrompt(
@@ -520,15 +592,39 @@ class SmartPipeline(
                 } else {
                     gemma.evictCachedSystemPrompt()
                 }
-            } finally {
-                pipelineMutex.unlock()
+            }
+        }
+    }
+
+    /**
+     * Marks microphone capture as stopped so any in-progress [onRecordingStartedAsync] warmup yields
+     * [pipelineMutex] immediately to final transcription, and idle auto-unload timers can arm.
+     */
+    fun onRecordingStopped() {
+        isRecordingActive = false
+    }
+
+    /**
+     * Finalizes a live-streaming dictation session: clears [isRecordingActive] and either unloads
+     * all models immediately (when `modelAutoUnloadMinutes == 0`) or starts the configured idle timer.
+     */
+    suspend fun completeStreamingSession() = withContext(Dispatchers.Default) {
+        isRecordingActive = false
+        pipelineMutex.withLock {
+            if (!isTranscribing) {
+                val snap = settings
+                if (snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) {
+                    evictAllModelsLocked(snap, "immediate auto-unload after dictation")
+                } else {
+                    resetIdleEvictionTimerLocked()
+                }
             }
         }
     }
 
     private fun schedulePostDictationPromptPrewarm() {
         val snap = settings
-        if (!snap.gemmaEnabled) return
+        if (!snap.gemmaEnabled || snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return
         promptPrewarmJob?.cancel()
         promptPrewarmJob = idleScope.launch {
             delay(400L)
@@ -536,6 +632,7 @@ class SmartPipeline(
             try {
                 if (isTranscribing) return@launch
                 val activeSnap = settings
+                if (activeSnap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return@launch
                 val gemma = gemmaProcessor ?: return@launch
                 if (!activeSnap.gemmaEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
                 val selectedLlm = activeSnap.selectedLlmModel
@@ -570,11 +667,40 @@ class SmartPipeline(
 
     /**
      * Updates [settings] immediately and synchronizes loaded models & hardware accelerator under [pipelineMutex].
+     *
+     * Lazy RAM Saver: If all models are currently unloaded (`!hasAnyLoadedModelLocked()`), changing settings
+     * keeps RAM at `0 MB` until the floating bubble is tapped (or the user explicitly taps Load in Settings).
      */
     suspend fun reloadSettings(newSettings: ModelSettings) = withContext(Dispatchers.Default) {
         settings = newSettings
         pipelineMutex.withLock {
             val snapshot = settings
+            val memReport = evaluateMemoryPressure()
+
+            if (!hasAnyLoadedModelLocked()) {
+                applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
+                appliedSettingsSnapshot = snapshot
+                idleEvictionJob?.cancel()
+                idleEvictionJob = null
+                llmIdleEvictionJob?.cancel()
+                llmIdleEvictionJob = null
+                updateStatusSnapshot(
+                    activeSettings = snapshot,
+                    phaseOverride = PipelinePhase.UNINITIALIZED,
+                    messageOverride = standbyStatusMessageLocked(snapshot)
+                )
+                return@withLock
+            }
+
+            if (!isRecordingActive && !isTranscribing &&
+                snapshot.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+            ) {
+                applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
+                appliedSettingsSnapshot = snapshot
+                evictAllModelsLocked(snapshot, "auto-unload set to Immediately")
+                return@withLock
+            }
+
             val accelChanged = appliedAccelerator != null && appliedAccelerator != snapshot.hardwareAccelerator
             val modelSelectionUnchanged = appliedSettingsSnapshot != null &&
                 appliedSettingsSnapshot?.earEnabled == snapshot.earEnabled &&
@@ -614,7 +740,6 @@ class SmartPipeline(
                 return@withLock
             }
 
-            val memReport = evaluateMemoryPressure()
             applyHardwareAcceleratorSettingsLocked(snapshot.hardwareAccelerator, memReport.isAnyMemoryTight)
 
             if (accelChanged) {
@@ -658,7 +783,7 @@ class SmartPipeline(
             val msg = if (vozOk) {
                 "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
             } else {
-                "Waiting for model download"
+                standbyStatusMessageLocked(snapshot)
             }
             updateStatusSnapshot(
                 activeSettings = snapshot,
@@ -684,7 +809,8 @@ class SmartPipeline(
         onStageProgress: ((String) -> Unit)? = null,
         languageHint: String? = null,
         onLanguageResolved: ((String) -> Unit)? = null,
-        applyPostProcessing: Boolean = true
+        applyPostProcessing: Boolean = true,
+        keepModelsWarmForSession: Boolean = false
     ): String = withContext(Dispatchers.Default) {
         if (samples.isEmpty()) return@withContext ""
 
@@ -856,36 +982,42 @@ class SmartPipeline(
                     stitchedTranscript
                 }
 
-                // Re-attach core & auxiliary models in ready state if memory is healthy,
-                // guaranteeing Voz and the selected LLM never co-reside when free RAM cannot hold both.
-                val postMem = evaluateMemoryPressure()
-                if (voz == null && !postMem.isCriticalPressure) {
-                    val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
-                    if (gemmaProcessor != null &&
-                        !postMem.canKeepVozAndLlmCoResident(
-                            llmChoice = activeLlm,
-                            vozAlreadyLoaded = false,
-                            llmAlreadyLoaded = true
-                        )
-                    ) {
-                        DebugLogManager.logInfo(
-                            TAG,
-                            "Unloading ${activeLlm.title} before reloading Voz so low/moderate-RAM device stays OOM-safe (sysAvail=${postMem.systemAvailMb}MB)"
-                        )
-                        closeGemmaLocked()
-                        System.gc()
+                val immediateUnloadNow = !keepModelsWarmForSession &&
+                    !isRecordingActive &&
+                    activeSettings.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+
+                if (!immediateUnloadNow) {
+                    // Re-attach core & auxiliary models in ready state if memory is healthy,
+                    // guaranteeing Voz and the selected LLM never co-reside when free RAM cannot hold both.
+                    val postMem = evaluateMemoryPressure()
+                    if (voz == null && !postMem.isCriticalPressure) {
+                        val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
+                        if (gemmaProcessor != null &&
+                            !postMem.canKeepVozAndLlmCoResident(
+                                llmChoice = activeLlm,
+                                vozAlreadyLoaded = false,
+                                llmAlreadyLoaded = true
+                            )
+                        ) {
+                            DebugLogManager.logInfo(
+                                TAG,
+                                "Unloading ${activeLlm.title} before reloading Voz so low/moderate-RAM device stays OOM-safe (sysAvail=${postMem.systemAvailMb}MB)"
+                            )
+                            closeGemmaLocked()
+                            System.gc()
+                        }
+                        ensureVozLocked(activeSettings, warmUp = false)
                     }
-                    ensureVozLocked(activeSettings, warmUp = false)
-                }
-                if (!postMem.isCriticalPressure) {
-                    ensureAuxiliaryModelsLocked(
-                        activeSettings = activeSettings,
-                        warmUp = false,
-                        preloadLlmIfCoResident = false
-                    )
-                }
-                if (applyPostProcessing && activeSettings.gemmaEnabled && gemmaProcessor != null) {
-                    schedulePostDictationPromptPrewarm()
+                    if (!postMem.isCriticalPressure) {
+                        ensureAuxiliaryModelsLocked(
+                            activeSettings = activeSettings,
+                            warmUp = false,
+                            preloadLlmIfCoResident = false
+                        )
+                    }
+                    if (applyPostProcessing && activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                        schedulePostDictationPromptPrewarm()
+                    }
                 }
 
                 val totalInferenceMs = (SystemClock.elapsedRealtime() - inferenceStartMs).coerceAtLeast(1L)
@@ -910,13 +1042,24 @@ class SmartPipeline(
             } finally {
                 isTranscribing = false
                 val snap = settings
-                val count = countLoadedModelsLocked(snap)
-                updateStatusSnapshot(
-                    activeSettings = snap,
-                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
-                )
-                resetIdleEvictionTimerLocked()
+                if (!keepModelsWarmForSession &&
+                    !isRecordingActive &&
+                    snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+                ) {
+                    evictAllModelsLocked(snap, "immediate auto-unload after dictation")
+                } else {
+                    val count = countLoadedModelsLocked(snap)
+                    updateStatusSnapshot(
+                        activeSettings = snap,
+                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = if (hasAnyLoadedModelLocked()) {
+                            "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        } else {
+                            standbyStatusMessageLocked(snap)
+                        }
+                    )
+                    resetIdleEvictionTimerLocked()
+                }
             }
         }
     }
@@ -1037,39 +1180,53 @@ class SmartPipeline(
                     precedingCleanedTail = precedingCleanedTail,
                     applyLeadingCursorContinuation = applyLeadingCursorContinuation
                 )
-                val postMem = evaluateMemoryPressure()
-                if (voz == null && !postMem.isCriticalPressure) {
-                    val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
-                    if (gemmaProcessor != null &&
-                        !postMem.canKeepVozAndLlmCoResident(
-                            llmChoice = activeLlm,
-                            vozAlreadyLoaded = false,
-                            llmAlreadyLoaded = true
-                        )
-                    ) {
-                        DebugLogManager.logInfo(
-                            TAG,
-                            "Unloading ${activeLlm.title} before reloading Voz after streaming session (sysAvail=${postMem.systemAvailMb}MB)"
-                        )
-                        closeGemmaLocked()
-                        System.gc()
+                val immediateUnloadNow = !isRecordingActive &&
+                    activeSettings.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+                if (!immediateUnloadNow) {
+                    val postMem = evaluateMemoryPressure()
+                    if (voz == null && !postMem.isCriticalPressure) {
+                        val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
+                        if (gemmaProcessor != null &&
+                            !postMem.canKeepVozAndLlmCoResident(
+                                llmChoice = activeLlm,
+                                vozAlreadyLoaded = false,
+                                llmAlreadyLoaded = true
+                            )
+                        ) {
+                            DebugLogManager.logInfo(
+                                TAG,
+                                "Unloading ${activeLlm.title} before reloading Voz after streaming session (sysAvail=${postMem.systemAvailMb}MB)"
+                            )
+                            closeGemmaLocked()
+                            System.gc()
+                        }
+                        ensureVozLocked(activeSettings, warmUp = false)
                     }
-                    ensureVozLocked(activeSettings, warmUp = false)
-                }
-                if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
-                    schedulePostDictationPromptPrewarm()
+                    if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                        schedulePostDictationPromptPrewarm()
+                    }
                 }
                 result
             } finally {
                 isTranscribing = false
                 val snap = settings
-                val count = countLoadedModelsLocked(snap)
-                updateStatusSnapshot(
-                    activeSettings = snap,
-                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
-                )
-                resetIdleEvictionTimerLocked()
+                if (!isRecordingActive &&
+                    snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+                ) {
+                    evictAllModelsLocked(snap, "immediate auto-unload after streaming session")
+                } else {
+                    val count = countLoadedModelsLocked(snap)
+                    updateStatusSnapshot(
+                        activeSettings = snap,
+                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = if (hasAnyLoadedModelLocked()) {
+                            "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        } else {
+                            standbyStatusMessageLocked(snap)
+                        }
+                    )
+                    resetIdleEvictionTimerLocked()
+                }
             }
         }
     }
@@ -1171,22 +1328,23 @@ class SmartPipeline(
                     onProgress = onProgress
                 )
 
-                val postMem = evaluateMemoryPressure()
-                val cannotKeepWithVoz = !postMem.canKeepVozAndLlmCoResident(
-                    llmChoice = selectedLlm,
-                    vozAlreadyLoaded = voz != null,
-                    llmAlreadyLoaded = true
-                )
-                val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
-                if (!activeSettings.gemmaEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
-                    closeGemmaLocked()
-                    System.gc()
-                }
-                if (voz == null && !postMem.isCriticalPressure) {
-                    ensureVozLocked(activeSettings, warmUp = false)
-                }
-                if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
-                    schedulePostDictationPromptPrewarm()
+                val immediateUnloadNow = !isRecordingActive &&
+                    activeSettings.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+                if (!immediateUnloadNow) {
+                    val postMem = evaluateMemoryPressure()
+                    val cannotKeepWithVoz = !postMem.canKeepVozAndLlmCoResident(
+                        llmChoice = selectedLlm,
+                        vozAlreadyLoaded = voz != null,
+                        llmAlreadyLoaded = true
+                    )
+                    val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
+                    if (!activeSettings.gemmaEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
+                        closeGemmaLocked()
+                        System.gc()
+                    }
+                    if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                        schedulePostDictationPromptPrewarm()
+                    }
                 }
 
                 benchResult
@@ -1197,14 +1355,45 @@ class SmartPipeline(
             } finally {
                 isTranscribing = false
                 val snap = settings
-                val count = countLoadedModelsLocked(snap)
-                updateStatusSnapshot(
-                    activeSettings = snap,
-                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
-                )
-                resetIdleEvictionTimerLocked()
+                if (!isRecordingActive &&
+                    snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
+                ) {
+                    evictAllModelsLocked(snap, "immediate auto-unload after benchmark")
+                } else {
+                    val count = countLoadedModelsLocked(snap)
+                    updateStatusSnapshot(
+                        activeSettings = snap,
+                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = if (hasAnyLoadedModelLocked()) {
+                            "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        } else {
+                            standbyStatusMessageLocked(snap)
+                        }
+                    )
+                    resetIdleEvictionTimerLocked()
+                }
             }
+        }
+    }
+
+    /**
+     * Unloads ALL models (`Voz`, `Ear`, `Punct`, and active `LiteRT-LM` LLM + KV cache) down to `0 MB`
+     * in RAM when idle. Models stay unloaded until the floating bubble is tapped (or manually loaded).
+     */
+    suspend fun evictAllModels(reason: String = "idle timeout") = withContext(Dispatchers.Default) {
+        pipelineMutex.withLock {
+            if (!isTranscribing && !isRecordingActive && hasAnyLoadedModelLocked()) {
+                evictAllModelsLocked(settings, reason)
+            }
+        }
+    }
+
+    /**
+     * Asynchronous fire-and-forget wrapper around [evictAllModels] for UI actions.
+     */
+    fun evictAllModelsAsync(reason: String = "manual unload") {
+        idleScope.launch {
+            evictAllModels(reason)
         }
     }
 
@@ -2219,6 +2408,44 @@ class SmartPipeline(
         )
     }
 
+    private fun hasAnyLoadedModelLocked(): Boolean {
+        return voz != null || ear != null || punctRestorer != null || gemmaProcessor != null
+    }
+
+    private fun standbyStatusMessageLocked(@Suppress("UNUSED_PARAMETER") activeSettings: ModelSettings): String {
+        val vozDownloaded = try {
+            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)
+        } catch (_: Throwable) {
+            false
+        }
+        return if (!vozDownloaded) {
+            "Models not downloaded yet"
+        } else {
+            "Standby — 0 MB in RAM (loads when bubble is tapped)"
+        }
+    }
+
+    private fun evictAllModelsLocked(activeSettings: ModelSettings, reason: String) {
+        idleEvictionJob?.cancel()
+        idleEvictionJob = null
+        llmIdleEvictionJob?.cancel()
+        llmIdleEvictionJob = null
+        promptPrewarmJob?.cancel()
+        promptPrewarmJob = null
+        Log.i(TAG, "Unloading all models from RAM ($reason) -> 0 MB Standby.")
+        DebugLogManager.logInfo(TAG, "Unloading all models from RAM ($reason) -> 0 MB Standby", includeMemory = true)
+        closeEarLocked()
+        closePunctLocked()
+        closeGemmaLocked()
+        closeVozLocked()
+        System.gc()
+        updateStatusSnapshot(
+            activeSettings = activeSettings,
+            phaseOverride = PipelinePhase.UNINITIALIZED,
+            messageOverride = standbyStatusMessageLocked(activeSettings)
+        )
+    }
+
     private fun updateStatusSnapshot(
         activeSettings: ModelSettings,
         phaseOverride: PipelinePhase?,
@@ -2227,12 +2454,17 @@ class SmartPipeline(
         val states = computeModelStatesSnapshot(activeSettings)
         val loaded = countLoadedModelsLocked(activeSettings)
         val enabled = activeSettings.enabledModels().size
+        val anyLoaded = hasAnyLoadedModelLocked()
         val resolvedPhase = phaseOverride ?: when {
             isTranscribing -> PipelinePhase.TRANSCRIBING
-            voz != null -> PipelinePhase.READY
+            anyLoaded -> PipelinePhase.READY
             else -> PipelinePhase.UNINITIALIZED
         }
-        val resolvedMsg = messageOverride ?: _pipelineStatus.value.statusMessage
+        val resolvedMsg = messageOverride ?: if (!anyLoaded && !isTranscribing) {
+            standbyStatusMessageLocked(activeSettings)
+        } else {
+            _pipelineStatus.value.statusMessage
+        }
         _pipelineStatus.value = _pipelineStatus.value.copy(
             phase = resolvedPhase,
             configuredAccelerator = activeSettings.hardwareAccelerator,
@@ -2248,18 +2480,36 @@ class SmartPipeline(
 
     private fun resetIdleEvictionTimerLocked() {
         idleEvictionJob?.cancel()
-        idleEvictionJob = idleScope.launch {
-            delay(IDLE_TIMEOUT_MS)
-            evictOptionalModels()
-        }
+        idleEvictionJob = null
         llmIdleEvictionJob?.cancel()
-        llmIdleEvictionJob = if (gemmaProcessor != null) {
-            idleScope.launch {
-                delay(LLM_IDLE_TIMEOUT_MS)
-                evictIdleLlm()
+        llmIdleEvictionJob = null
+
+        if (isTranscribing || isRecordingActive || !hasAnyLoadedModelLocked()) {
+            return
+        }
+
+        val activeSnap = settings
+        val unloadMinutes = activeSnap.modelAutoUnloadMinutes
+        when {
+            unloadMinutes == ModelSettings.AUTO_UNLOAD_NEVER -> {
+                // Keep loaded models warm in RAM indefinitely unless OS memory pressure occurs
             }
-        } else {
-            null
+            unloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY -> {
+                evictAllModelsLocked(activeSnap, "immediate auto-unload")
+            }
+            else -> {
+                val timeoutMs = unloadMinutes.coerceAtLeast(1).toLong() * 60_000L
+                idleEvictionJob = idleScope.launch {
+                    delay(timeoutMs)
+                    evictAllModels("auto-unload after ${unloadMinutes}m idle")
+                }
+                if (gemmaProcessor != null && timeoutMs > LLM_IDLE_TIMEOUT_MS) {
+                    llmIdleEvictionJob = idleScope.launch {
+                        delay(LLM_IDLE_TIMEOUT_MS)
+                        evictIdleLlm()
+                    }
+                }
+            }
         }
     }
 

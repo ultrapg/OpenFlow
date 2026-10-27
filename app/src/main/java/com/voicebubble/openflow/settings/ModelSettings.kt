@@ -84,8 +84,8 @@ enum class DesertAntModel(
     QWEN_3_0_6B_LITE(
         id = "qwen3_0_6b_lite",
         shortLabel = "Qwen 3 0.6B Lite",
-        displayName = "Qwen 3 0.6B Lite — Ultra-Fast AI",
-        roleSummary = "Experimental • Ultra-light 4-bit GPU/CPU LLM (329 MB) for instant filler removal & cleanup",
+        displayName = "Qwen 3 0.6B Lite",
+        roleSummary = "0.32 GB • 4-bit model for light cleanup",
         sizeMb = 329,
         expectedBytes = 344_671_744L,
         isRequired = false,
@@ -95,8 +95,8 @@ enum class DesertAntModel(
     QWEN_3_0_6B(
         id = "qwen3_0_6b",
         shortLabel = "Qwen 3 0.6B",
-        displayName = "Qwen 3 0.6B — Fast & Light AI",
-        roleSummary = "Experimental • Recommended NPU/GPU/CPU LLM (585 MB) for fast multilingual cleanup, numbers & lists",
+        displayName = "Qwen 3 0.6B",
+        roleSummary = "0.57 GB • Compact model for multilingual cleanup",
         sizeMb = 585,
         expectedBytes = 613_722_264L,
         isRequired = false,
@@ -106,8 +106,8 @@ enum class DesertAntModel(
     QWEN_3_1_7B(
         id = "qwen3_1_7b",
         shortLabel = "Qwen 3 1.7B",
-        displayName = "Qwen 3 1.7B — Balanced AI",
-        roleSummary = "Experimental • Fast 4-bit GPU LLM (932 MB) balancing sub-second speed with smart backtrack editing",
+        displayName = "Qwen 3 1.7B",
+        roleSummary = "0.91 GB • Mid-size model for multi-clause edits",
         sizeMb = 932,
         expectedBytes = 977_184_032L,
         isRequired = false,
@@ -117,8 +117,8 @@ enum class DesertAntModel(
     QWEN_2_5_1_5B(
         id = "qwen2_5_1_5b",
         shortLabel = "Qwen 2.5 1.5B",
-        displayName = "Qwen 2.5 1.5B — Direct Instruct AI",
-        roleSummary = "Experimental • Direct non-thinking INT8 LLM (1,524 MB) for instant zero-thought GPU/CPU cleanup",
+        displayName = "Qwen 2.5 1.5B Instruct",
+        roleSummary = "1.49 GB • Direct non-thinking instruct model",
         sizeMb = 1524,
         expectedBytes = 1_597_922_856L,
         isRequired = false,
@@ -128,14 +128,17 @@ enum class DesertAntModel(
     GEMMA_4_E2B(
         id = "gemma4_e2b",
         shortLabel = "Gemma 4 E2B",
-        displayName = "Gemma 4 E2B — Flagship Max Quality",
-        roleSummary = "Experimental • Flagship Google Gemma 4 E2B LLM (2,468 MB) on NPU for nuanced Wispr Flow reformatting",
+        displayName = "Gemma 4 E2B",
+        roleSummary = "2.41 GB • Largest model for complex edits",
         sizeMb = 2468,
         expectedBytes = 2_588_147_712L,
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
     );
+
+    val sizeGbLabel: String
+        get() = String.format(Locale.US, "%.2f GB", expectedBytes.toDouble() / (1024.0 * 1024.0 * 1024.0))
 }
 
 /**
@@ -184,9 +187,9 @@ enum class LlmModelChoice(
         desertAntModel = DesertAntModel.QWEN_3_0_6B_LITE,
         modelFileName = "Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm",
         title = "Qwen 3 0.6B Lite",
-        badgeLabel = "TINY & FASTEST",
-        speedAndRamSummary = "329 MB download • ~350 MB RAM • Ultra-fast GPU / CPU",
-        description = "Smallest 4-bit model (~70+ tok/s on GPU). Best for instant filler removal, numbers & light cleanup on any phone (4 GB+ RAM).",
+        badgeLabel = "LITE",
+        speedAndRamSummary = "0.32 GB",
+        description = "4-bit light cleanup",
         estimatedStandaloneRamMb = 480,
         estimatedIncrementalRamMb = 350,
         supportsThinking = true,
@@ -204,8 +207,8 @@ enum class LlmModelChoice(
         modelFileName = "Qwen3-0.6B.litertlm",
         title = "Qwen 3 0.6B",
         badgeLabel = "RECOMMENDED",
-        speedAndRamSummary = "585 MB download • ~450 MB RAM • NPU / GPU / CPU",
-        description = "Best all-round light model. Runs natively on NPU, GPU, or CPU with crisp multilingual cleanup, numbers & list formatting (6 GB+ RAM).",
+        speedAndRamSummary = "0.57 GB",
+        description = "Compact multilingual cleanup",
         estimatedStandaloneRamMb = 650,
         estimatedIncrementalRamMb = 450,
         supportsThinking = true,
@@ -223,8 +226,8 @@ enum class LlmModelChoice(
         modelFileName = "Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm",
         title = "Qwen 3 1.7B",
         badgeLabel = "BALANCED",
-        speedAndRamSummary = "932 MB download • ~650 MB RAM • Fast 4-bit GPU",
-        description = "Sweet spot of sub-second GPU speed (~41 tok/s) and stronger multi-clause backtrack & list understanding (6 GB+ RAM).",
+        speedAndRamSummary = "0.91 GB",
+        description = "Mid-size multi-clause edits",
         estimatedStandaloneRamMb = 1_050,
         estimatedIncrementalRamMb = 650,
         supportsThinking = true,
@@ -241,9 +244,9 @@ enum class LlmModelChoice(
         desertAntModel = DesertAntModel.QWEN_2_5_1_5B,
         modelFileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
         title = "Qwen 2.5 1.5B Instruct",
-        badgeLabel = "ZERO-THINK",
-        speedAndRamSummary = "1,524 MB download • ~750 MB RAM • Direct GPU / CPU",
-        description = "Direct instruction-tuned INT8 model with zero thinking step (~31–34 tok/s on GPU & CPU). Instant first-token output (6 GB+ RAM).",
+        badgeLabel = "INSTRUCT",
+        speedAndRamSummary = "1.49 GB",
+        description = "Direct non-thinking instruct",
         estimatedStandaloneRamMb = 1_450,
         estimatedIncrementalRamMb = 750,
         supportsThinking = false,
@@ -260,20 +263,23 @@ enum class LlmModelChoice(
         desertAntModel = DesertAntModel.GEMMA_4_E2B,
         modelFileName = "gemma-4-E2B-it.litertlm",
         title = "Gemma 4 E2B",
-        badgeLabel = "MAX QUALITY",
-        speedAndRamSummary = "2,468 MB download • ~850 MB RAM • NPU Flagship",
-        description = "Largest flagship Google Gemma 4 model on NPU/GPU. Highest accuracy on complex mid-sentence backtracks, nuance & custom prompts (8 GB+ RAM).",
+        badgeLabel = "FLAGSHIP",
+        speedAndRamSummary = "2.41 GB",
+        description = "Flagship reasoning & structure",
         estimatedStandaloneRamMb = 1_900,
         estimatedIncrementalRamMb = 850,
         supportsThinking = true,
         supportsNpuBackend = true,
         promptTier = LlmPromptTier.FLAGSHIP_GEMMA_4,
         preferredMaxContextTokens = 2_048,
-        thinkingTokenBudgetCap = 144,
+        thinkingTokenBudgetCap = 256,
         samplerTopK = 20,
         samplerTopP = 0.90,
         samplerTemperature = 0.10
     );
+
+    val sizeGbLabel: String
+        get() = desertAntModel.sizeGbLabel
 
     val shortLabel: String
         get() = desertAntModel.shortLabel
@@ -308,40 +314,40 @@ enum class GemmaPromptPreset(
         title = "Wispr Flow Auto-Edit (Default)",
         shortLabel = "Auto-Edit",
         subtitle = "Resolves mid-sentence backtracks, strips fillers, auto-formats spoken lists, numbers, dates, emails & app-aware layout",
-        defaultSystemPrompt = """Transform raw spoken dictation into clean, natural, ready-to-send written text — exactly as the speaker intended it to read — while preserving their authentic voice, tone, word choice, and language:
-- Course-correction & backtracks: When the speaker changes their mind mid-thought ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine', 'besser gesagt'), discard BOTH the retracted phrase and the repair cue, keeping only the final intended words. Keep genuine logical contrasts ('not X, but Y').
-- Disfluencies & pauses: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), abandoned false starts, and discourse fillers ('like', 'you know', 'sort of' ONLY when used as hesitation — never remove literal verbs or comparisons like 'I like this' or 'looks like'). Repair false mid-sentence pause periods and broken capitalization.
-- Smart list detection: Automatically format clear spoken sequences ('first... second... third...', 'one... two... three...', '1... 2... 3...', 'erstens... zweitens...') as vertical numbered lists ('1. ', '2. ') with a colon (':') on any lead-in clause, and spoken bullet cues ('bullet point', 'dash item') as '- ' bullet lists. Keep short casual inline series ('milk, eggs, and bread') inline.
-- Numbers, dates & units: Spell out standalone counts one through nine in ordinary prose (and idioms like 'one of the', 'a couple of', 'ein paar'), and convert 10+ plus all decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), version numbers ('2.8.0'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C') into clean digits matching the transcript language.
-- Tech terms, emails & structure: Capitalize acronyms and code identifiers accurately ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format dictated email addresses and URLs ('name@example.com'), apply explicit spoken cues ('new line' / 'neue Zeile', 'new paragraph' / 'neuer Absatz') as real breaks (removing the cue), separate spoken greetings/sign-offs cleanly, and never inject corporate buzzwords or unrequested formality."""
+        defaultSystemPrompt = """Edit raw spoken dictation into clean, natural, ready-to-send text in the speaker's exact voice, tone, and language:
+1. Self-corrections & backtracks: When the speaker retracts or revises words mid-thought ('wait', 'no wait', 'wait no', 'actually', 'actually sorry', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'oder nein', 'ich meine', 'besser gesagt'), delete BOTH the abandoned phrase and the repair cue, keeping ONLY the final intended wording. Keep genuine contrasts ('not X, but Y').
+2. Fillers, stutters & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word stutters ('the the', 'I I'), false starts, and hesitation 'like' / 'you know' / 'sort of' (never remove literal uses like 'I like this' or 'looks like'). Repair false mid-sentence pause periods, capitalization, and punctuation; keep spoken questions as questions.
+3. Vertical numbered & bulleted lists: Format spoken enumerations ('number one... number two... number three...', 'first... second... third...', 'one... two... three...', 'point one... point two...', 'item one... item two...', 'erstens... zweitens...', 'punkt eins... punkt zwei...') with a colon ':' on any lead-in clause (replacing spoken 'colon' / 'doppelpunkt') and put EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' (stripping the spoken cue). Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
+4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and model names ('Qwen 3 0.6B', 'Gemma 4 E2B'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
+5. Paragraphs, emails & tech casing: Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') removing the cue, format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev'), capitalize technical terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'camelCase', 'snake_case'), and separate spoken greetings/sign-offs without inventing unspoken ones."""
     ),
     STRICT_CLEANUP(
         id = "strict_cleanup",
         title = "Light Cleanup (Verbatim)",
         shortLabel = "Light Cleanup",
         subtitle = "Verbatim cleanup: strips fillers, stutters & obvious backtracks, formats numbers/units & fixes punctuation with zero rephrasing",
-        defaultSystemPrompt = "Perform light, verbatim dictation cleanup: remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and obvious mid-phrase self-corrections (keeping only the intended correction), convert spoken decimals, percentages, currencies, dates, times, version numbers, measurements, and 10+ counts into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and repair broken punctuation, mid-sentence pause periods, and capitalization. Never rephrase, reorder, summarize, or alter the speaker's vocabulary."
+        defaultSystemPrompt = "Perform light, verbatim dictation cleanup: remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and obvious mid-phrase self-corrections (keeping only the intended correction), convert spoken decimals, percentages, currencies, dates, times, version numbers, measurements/units ('0 MB', '6 GB', '380 ms'), and 10+ counts into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API'), and repair broken punctuation, mid-sentence pause periods, and capitalization. Never rephrase, reorder, summarize, or alter the speaker's vocabulary."
     ),
     CONCISE_DIRECT(
         id = "concise_direct",
         title = "Crisp & Direct",
         shortLabel = "Crisp",
         subtitle = "Resolves backtracks and tightens rambling spoken thoughts into crisp, scannable sentences, lists & clean numbers",
-        defaultSystemPrompt = "Edit the spoken dictation into crisp, concise, scannable text. Resolve all mid-sentence backtracks and self-corrections, strip vocal fillers, hedging, and redundant phrasing, format multi-item enumerations as clean lists, and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units accurately while preserving every fact, name, and the speaker's original language."
+        defaultSystemPrompt = "Edit the spoken dictation into crisp, concise, scannable text. Resolve all mid-sentence backtracks and self-corrections, strip vocal fillers, hedging, and redundant phrasing, place multi-item enumerations on separate '1. ' or '- ' lines after a ':', and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units accurately as digits while preserving every fact, name, and the speaker's original language."
     ),
     PROFESSIONAL_MESSAGE(
         id = "professional_message",
         title = "Email & Work Message",
         shortLabel = "Email / Work",
         subtitle = "Structures emails & work messages with clean greeting/sign-off spacing, paragraphs, action lists & accurate numbers",
-        defaultSystemPrompt = "Format the spoken dictation into a natural, well-structured email or work message. Resolve all mid-sentence self-corrections and remove vocal hesitations, place spoken greetings (e.g., 'Hi Sarah,') and sign-offs (e.g., 'Best,\\nAlex') on separate lines with clean paragraph breaks, format multi-step action items as numbered or bulleted lists, and convert spoken numbers, dates, times, currencies, versions, and units into clean written digits in the speaker's original language without inventing placeholders or greetings that were not spoken."
+        defaultSystemPrompt = "Format the spoken dictation into a natural, well-structured email or work message. Resolve all mid-sentence self-corrections and remove vocal hesitations, place spoken greetings (e.g., 'Hi Sarah,') and sign-offs (e.g., 'Best,\\nAlex') on separate lines with clean paragraph breaks, place multi-step action items on separate '1. ' or '- ' lines, and convert spoken numbers, dates, times, currencies, versions, and units into clean written digits in the speaker's original language without inventing placeholders or greetings that were not spoken."
     ),
     STRUCTURED_NOTES(
         id = "structured_notes",
         title = "Structured Lists & Notes",
         shortLabel = "Lists & Notes",
         subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean bulleted or numbered lists with backtrack cleanup",
-        defaultSystemPrompt = "Transform the spoken dictation into a clean, scannable set of structured notes using '- ' bullet points (or '1. ' numbered steps when sequential). Resolve mid-sentence self-corrections, remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related action items logically, and preserve the speaker's original language."
+        defaultSystemPrompt = "Transform the spoken dictation into a clean, scannable set of structured notes with each point on its own '- ' bullet line (or '1. ' numbered line when sequential). Resolve mid-sentence self-corrections, remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related action items logically, and preserve the speaker's original language."
     ),
     CUSTOM(
         id = "custom",
@@ -358,14 +364,14 @@ enum class GemmaPromptPreset(
     fun promptForModel(llmChoice: LlmModelChoice): String = when (llmChoice.promptTier) {
         LlmPromptTier.COMPACT_0_6B -> when (this) {
             CLEAN_AND_POLISH -> """Clean and format the dictated speech while keeping the speaker's exact meaning, tone, and language:
-- Self-corrections: When the speaker corrects themselves ('wait', 'no wait', 'actually', 'I mean', 'make that', 'nein warte', 'ich meine'), keep ONLY the final intended phrase.
+- Self-corrections: When the speaker corrects themselves ('wait', 'no wait', 'actually', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'ich meine'), keep ONLY the final intended phrase.
 - Fillers & punctuation: Remove hesitation sounds ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('I I', 'the the'), and false mid-sentence periods. Fix capitalization and sentence punctuation. Keep spoken questions as questions.
-- Lists: Format spoken sequences ('first... second... third...', 'erstens... zweitens...') as '1. ', '2. ' numbered lines after a ':', and 'bullet point' cues as '- ' lines. Keep short inline series ('milk, eggs, and bread') on one line.
-- Numbers & tech: Write 10+, decimals ('3.5'), percentages ('25%'), money ('$1,500', '49,99 €'), times ('3:30 PM', '14:30'), versions ('2.8.0'), and units ('8 GB', '500 ms') as digits; keep one to nine as words in prose. Capitalize acronyms ('NPU', 'GPU', 'RAM', 'API', 'GitHub') and format spoken emails ('name@example.com')."""
-            STRICT_CLEANUP -> "Clean the dictated text verbatim: remove fillers ('um', 'uh', 'äh', 'ähm', 'hm'), stutters, and mid-sentence self-corrections (keep only the correction), write 10+, decimals, times, money, versions, and units ('8 GB', '500 ms') as digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'API'), and fix punctuation and capitalization without changing the speaker's words."
-            CONCISE_DIRECT -> "Rewrite the dictated speech into short, clear, direct sentences in the same language. Keep only the final wording after any self-correction, strip all fillers and repetition, use '1. ' or '- ' lists for multiple items, and write numbers, times, money, versions, and units cleanly as digits while keeping all facts."
-            PROFESSIONAL_MESSAGE -> "Format the dictated speech as a clean email or work message in the same language. Remove fillers and self-corrections, put spoken greetings ('Hi Sarah,') and sign-offs ('Best,\\nAlex') on separate lines, format action items as '1. ' or '- ' lists, and write dates, times, money, versions, and units as digits. Do not invent greetings that were not spoken."
-            STRUCTURED_NOTES -> "Turn the dictated speech into clean '- ' bullet notes (or '1. ' numbered steps for sequences) in the same language. Remove fillers and self-corrections, and format numbers, times, dates, versions, and units as digits."
+- Lists: Format spoken sequences ('number one... number two...', 'first... second... third...', 'erstens... zweitens...') with each item on its own new line ('1. ', '2. ') after ':', and 'bullet point' cues as '- ' lines. Keep short inline series ('milk, eggs, and bread') on one line.
+- Numbers & tech: Use digits whenever paired with units, times, dates, money, percents, versions, or model names ('0 MB', '6 GB', '5 minutes', '380 ms', '25%', '$1,500', '3:30 PM', '2.8.0', 'Qwen 3 0.6B') and for 10+; keep standalone one to nine as words in prose. Capitalize acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API', 'GitHub') and format spoken emails ('name@example.com')."""
+            STRICT_CLEANUP -> "Clean the dictated text verbatim: remove fillers ('um', 'uh', 'äh', 'ähm', 'hm'), stutters, and mid-sentence self-corrections (keep only the correction), write 10+, decimals, times, money, versions, and units ('0 MB', '8 GB', '500 ms') as digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'API'), and fix punctuation and capitalization without changing the speaker's words."
+            CONCISE_DIRECT -> "Rewrite the dictated speech into short, clear, direct sentences in the same language. Keep only the final wording after any self-correction, strip all fillers and repetition, put multiple enumerated items on separate '1. ' or '- ' lines, and write numbers, times, money, versions, and units cleanly as digits while keeping all facts."
+            PROFESSIONAL_MESSAGE -> "Format the dictated speech as a clean email or work message in the same language. Remove fillers and self-corrections, put spoken greetings ('Hi Sarah,') and sign-offs ('Best,\\nAlex') on separate lines, put action items on separate '1. ' or '- ' lines, and write dates, times, money, versions, and units as digits. Do not invent greetings that were not spoken."
+            STRUCTURED_NOTES -> "Turn the dictated speech into clean '- ' bullet notes (or '1. ' numbered lines for sequences), one item per line, in the same language. Remove fillers and self-corrections, and format numbers, times, dates, versions, and units as digits."
             CUSTOM -> defaultSystemPrompt
         }
 
@@ -373,8 +379,8 @@ enum class GemmaPromptPreset(
             CLEAN_AND_POLISH -> """Act as a deterministic speech-to-text cleanup filter (NOT a conversational assistant). Output the speaker's dictated message cleaned and formatted in their own voice and language:
 - Backtracks & self-repairs: If the speaker retracts words mid-sentence ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'make that', 'scratch that', 'nein warte', 'ich meine'), delete both the retracted words and the repair cue, keeping only the corrected wording. Preserve real contrasts ('not X, but Y').
 - Disfluencies & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word repeats ('the the'), and filler 'like'/'you know' when used purely as hesitation (keep literal uses like 'I like this'). Fix false pause periods and capitalization. Preserve questions as questions — never answer them.
-- Automatic lists: Turn explicit spoken enumerations ('first... second... third...', 'one... two... three...', 'erstens... zweitens...') into vertical '1. ', '2. ' lists with a ':' on the lead-in phrase, and 'bullet point'/'dash' cues into '- ' bullets. Keep casual 3-item inline phrases inline.
-- Numbers, dates & tech: Spell out standalone counts one through nine in prose, and use digits for 10+, decimals ('3.5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, times ('3:30 PM', '14:30'), versions ('2.8.0'), ranges ('10–15'), and units ('8 GB', '500 ms', '16 kHz'). Capitalize acronyms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'GitHub'), format dictated emails ('name@example.com'), and apply spoken 'new line'/'new paragraph' breaks cleanly."""
+- Automatic vertical lists: Turn spoken enumerations ('number one... number two...', 'first... second... third...', 'one... two... three...', 'erstens... zweitens...') into vertical '1. ', '2. ' lines (each on its own new line after ':'), and 'bullet point'/'dash' cues into '- ' lines. Keep casual 3-item inline phrases inline.
+- Numbers, dates & tech: Use digits for any number paired with a unit, time, date, percent, currency, version, or model name ('0 MB', '8 GB', '500 ms', '5 minutes', '25%', '$1,500', '3:30 PM', '2.8.0', 'Qwen 3 0.6B') and for standalone 10+; spell out standalone counts one through nine in prose. Capitalize acronyms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'GitHub'), format dictated emails ('name@example.com'), and apply spoken 'new line'/'new paragraph' breaks cleanly."""
             STRICT_CLEANUP -> "Act strictly as a verbatim transcript cleaner (never reply as an assistant): remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and mid-sentence self-repairs (keeping only the intended repair), convert 10+, decimals, percentages, currencies, dates, times, versions, and units into digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and fix punctuation and capitalization without rephrasing."
             else -> defaultSystemPrompt
         }
@@ -383,13 +389,49 @@ enum class GemmaPromptPreset(
             CLEAN_AND_POLISH -> """Edit raw spoken dictation into clean, natural written text that reads smoothly while keeping the speaker's exact voice, tone, intent, and language:
 - Mid-sentence backtracks: When the speaker changes course ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine'), remove both the abandoned phrase and the repair cue, keeping only the final intended words. Keep true contrasts ('not X, but Y').
 - Fillers & punctuation: Strip vocal hesitations ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), false starts, and hesitation 'like'/'you know' (never remove literal 'like' in 'I like this' or 'looks like'). Repair mid-sentence pause periods and capitalization.
-- Smart list layout: Format clear spoken sequences ('first... second... third...', 'one... two... three...', 'erstens... zweitens...') as vertical '1. ', '2. ' lists with a colon ':' after any lead-in clause, and 'bullet point'/'dash item' cues as '- ' lists. Keep short casual series ('milk, eggs, and bread') inline.
-- Numbers, times & units: Spell out standalone counts one to nine in ordinary prose (and idioms like 'one of the', 'a couple of'), and format 10+, decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), versions ('2.8.0'), ranges ('10–15'), and units ('8 GB', '500 ms', '16 kHz', '24 °C') as clean digits.
-- Tech terms, emails & breaks: Capitalize acronyms & identifiers ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format spoken emails/URLs ('name@example.com'), and turn explicit spoken 'new line'/'new paragraph' cues into line breaks without adding unrequested formality."""
+- Vertical list layout: Format spoken sequences ('number one... number two...', 'first... second... third...', 'one... two... three...', 'erstens... zweitens...') with ':' after any lead-in clause and EVERY item on its own new line ('1. ', '2. '), and 'bullet point'/'dash item' cues as '- ' lines. Keep short casual series ('milk, eggs, and bread') inline.
+- Numbers, times & units: Always use digits when paired with units, times, dates, percents, currencies, versions, or model names ('0 MB', '6 GB', '1.9 GB', '380 ms', '5 minutes', '25%', '$1,500', '49,99 €', '3:30 PM', '14:30', '2.8.0', 'Gemma 4 E2B') and for standalone 10+; spell out standalone counts one to nine in ordinary prose.
+- Tech terms, emails & breaks: Capitalize acronyms & identifiers ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format spoken emails/URLs ('name@example.com'), and turn explicit spoken 'new line'/'new paragraph' cues into line breaks without adding unrequested formality."""
             else -> defaultSystemPrompt
         }
 
-        LlmPromptTier.FLAGSHIP_GEMMA_4 -> defaultSystemPrompt
+        LlmPromptTier.FLAGSHIP_GEMMA_4 -> when (this) {
+            CLEAN_AND_POLISH -> """Edit raw spoken dictation into clean, natural, ready-to-send text in the speaker's exact voice, tone, and language:
+1. Course-correction & backtracks:
+   - Delete BOTH retracted phrases and spoken repair cues ('wait', 'no wait', 'wait no', 'actually', 'actually sorry', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'oder nein', 'ich meine', 'besser gesagt'), keeping ONLY the final intended wording (e.g., 'eight gigabytes wait no make that six gigabytes' -> '6 GB'; 'two point one gigabytes actually sorry one point nine gigabytes' -> '1.9 GB').
+   - Keep genuine contrasts ('not Monday morning', 'not X, but Y').
+2. Fillers, stutters & sentence flow:
+   - Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word stutters ('the the', 'I I'), false starts, and filler 'like' / 'you know' / 'sort of' ONLY when used as hesitation (keep literal 'I like this' or 'looks like').
+   - Fix false mid-sentence pause periods, run-on clauses, capitalization, and punctuation; keep spoken questions as questions ('?').
+3. Smart list detection (vertical numbered & bulleted lists):
+   - Detect spoken sequences ('number one... number two... number three...', 'first... second... third...', 'one... two... three...', 'point one... point two...', 'item one... item two...', 'erstens... zweitens...', 'punkt eins... punkt zwei...').
+   - End any lead-in clause with ':' (replacing spoken 'colon' / 'doppelpunkt'), strip the spoken cue ('number one', 'first'), and place EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' — NEVER write '1. ... 2. ... 3. ...' inline on one paragraph line.
+   - Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
+4. Numbers, dates & units:
+   - ALWAYS use digits (including 0–9) when paired with ANY unit, time, date, percent, currency, version, or model/spec name: percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30', 'November 24, 2026'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '1,500 MB', '380 ms', '42.5 tokens/s', '5 minutes', '30 seconds', '2,048 tokens'), and model names ('Qwen 3 0.6B', 'Gemma 4 E2B').
+   - Spell out standalone prose counts one through nine ONLY when not paired with a unit ('three local models', 'four things'), and use digits for standalone 10+.
+5. Paragraphs, emails & technical terms:
+   - Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') and delete the cue words.
+   - Format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev', 'acme dash corp dot com' -> 'acme-corp.com').
+   - Capitalize acronyms, products & code identifiers ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'LiteRT-LM', 'Voz', 'camelCase', 'snake_case') and separate spoken greetings/sign-offs cleanly without inventing unspoken ones."""
+            STRICT_CLEANUP -> """Perform strict verbatim dictation cleanup in the speaker's exact language and wording:
+1. Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the'), and mid-sentence self-corrections ('wait no', 'scratch that', 'actually make that'), keeping only the intended repair.
+2. Convert spoken decimals, percentages, currencies, clock times, dates, version numbers, 10+ counts, and ALL numbers paired with units or model names ('0 MB', '6 GB', '380 ms', '5 minutes', 'Gemma 4 E2B') into clean digits.
+3. Format spoken emails ('name@domain.com'), capitalize standard acronyms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'GitHub'), apply explicit 'new line' / 'new paragraph' cues, and fix punctuation and capitalization without rephrasing or reordering words."""
+            CONCISE_DIRECT -> """Edit spoken dictation into crisp, high-signal, scannable text in the speaker's exact language:
+1. Resolve all mid-sentence self-corrections and strip fillers, hedging, throat-clearing, and wordy repetition while keeping 100% of facts, names, constraints, and numbers.
+2. Put multi-item enumerations ('number one... number two...', 'first... second...') onto separate vertical '1. ', '2. ' or '- ' lines after a ':' — never cram multiple numbered items onto one line.
+3. Write all units, specs, percentages, currencies, times, dates, version numbers, model names ('0 MB', '6 GB', '380 ms', '98%', '4:45 PM', 'v2.10'), and 10+ counts as clean digits, format spoken emails, and capitalize technical acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API')."""
+            PROFESSIONAL_MESSAGE -> """Format spoken dictation into a polished, natural email or work message in the speaker's exact language:
+1. Resolve all mid-sentence self-corrections and strip vocal fillers while keeping a warm, authentic human voice (zero stiff corporate clichés).
+2. Place spoken greetings ('Hi Sarah,') on their own opening line followed by a blank line, organize distinct topics into clear paragraphs, put multi-step action items on separate vertical '1. ' or '- ' lines after ':', and place spoken sign-offs ('Thanks,\nAlex') at the end without inventing unspoken greetings or sign-offs.
+3. Format all numbers with units, times, dates, percentages, currencies, version numbers, spoken emails ('name@company.com'), and technical acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API') cleanly."""
+            STRUCTURED_NOTES -> """Transform spoken dictation into clean, scannable structured notes in the speaker's exact language:
+1. Place EVERY distinct point or action item on its own vertical '- ' bullet line (or '1. ', '2. ', '3. ' numbered lines when sequential), keeping any brief spoken topic header above the list ending with ':'.
+2. Resolve all mid-sentence self-corrections, remove fillers and stutters, and tighten phrasing into crisp note items without losing any detail.
+3. Format all numbers with units ('0 MB', '6 GB', '380 ms', '5 minutes'), percentages, currencies, dates, times, version numbers, model names, spoken emails, and technical acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API') accurately."""
+            CUSTOM -> defaultSystemPrompt
+        }
     }
 
     companion object {
@@ -454,7 +496,8 @@ data class ModelSettings(
     val gemmaCustomPrompt: String = "",
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
-    val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO
+    val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
+    val modelAutoUnloadMinutes: Int = DEFAULT_MODEL_AUTO_UNLOAD_MINUTES
 ) {
     /**
      * `Voz` is the core STT engine and cannot be disabled.
@@ -511,6 +554,9 @@ data class ModelSettings(
         DesertAntModel.GEMMA_4_E2B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
     }
 
+    val autoUnloadSummary: String
+        get() = autoUnloadSummary(modelAutoUnloadMinutes)
+
     fun enabledModels(): List<DesertAntModel> = buildList {
         add(DesertAntModel.VOZ)
         if (earEnabled) add(DesertAntModel.EAR)
@@ -531,7 +577,43 @@ data class ModelSettings(
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
+        const val KEY_MODEL_AUTO_UNLOAD_MINUTES = "model_auto_unload_minutes"
         const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
+
+        const val DEFAULT_MODEL_AUTO_UNLOAD_MINUTES = 5
+        const val AUTO_UNLOAD_IMMEDIATELY = 0
+        const val AUTO_UNLOAD_NEVER = -1
+
+        /**
+         * Selectable idle auto-unload presets in minutes (`0` = unload immediately after dictation,
+         * `-1` = keep loaded until Android OS requests memory).
+         */
+        val AUTO_UNLOAD_OPTIONS_MINUTES: List<Int> = listOf(0, 1, 2, 5, 10, 15, 30, -1)
+
+        fun sanitizeAutoUnloadMinutes(raw: Int): Int {
+            return when {
+                raw == AUTO_UNLOAD_NEVER -> AUTO_UNLOAD_NEVER
+                raw in 0..120 -> raw
+                else -> DEFAULT_MODEL_AUTO_UNLOAD_MINUTES
+            }
+        }
+
+        fun autoUnloadChipLabel(minutes: Int): String = when (minutes) {
+            AUTO_UNLOAD_IMMEDIATELY -> "Immediately"
+            AUTO_UNLOAD_NEVER -> "Never"
+            else -> "${minutes}m"
+        }
+
+        fun autoUnloadSummary(minutes: Int): String = when (minutes) {
+            AUTO_UNLOAD_IMMEDIATELY ->
+                "Unloads all models to 0 MB immediately after each dictation — maximum battery & RAM savings; reloads automatically while you speak when the bubble is tapped."
+            AUTO_UNLOAD_NEVER ->
+                "Keeps loaded models warm in RAM once the bubble is tapped (evicts only under Android low-memory pressure)."
+            1 ->
+                "Unloads all models (Voz, Ear, Punct & LLM) to 0 MB after 1 minute of inactivity and reloads only when the bubble is tapped."
+            else ->
+                "Unloads all models (Voz, Ear, Punct & LLM) to 0 MB after $minutes minutes of inactivity and reloads only when the bubble is tapped."
+        }
 
         fun defaultPreferredLanguage(): String {
             val systemLang = Locale.getDefault().language.lowercase(Locale.ROOT)
@@ -566,6 +648,10 @@ data class ModelSettings(
                 LlmModelChoice.QWEN_3_0_6B
             }
 
+            val autoUnloadMinutes = sanitizeAutoUnloadMinutes(
+                prefs.getInt(KEY_MODEL_AUTO_UNLOAD_MINUTES, DEFAULT_MODEL_AUTO_UNLOAD_MINUTES)
+            )
+
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
@@ -577,7 +663,8 @@ data class ModelSettings(
                 gemmaCustomPrompt = customPrompt,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
-                hardwareAccelerator = accel
+                hardwareAccelerator = accel,
+                modelAutoUnloadMinutes = autoUnloadMinutes
             )
         }
 
@@ -595,6 +682,7 @@ data class ModelSettings(
             } else {
                 defaultPreferredLanguage()
             }
+            val validAutoUnload = sanitizeAutoUnloadMinutes(settings.modelAutoUnloadMinutes)
 
             getPreferences(context).edit()
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
@@ -608,6 +696,7 @@ data class ModelSettings(
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
+                .putInt(KEY_MODEL_AUTO_UNLOAD_MINUTES, validAutoUnload)
                 .apply()
         }
 

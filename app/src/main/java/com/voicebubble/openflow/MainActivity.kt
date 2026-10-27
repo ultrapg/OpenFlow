@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
                 requiresOnboarding = !allReady
                 isCheckingModels = false
                 if (allReady) {
-                    SmartPipeline.getInstance(context).initializeAsync(warmUp = true)
+                    SmartPipeline.getInstance(context).refreshStatusSnapshot()
                     FloatingBubbleService.ensureRunningIfEnabled(context, reason = "main_activity_launch")
                 }
             }
@@ -185,9 +185,9 @@ class MainActivity : ComponentActivity() {
                             val isDeveloperModeUnlocked by DebugLogManager.isUnlocked.collectAsState()
                             val appVersionName = remember {
                                 try {
-                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.9.0"
+                                    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.11.0"
                                 } catch (_: Throwable) {
-                                    "2.10.0"
+                                    "2.11.0"
                                 }
                             }
                             var versionTapCount by remember { mutableIntStateOf(0) }

@@ -2134,4 +2134,113 @@ class SmartPipelineTest {
         )
         assertEquals(800.0 / 525.0, result.speedupFactor!!, 0.001)
     }
+
+    @Test
+    fun `ModelSettings auto-unload defaults to 5 minutes, sanitizes invalid values, and formats labels`() {
+        val defaults = ModelSettings()
+        assertEquals(ModelSettings.DEFAULT_MODEL_AUTO_UNLOAD_MINUTES, defaults.modelAutoUnloadMinutes)
+        assertEquals(5, defaults.modelAutoUnloadMinutes)
+
+        assertEquals(0, ModelSettings.sanitizeAutoUnloadMinutes(0))
+        assertEquals(-1, ModelSettings.sanitizeAutoUnloadMinutes(-1))
+        assertEquals(15, ModelSettings.sanitizeAutoUnloadMinutes(15))
+        assertEquals(5, ModelSettings.sanitizeAutoUnloadMinutes(999))
+        assertEquals(5, ModelSettings.sanitizeAutoUnloadMinutes(-42))
+
+        assertEquals("Immediately", ModelSettings.autoUnloadChipLabel(0))
+        assertEquals("5m", ModelSettings.autoUnloadChipLabel(5))
+        assertEquals("Never", ModelSettings.autoUnloadChipLabel(-1))
+
+        assertTrue(ModelSettings(modelAutoUnloadMinutes = 0).autoUnloadSummary.contains("immediately"))
+        assertTrue(ModelSettings(modelAutoUnloadMinutes = 10).autoUnloadSummary.contains("10 min"))
+        assertTrue(ModelSettings(modelAutoUnloadMinutes = -1).autoUnloadSummary.contains("tapped"))
+    }
+
+    @Test
+    fun `LlmModelChoice descriptions show exact GB sizes with concise copy and zero speed or RAM claims`() {
+        val gbPattern = Regex("""^\d+\.\d{2} GB$""")
+        val forbiddenClaimPattern = Regex(
+            """\b(tok/s|tokens?/s|ram|gb\+|mb\b|ultra-fast|fastest|sub-second)\b""",
+            RegexOption.IGNORE_CASE
+        )
+
+        for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+            assertTrue(
+                "Expected X.XX GB for ${choice.id}, got '${choice.speedAndRamSummary}'",
+                gbPattern.matches(choice.speedAndRamSummary)
+            )
+            assertEquals(choice.desertAntModel.sizeGbLabel, choice.sizeGbLabel)
+            assertEquals(choice.sizeGbLabel, choice.speedAndRamSummary)
+            assertTrue(
+                "Description for ${choice.id} must be short (<= 38 chars), got '${choice.description}'",
+                choice.description.length in 8..38
+            )
+            assertFalse(
+                "Description for ${choice.id} must not make speed or RAM claims: '${choice.description}'",
+                forbiddenClaimPattern.containsMatchIn(choice.description)
+            )
+            assertFalse(
+                "Badge for ${choice.id} must not make speed or RAM claims: '${choice.badgeLabel}'",
+                forbiddenClaimPattern.containsMatchIn(choice.badgeLabel)
+            )
+        }
+    }
+
+    @Test
+    fun `Gemma 4 E2B upgraded prompt, inline list expansion, spoken colon normalization, and paragraph splitter work cleanly`() {
+        // 1. Dedicated Gemma 4 E2B prompts across presets + telegraphic <35 word thinking cap
+        for (preset in com.voicebubble.openflow.settings.GemmaPromptPreset.entries) {
+            val sysPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+                preset = preset,
+                disableThinking = false,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            )
+            assertTrue("Preset ${preset.id} must be non-blank for Gemma 4 E2B", sysPrompt.length > 200)
+            assertTrue("Gemma 4 E2B prompt must include <35 word thinking cap", sysPrompt.contains("under 35 words"))
+        }
+
+        // 2. Spoken "colon" before "number one" normalizes cleanly
+        val rawComplex = "Here is what we saw colon number one memory stayed low. Number two latency dropped. Number three tests passed."
+        val preNormalized = com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(rawComplex)
+        assertTrue(preNormalized.startsWith("Here is what we saw: number one"))
+
+        // 3. "number one ... number two" triggers adaptive thinking and prevents span-patch flattening
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = preNormalized,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            )
+        )
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
+                segment = preNormalized.repeat(3),
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            )
+        )
+
+        // 4. Inline single-line numbered lists expand onto clean vertical lines while ignoring decimals
+        val inlineModelOutput = "Hi team,\n\nHere is what we saw in v2.11: 1. Memory stayed at 0 MB on 6 GB devices. 2. First token latency dropped by 45%. 3. All 5 benchmarks passed.\n\nPlease ship today."
+        val expanded = com.voicebubble.openflow.core.speech.GemmaTextProcessor.expandInlineSequentialLists(inlineModelOutput)
+        assertEquals(
+            "Hi team,\n\nHere is what we saw in v2.11:\n1. Memory stayed at 0 MB on 6 GB devices.\n2. First token latency dropped by 45%.\n3. All 5 benchmarks passed.\n\nPlease ship today.",
+            expanded
+        )
+
+        // Decimals & version numbers without sequential list items must remain untouched
+        val decimalSentence = "Release 1. Build 2.11 uses 0.57 GB on disk."
+        assertEquals(
+            decimalSentence,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.expandInlineSequentialLists(decimalSentence)
+        )
+
+        // 5. splitLongTranscript preserves explicit paragraph breaks (\n\n)
+        val multiPara = "Hi Marcus,\n\nFirst paragraph sentence one. First paragraph sentence two.\n\nBest regards."
+        val splitParas = com.voicebubble.openflow.core.speech.GemmaTextProcessor.splitLongTranscript(
+            text = multiPara,
+            maxCharsPerSegment = 500
+        )
+        assertEquals(listOf(multiPara), splitParas)
+    }
 }

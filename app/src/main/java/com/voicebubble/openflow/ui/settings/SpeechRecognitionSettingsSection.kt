@@ -363,8 +363,9 @@ fun SpeechRecognitionSettingsSection(
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                         Spacer(modifier = Modifier.width(6.dp))
+                        val activeDiskGb = String.format(Locale.US, "%.2f GB", settings.activeDiskFootprintMb / 1024.0)
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount downloaded)",
+                            text = "Active Disk: $activeDiskGb ($downloadedCount downloaded)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -378,35 +379,84 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Peak RAM: ~${settings.estimatedPeakRamMb} MB",
+                            text = "Idle unload: ${ModelSettings.autoUnloadChipLabel(settings.modelAutoUnloadMinutes)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }
                 }
 
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.15f))
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "Auto-Unload All Models When Idle (Battery Saver)",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Text(
+                        text = settings.autoUnloadSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
+                    )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        ModelSettings.AUTO_UNLOAD_OPTIONS_MINUTES.forEach { minutes ->
+                            val selected = settings.modelAutoUnloadMinutes == minutes
+                            FilterChip(
+                                selected = selected,
+                                onClick = {
+                                    if (!selected) {
+                                        persistAndReload(settings.copy(modelAutoUnloadMinutes = minutes))
+                                    }
+                                },
+                                label = {
+                                    Text(ModelSettings.autoUnloadChipLabel(minutes))
+                                }
+                            )
+                        }
+                    }
+                }
+
                 val isWorking = pipelineStatus.phase == PipelinePhase.LOADING ||
                     pipelineStatus.phase == PipelinePhase.WARMING_UP ||
                     pipelineStatus.phase == PipelinePhase.TRANSCRIBING
-                OutlinedButton(
-                    onClick = { smartPipeline.initializeAsync(warmUp = true, forceReload = pipelineStatus.isReady) },
-                    enabled = !isWorking && !downloadState.isRunning,
-                    modifier = Modifier.fillMaxWidth()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        imageVector = if (pipelineStatus.isReady) Icons.Default.CheckCircle else Icons.Default.Bolt,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        when {
-                            isWorking -> "Loading & Warming Up Models..."
-                            pipelineStatus.loadedCount == pipelineStatus.enabledCount && pipelineStatus.isReady ->
-                                "All Enabled Models Loaded in RAM (Tap to Re-Warm)"
-                            else -> "Load & Warm Up Models in RAM Now"
+                    OutlinedButton(
+                        onClick = { smartPipeline.initializeAsync(warmUp = true, forceReload = pipelineStatus.isReady) },
+                        enabled = !isWorking && !downloadState.isRunning,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = if (pipelineStatus.isReady) Icons.Default.CheckCircle else Icons.Default.Bolt,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            when {
+                                isWorking -> "Loading..."
+                                pipelineStatus.loadedCount == pipelineStatus.enabledCount && pipelineStatus.isReady ->
+                                    "Re-Warm Models"
+                                else -> "Load Models Now"
+                            }
+                        )
+                    }
+                    if (pipelineStatus.loadedCount > 0) {
+                        OutlinedButton(
+                            onClick = { smartPipeline.evictAllModelsAsync(reason = "manual unload from Settings") },
+                            enabled = !isWorking
+                        ) {
+                            Text("Unload Now")
                         }
-                    )
+                    }
                 }
             }
         }
@@ -638,7 +688,7 @@ fun SpeechRecognitionSettingsSection(
                         color = MaterialTheme.colorScheme.tertiaryContainer
                     ) {
                         Text(
-                            text = "ON-DEMAND RAM",
+                            text = "OFFLINE AI",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onTertiaryContainer,
@@ -648,7 +698,7 @@ fun SpeechRecognitionSettingsSection(
                 }
 
                 Text(
-                    text = "Removes 'um'/'uh'/'like', fixes numbers & lists, or reformats speech 100% offline via LiteRT-LM. Strictly 1 AI model is ever loaded on demand when you dictate — idle RAM stays at 0 MB, and Punct is bypassed automatically. Off by default.",
+                    text = "Removes fillers ('um', 'uh'), self-corrections, and formats numbers & lists offline via LiteRT-LM. Off by default.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -665,7 +715,7 @@ fun SpeechRecognitionSettingsSection(
 
                 ModelToggleItem(
                     title = "Enable AI Post-Processing (${selectedLlm.title})",
-                    subtitle = "${selectedLlm.speedAndRamSummary} • Unloads automatically when idle",
+                    subtitle = "${selectedLlm.sizeGbLabel} • Auto-unloads when idle",
                     loadState = pipelineStatus.modelStates[selectedDesertModel],
                     checked = settings.gemmaEnabled || anyLlmPendingAutoEnable,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == selectedDesertModel),
@@ -679,12 +729,12 @@ fun SpeechRecognitionSettingsSection(
                 HorizontalDivider()
 
                 Text(
-                    text = "Choose AI Model (Only 1 Loaded at a Time)",
+                    text = "Choose AI Model",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "Prompts & token budgets automatically adapt to your selected model. Switching models immediately frees the previous model from RAM.",
+                    text = "Only one model is loaded on demand when you dictate.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -736,9 +786,9 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Text(
                             text = if (supportsThinking) {
-                                "Significantly speeds up cleanup and reformatting by skipping ${selectedLlm.title}'s reasoning step, though accuracy on complex edits may decrease. Off by default."
+                                "Skips ${selectedLlm.title}'s reasoning step for direct output. Off by default."
                             } else {
-                                "${selectedLlm.title} is a direct non-thinking model — it outputs cleaned text immediately with zero reasoning overhead."
+                                "${selectedLlm.title} is a direct non-thinking model."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -774,12 +824,12 @@ fun SpeechRecognitionSettingsSection(
                                 .padding(end = 12.dp)
                         ) {
                             Text(
-                                text = "Adaptive Smart Thinking (Faster)",
+                                text = "Adaptive Smart Thinking",
                                 style = MaterialTheme.typography.bodyLarge,
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                text = "Skips reasoning tokens on everyday sentences, fillers & numbers for 2×–4× faster cleanup, and automatically enables thinking only on self-corrections, spoken lists, or structural rewrites. On by default.",
+                                text = "Uses reasoning only on self-corrections, spoken lists, or structural rewrites, and outputs directly on simple sentences. On by default.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1127,12 +1177,13 @@ fun SpeechRecognitionSettingsSection(
                                 fontWeight = FontWeight.Medium
                             )
                             val loadState = pipelineStatus.modelStates[model]
-                            val ramTag = if (loadState == ModelLoadState.LOADED) " • Loaded in RAM" else ""
+                            val ramTag = if (loadState == ModelLoadState.LOADED) " • Loaded" else ""
+                            val sizeLabel = if (model.isLlmModel) model.sizeGbLabel else "${model.sizeMb} MB"
                             val statusText = when {
-                                model.isRequired && isDownloaded -> "Downloaded • ${model.sizeMb} MB (Required$ramTag)"
-                                isDownloaded && isEnabled -> "Downloaded • ${model.sizeMb} MB (Active$ramTag)"
-                                isDownloaded && !isEnabled -> "Downloaded • ${model.sizeMb} MB (Inactive)"
-                                else -> "Not downloaded (${model.sizeMb} MB)"
+                                model.isRequired && isDownloaded -> "Downloaded • $sizeLabel (Required$ramTag)"
+                                isDownloaded && isEnabled -> "Downloaded • $sizeLabel (Active$ramTag)"
+                                isDownloaded && !isEnabled -> "Downloaded • $sizeLabel (Inactive)"
+                                else -> "Not downloaded ($sizeLabel)"
                             }
                             Text(
                                 text = statusText,
@@ -1218,13 +1269,13 @@ private fun LlmModelOptionCard(
     } else {
         MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
     }
-    val statusBadgeText = when {
+    val stateLabel = when {
         isDownloading -> "Downloading..."
-        loadState == ModelLoadState.LOADED || loadState == ModelLoadState.ACTIVE -> "Loaded in RAM"
-        isDownloaded -> "Ready on Disk"
-        else -> "${choice.desertAntModel.sizeMb} MB Download"
+        loadState == ModelLoadState.LOADED || loadState == ModelLoadState.ACTIVE -> "Loaded"
+        isDownloaded -> "Downloaded"
+        else -> null
     }
-    val statusBadgeColor = when {
+    val stateColor = when {
         isDownloading -> Color(0xFFEF6C00)
         loadState == ModelLoadState.LOADED || loadState == ModelLoadState.ACTIVE -> Color(0xFF2E7D32)
         isDownloaded -> MaterialTheme.colorScheme.primary
@@ -1247,8 +1298,8 @@ private fun LlmModelOptionCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.Top
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             RadioButton(
                 selected = selected,
@@ -1257,7 +1308,7 @@ private fun LlmModelOptionCard(
             Spacer(modifier = Modifier.width(6.dp))
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(3.dp)
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1292,23 +1343,27 @@ private fun LlmModelOptionCard(
                         )
                     }
                 }
-                Text(
-                    text = choice.speedAndRamSummary,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = choice.description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Text(
-                    text = statusBadgeText,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Medium,
-                    color = statusBadgeColor
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "${choice.sizeGbLabel} • ${choice.description}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (stateLabel != null) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = stateLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = stateColor
+                        )
+                    }
+                }
             }
         }
     }

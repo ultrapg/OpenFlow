@@ -229,74 +229,80 @@ class StreamingDictationSession(
             }
         }
         queue.close()
-        workerJob?.join()
+        pipeline.onRecordingStopped()
+        try {
+            workerJob?.join()
 
-        var stillFailed = droppedFailedChunks.get()
-        for (index in failed.keys.sorted()) {
-            // Detach audio buffer immediately so GC can reclaim it right after retry
-            val samples = failed.remove(index) ?: continue
-            failedBufferedSamples.addAndGet(-samples.size.toLong())
-            val text = transcribeChunk(PendingChunk(index, samples), allowLanguageHint = false)
-            if (text != null) {
-                results[index] = text
-            } else {
-                stillFailed++
+            var stillFailed = droppedFailedChunks.get()
+            for (index in failed.keys.sorted()) {
+                // Detach audio buffer immediately so GC can reclaim it right after retry
+                val samples = failed.remove(index) ?: continue
+                failedBufferedSamples.addAndGet(-samples.size.toLong())
+                val text = transcribeChunk(PendingChunk(index, samples), allowLanguageHint = false)
+                if (text != null) {
+                    results[index] = text
+                } else {
+                    stillFailed++
+                }
             }
-        }
-        failed.clear()
-        failedChunkCount = stillFailed
+            failed.clear()
+            failedChunkCount = stillFailed
 
-        val orderedRemainingChunks = results.entries
-            .filter { it.key >= nextUncleanedChunkIndex }
-            .sortedBy { it.key }
-            .map { it.value }
-            .filter { it.isNotBlank() }
-        results.clear()
+            val orderedRemainingChunks = results.entries
+                .filter { it.key >= nextUncleanedChunkIndex }
+                .sortedBy { it.key }
+                .map { it.value }
+                .filter { it.isNotBlank() }
+            results.clear()
 
-        val activeSettings = pipeline.currentSettings()
-        val resolvedLang = language ?: activeSettings.preferredLanguage
+            val activeSettings = pipeline.currentSettings()
+            val resolvedLang = language ?: activeSettings.preferredLanguage
 
-        if (preCleanedSegments.isEmpty()) {
-            val stitched = stitchChunkTranscripts(
+            if (preCleanedSegments.isEmpty()) {
+                val stitched = stitchChunkTranscripts(
+                    chunks = orderedRemainingChunks,
+                    language = resolvedLang,
+                    customVocabulary = activeSettings.customVocabulary
+                )
+                return pipeline.postProcessFinalTranscript(
+                    text = stitched,
+                    languageHint = resolvedLang,
+                    onStageProgress = onStageProgress
+                )
+            }
+
+            val tailStitched = stitchChunkTranscripts(
                 chunks = orderedRemainingChunks,
                 language = resolvedLang,
                 customVocabulary = activeSettings.customVocabulary
             )
-            return pipeline.postProcessFinalTranscript(
-                text = stitched,
-                languageHint = resolvedLang,
-                onStageProgress = onStageProgress
-            )
-        }
-
-        val tailStitched = stitchChunkTranscripts(
-            chunks = orderedRemainingChunks,
-            language = resolvedLang,
-            customVocabulary = activeSettings.customVocabulary
-        )
-        if (tailStitched.isNotBlank()) {
-            val cleanedTail = pipeline.postProcessFinalTranscript(
-                text = tailStitched,
-                languageHint = resolvedLang,
-                onStageProgress = onStageProgress,
-                precedingCleanedTail = lastCleanedTail,
-                applyLeadingCursorContinuation = false
-            )
-            if (cleanedTail.isNotBlank()) {
-                preCleanedSegments.add(cleanedTail)
+            if (tailStitched.isNotBlank()) {
+                val cleanedTail = pipeline.postProcessFinalTranscript(
+                    text = tailStitched,
+                    languageHint = resolvedLang,
+                    onStageProgress = onStageProgress,
+                    precedingCleanedTail = lastCleanedTail,
+                    applyLeadingCursorContinuation = false
+                )
+                if (cleanedTail.isNotBlank()) {
+                    preCleanedSegments.add(cleanedTail)
+                }
             }
+            val joined = joinStreamingCleanedSegments(
+                segments = preCleanedSegments,
+                preset = activeSettings.gemmaPromptPreset
+            )
+            preCleanedSegments.clear()
+            return joined
+        } finally {
+            pipeline.completeStreamingSession()
         }
-        val joined = joinStreamingCleanedSegments(
-            segments = preCleanedSegments,
-            preset = activeSettings.gemmaPromptPreset
-        )
-        preCleanedSegments.clear()
-        return joined
     }
 
     /** Abandons the session (screen turned off, recording failed, service destroyed). */
     fun cancel() {
         stopRequested.set(true)
+        pipeline.onRecordingStopped()
         pollerJob?.cancel()
         pollerJob = null
         workerJob?.cancel()
@@ -327,7 +333,8 @@ class StreamingDictationSession(
                 onLanguageResolved = { detected ->
                     if (config.reuseLanguage && language == null) language = detected
                 },
-                applyPostProcessing = false
+                applyPostProcessing = false,
+                keepModelsWarmForSession = true
             )
         } catch (ce: CancellationException) {
             throw ce

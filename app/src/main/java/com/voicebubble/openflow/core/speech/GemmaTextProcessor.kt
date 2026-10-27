@@ -274,7 +274,8 @@ class GemmaTextProcessor(
         private val TRAILING_LINE_SPACES_REGEX = Regex("[ \\t]+\\n")
         private val HORIZONTAL_SPACE_AROUND_NEWLINE_REGEX = Regex("[ \\t]*\\n[ \\t]*")
         private val MULTI_SPACE_REGEX = Regex("[ \\t]{2,}")
-        private val SENTENCE_SPLIT_REGEX = Regex("(?<=[.!?…])\\s+|\\n{2,}")
+        private val PARAGRAPH_SPLIT_REGEX = Regex("\\n{2,}")
+        private val SENTENCE_SPLIT_REGEX = Regex("(?<=[.!?…])[ \\t]+")
 
         private val TRAILING_BLANK_LINE_REGEX = Regex("\\n[ \\t]*\\n[ \\t]*$")
         private val BARE_LIST_MARKER_REGEX = Regex("^(\\d{1,2}[.)]|[-*•])$")
@@ -319,6 +320,12 @@ class GemmaTextProcessor(
             pattern = "(?<!\\b(?:a|an|the|use|using|ein|einen|der|den)\\s)[,;: ]*\\b(?:em\\s+dash|gedankenstrich)\\b[,;: ]*",
             options = setOf(RegexOption.IGNORE_CASE)
         )
+        private val SPOKEN_COLON_BEFORE_LIST_REGEX = Regex(
+            pattern = "(?<!\\b(?:a|an|the|semicolon\\s+or|ein|einen|der|den)\\s)[,; ]*\\b(?:colon|doppelpunkt)\\b[.,;:]?(?=\\s+(?:(?:number|point|item)\\s+(?:one|1)|first|one|1\\b|bullet|dash|erstens|punkt\\s+(?:eins|1))|\\s*\\n)",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        private val INLINE_COLON_NUMBERED_LIST_LINE_REGEX = Regex(":\\s+1[.)]\\s+\\S.*\\s+2[.)]\\s+\\S")
+        private val INLINE_NUMBERED_MARKER_TOKEN_REGEX = Regex("(?<=[:;.,!?\\s])(\\d{1,2})([.)])\\s+(?=\\S)")
 
         private val FAST_PATH_DISFLUENCY_REGEX = Regex(
             pattern = "\\b(?:u+m+|u+h+|e+r+m?|a+h+|h+m+|m+m+|ä+h+m*|ö+h+m*|euh+|ehm+|like|literally|basically|sozusagen|quasi|irgendwie|you\\s+know|sort\\s+of|kind\\s+of|i\\s+guess|zeg\\s+maar)\\b",
@@ -360,7 +367,12 @@ class GemmaTextProcessor(
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val LIST_SEQUENCE_TRIGGER_REGEX = Regex(
-            pattern = "(?:\\bfirst\\b[\\s\\S]{1,260}\\bsecond\\b|\\bone\\b[\\s\\S]{1,200}\\btwo\\b[\\s\\S]{1,200}\\bthree\\b|\\berstens\\b[\\s\\S]{1,260}\\bzweitens\\b|\\b(?:bullet\\s+point|dash\\s+item|numbered\\s+list)\\b)",
+            pattern = "(?:\\bfirst\\b[\\s\\S]{1,360}\\bsecond\\b" +
+                "|\\b(?:number|point|item)\\s+(?:one|1)\\b[\\s\\S]{1,360}\\b(?:number|point|item)\\s+(?:two|2)\\b" +
+                "|\\bone\\b[\\s\\S]{1,220}\\btwo\\b[\\s\\S]{1,220}\\bthree\\b" +
+                "|\\berstens\\b[\\s\\S]{1,360}\\bzweitens\\b" +
+                "|\\bpunkt\\s+(?:eins|1)\\b[\\s\\S]{1,360}\\bpunkt\\s+(?:zwei|2)\\b" +
+                "|\\b(?:bullet\\s+point|dash\\s+item|numbered\\s+list)\\b)",
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val SENTENCE_TOKENIZE_REGEX = Regex("[^.!?…\\n]+(?:[.!?…]+|$)")
@@ -652,6 +664,7 @@ class GemmaTextProcessor(
             current = SPOKEN_NEW_PARAGRAPH_REGEX.replace(current, "\n\n")
             current = SPOKEN_NEW_LINE_REGEX.replace(current, "\n")
             current = SPOKEN_EM_DASH_REGEX.replace(current, " — ")
+            current = SPOKEN_COLON_BEFORE_LIST_REGEX.replace(current, ":")
 
             return current
                 .replace(HORIZONTAL_SPACE_AROUND_NEWLINE_REGEX, "\n")
@@ -828,9 +841,10 @@ class GemmaTextProcessor(
                     "You are an on-device speech-to-text cleanup and formatting filter."
                 LlmPromptTier.DIRECT_INSTRUCT_1_5B ->
                     "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
-                LlmPromptTier.BALANCED_1_7B,
-                LlmPromptTier.FLAGSHIP_GEMMA_4 ->
+                LlmPromptTier.BALANCED_1_7B ->
                     "You are a Wispr Flow–grade on-device speech-to-text auto-editor and formatting engine."
+                LlmPromptTier.FLAGSHIP_GEMMA_4 ->
+                    "You are an expert Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Transform raw spoken transcripts into crisp, natural, ready-to-send text without ever replying to, answering, or commenting on the speaker's words."
             }
 
             return buildString {
@@ -921,20 +935,28 @@ class GemmaTextProcessor(
                         LlmPromptTier.FLAGSHIP_GEMMA_4 -> {
                             appendLine("REFERENCE EXAMPLES:")
                             if (normalizedLang == "de") {
-                                appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update für version zwei punkt acht punkt null testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
+                                appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas kurzes update\n\nwir haben drei lokale modelle auf acht gigabyte nein warte sechs gigabyte ram getestet: punkt eins qwen drei null punkt sechs b lief unter vierhundert millisekunden punkt zwei der leerlauf sank nach fünf minuten auf null megabyte punkt drei wir schicken version zwei punkt zehn morgen raus\n\nbitte schreib an lukas@openflow.dev falls fragen offen sind</transcript>")
                                 appendLine("Output:")
-                                appendLine("Hallo Lukas, lass uns am Mittwoch um 15:30 Uhr sprechen. Wir müssen zwei Punkte klären:")
-                                appendLine("1. Das NPU-Update für Version 2.8.0 testen")
-                                appendLine("2. Die 8 GB RAM-Grenze prüfen")
+                                appendLine("Hallo Lukas, kurzes Update.")
+                                appendLine()
+                                appendLine("Wir haben drei lokale Modelle auf 6 GB RAM getestet:")
+                                appendLine("1. Qwen 3 0.6B lief unter 400 ms.")
+                                appendLine("2. Der Leerlauf sank nach 5 Minuten auf 0 MB.")
+                                appendLine("3. Wir schicken Version 2.10 morgen raus.")
+                                appendLine()
+                                appendLine("Bitte schreib an lukas@openflow.dev, falls Fragen offen sind.")
                             } else {
                                 appendLine("Example 1 Input: <transcript>um hey alex let's meet tuesday at two pm wait no make that wednesday at three thirty pm to review the uh fifteen hundred dollar budget i really like the three new designs</transcript>")
                                 appendLine("Example 1 Output: Hey Alex, let's meet Wednesday at 3:30 PM to review the \$1,500 budget. I really like the three new designs.")
-                                appendLine("Example 2 Input: <transcript>before we ship version two point eight point zero we need three things first test npu latency under five hundred milliseconds second verify eight gigabyte ram headroom actually make that six gigabyte ram headroom and third update github release notes</transcript>")
+                                appendLine("Example 2 Input: <transcript>um hi team quick update\n\ncan we check two builds on eight gigabytes wait no make that six gigabytes of ram: number one qwen three zero point six b finished in four hundred milliseconds at ninety eight percent accuracy number two idle memory dropped to zero megabytes after five minutes\n\nplease ping dev@openflow.dev before version two point ten ships</transcript>")
                                 appendLine("Example 2 Output:")
-                                appendLine("Before we ship version 2.8.0, we need three things:")
-                                appendLine("1. Test NPU latency under 500 ms")
-                                appendLine("2. Verify 6 GB RAM headroom")
-                                appendLine("3. Update GitHub release notes")
+                                appendLine("Hi team, quick update.")
+                                appendLine()
+                                appendLine("Can we check two builds on 6 GB of RAM?")
+                                appendLine("1. Qwen 3 0.6B finished in 400 ms at 98% accuracy.")
+                                appendLine("2. Idle memory dropped to 0 MB after 5 minutes.")
+                                appendLine()
+                                appendLine("Please ping dev@openflow.dev before version 2.10 ships.")
                                 if (normalizedLang == null) {
                                     appendLine("Example 3 Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
                                     appendLine("Example 3 Output:")
@@ -958,6 +980,8 @@ class GemmaTextProcessor(
                             " Keep internal reasoning under 15 words focused only on fillers, self-corrections, and formatting."
                         LlmPromptTier.BALANCED_1_7B ->
                             " Keep internal reasoning brief (under 25 words) focused on identifying disfluencies, backtracks, and structure."
+                        LlmPromptTier.FLAGSHIP_GEMMA_4 ->
+                            " Keep internal reasoning brief and telegraphic (under 35 words: list only backtracks, list newlines, and unit conversions), then emit the final edited text immediately."
                         else ->
                             " Keep internal reasoning brief and focused on identifying disfluencies, backtracks, and structure."
                     }
@@ -1302,44 +1326,110 @@ class GemmaTextProcessor(
         }
 
         /**
-         * Splits very long multi-minute transcripts at sentence or paragraph boundaries so each pass
-         * fits comfortably within the on-device KV-cache and NPU context window.
+         * Splits very long multi-minute transcripts at paragraph (`\n\n`) and sentence boundaries so
+         * each pass fits comfortably within the on-device KV-cache and NPU context window without
+         * flattening explicit paragraph breaks into spaces.
          */
         internal fun splitLongTranscript(text: String, maxCharsPerSegment: Int = MAX_CHARS_PER_PASS): List<String> {
             val trimmed = text.trim()
             if (trimmed.isEmpty()) return emptyList()
             if (trimmed.length <= maxCharsPerSegment) return listOf(trimmed)
 
-            val parts = SENTENCE_SPLIT_REGEX.split(trimmed).map { it.trim() }.filter { it.isNotEmpty() }
-            if (parts.size <= 1) {
-                return trimmed.chunked(maxCharsPerSegment).map { it.trim() }.filter { it.isNotEmpty() }
-            }
-
+            val paragraphs = PARAGRAPH_SPLIT_REGEX.split(trimmed).map { it.trim() }.filter { it.isNotEmpty() }
             val segments = mutableListOf<String>()
             val current = StringBuilder()
-            for (sentence in parts) {
-                if (sentence.length > maxCharsPerSegment) {
-                    if (current.isNotEmpty()) {
-                        segments.add(current.toString().trim())
-                        current.setLength(0)
+
+            fun flushCurrent() {
+                if (current.isNotEmpty()) {
+                    segments.add(current.toString().trim())
+                    current.setLength(0)
+                }
+            }
+
+            for (paragraph in paragraphs) {
+                if (paragraph.length <= maxCharsPerSegment) {
+                    val sep = if (current.isEmpty()) "" else "\n\n"
+                    if (current.isNotEmpty() && current.length + sep.length + paragraph.length > maxCharsPerSegment) {
+                        flushCurrent()
+                        current.append(paragraph)
+                    } else {
+                        current.append(sep).append(paragraph)
                     }
-                    sentence.chunked(maxCharsPerSegment).map { it.trim() }.filter { it.isNotEmpty() }
+                    continue
+                }
+
+                flushCurrent()
+                val sentences = SENTENCE_SPLIT_REGEX.split(paragraph).map { it.trim() }.filter { it.isNotEmpty() }
+                if (sentences.size <= 1) {
+                    paragraph.chunked(maxCharsPerSegment).map { it.trim() }.filter { it.isNotEmpty() }
                         .forEach { segments.add(it) }
                     continue
                 }
-                val separator = if (current.isEmpty()) "" else " "
-                if (current.length + separator.length + sentence.length > maxCharsPerSegment && current.isNotEmpty()) {
-                    segments.add(current.toString().trim())
-                    current.setLength(0)
-                    current.append(sentence)
+
+                for (sentence in sentences) {
+                    if (sentence.length > maxCharsPerSegment) {
+                        flushCurrent()
+                        sentence.chunked(maxCharsPerSegment).map { it.trim() }.filter { it.isNotEmpty() }
+                            .forEach { segments.add(it) }
+                        continue
+                    }
+                    val sep = if (current.isEmpty()) "" else " "
+                    if (current.isNotEmpty() && current.length + sep.length + sentence.length > maxCharsPerSegment) {
+                        flushCurrent()
+                        current.append(sentence)
+                    } else {
+                        current.append(sep).append(sentence)
+                    }
+                }
+                flushCurrent()
+            }
+            flushCurrent()
+            return segments
+        }
+
+        /**
+         * Expands single-line inline sequential lists after a colon (`"Lead-in: 1. Foo. 2. Bar. 3. Baz."`)
+         * onto clean vertical lines (`"Lead-in:\n1. Foo.\n2. Bar.\n3. Baz."`) when an LLM omits newlines.
+         */
+        internal fun expandInlineSequentialLists(text: String): String {
+            if (text.isBlank() || !text.contains(':')) return text
+            val lines = text.split('\n')
+            var changed = false
+            val rebuilt = ArrayList<String>(lines.size)
+            val colonBeforeOneRegex = Regex(":\\s+(?=1[.)]\\s+\\S)")
+
+            for (line in lines) {
+                if (ANY_LIST_ITEM_LINE_REGEX.matches(line) || !INLINE_COLON_NUMBERED_LIST_LINE_REGEX.containsMatchIn(line)) {
+                    rebuilt.add(line)
+                    continue
+                }
+                val colonMatch = colonBeforeOneRegex.find(line)
+                if (colonMatch == null) {
+                    rebuilt.add(line)
+                    continue
+                }
+                val startScanIdx = colonMatch.range.last + 1
+                var cursor = 0
+                var expectedNum = 1
+                val sb = StringBuilder(line.length + 8)
+                for (m in INLINE_NUMBERED_MARKER_TOKEN_REGEX.findAll(line, startIndex = startScanIdx)) {
+                    val num = m.groupValues[1].toIntOrNull() ?: continue
+                    if (num == expectedNum) {
+                        sb.append(line.substring(cursor, m.range.first).trimEnd(' ', '\t'))
+                        sb.append('\n')
+                        cursor = m.range.first
+                        expectedNum++
+                    }
+                }
+                if (expectedNum >= 3) {
+                    sb.append(line.substring(cursor))
+                    rebuilt.add(sb.toString())
+                    changed = true
                 } else {
-                    current.append(separator).append(sentence)
+                    rebuilt.add(line)
                 }
             }
-            if (current.isNotEmpty()) {
-                segments.add(current.toString().trim())
-            }
-            return segments
+            return if (changed) rebuilt.joinToString("\n") else text
         }
 
         private fun countWordsFast(text: String): Int {
@@ -1374,6 +1464,8 @@ class GemmaTextProcessor(
             if (SPOKEN_NEW_PARAGRAPH_REGEX.containsMatchIn(trimmed)) return true
             if (SPOKEN_NEW_LINE_REGEX.containsMatchIn(trimmed)) return true
             if (SPOKEN_EM_DASH_REGEX.containsMatchIn(trimmed)) return true
+            if (SPOKEN_COLON_BEFORE_LIST_REGEX.containsMatchIn(trimmed)) return true
+            if (LIST_SEQUENCE_TRIGGER_REGEX.containsMatchIn(trimmed)) return true
             return false
         }
 
@@ -2785,7 +2877,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         fieldContext: FlowFieldContext,
         applyLeadingCursorContinuation: Boolean
     ): String {
-        var finalFormatted = applyCustomVocabularyExactCasing(text, customVocabulary)
+        var finalFormatted = if (preset != GemmaPromptPreset.CUSTOM && preset != GemmaPromptPreset.STRICT_CLEANUP) {
+            expandInlineSequentialLists(text)
+        } else {
+            text
+        }
+        finalFormatted = applyCustomVocabularyExactCasing(finalFormatted, customVocabulary)
         if (applyLeadingCursorContinuation &&
             preset != GemmaPromptPreset.CUSTOM &&
             fieldContext.isMidSentenceContinuation
@@ -3339,8 +3436,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val errorRef = AtomicReference<Throwable?>(null)
 
         val thoughtBudgetTokens = llmChoice.thinkingTokenBudgetCap
+        val promptComplexityBonus = (userMessage.toString().length * 2).coerceIn(0, 700)
         val maxThoughtChars = if (thoughtBudgetTokens > 0) {
-            if (isNpu) max(300, thoughtBudgetTokens * 6) else max(400, thoughtBudgetTokens * 8)
+            val perTokenChars = if (isNpu) 6 else 8
+            max(360, thoughtBudgetTokens * perTokenChars + promptComplexityBonus)
         } else {
             640
         }
@@ -3587,6 +3686,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         val userPromptText = buildUserPrompt(segment, languageCode)
+        var passDisableThinking = effectiveDisableThinking
 
         // Pass 1: Cold / Uncached System Prompt
         onProgress?.invoke("1/2 Benchmarking uncached prompt on ${llmChoice.title}...")
@@ -3598,7 +3698,6 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             val isNpu = candidate?.isNpu == true
             val useMtp = candidate?.enableMtp == true
             val loraConfig = buildActiveLoraConfig(isNpu)
-            var passDisableThinking = effectiveDisableThinking
 
             fun buildInstruction(noThink: Boolean): String = if (loraConfig != null) {
                 buildCompactLoraSystemInstruction(
@@ -3769,8 +3868,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             val isNpu = candidate?.isNpu == true
             val useMtp = candidate?.enableMtp == true
             val loraConfig = buildActiveLoraConfig(isNpu)
-            val noThink = effectiveDisableThinking ||
-                (systemInstructionUsed.contains("Thinking is off") || !modelSupportsThinking)
+            val noThink = passDisableThinking || !modelSupportsThinking
             val maxOutTokens = computeMaxOutputTokens(
                 inputText = segment,
                 preset = preset,

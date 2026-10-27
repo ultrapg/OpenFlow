@@ -80,6 +80,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -368,7 +369,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         registerScreenStateReceiver()
         setupOverlayView()
         syncBubbleVisibility()
-        initializePipeline()
+        prepareStandbyPipeline()
 
         val modelPrefs = ModelSettings.getPreferences(this)
         modelPrefs.registerOnSharedPreferenceChangeListener(modelPrefsListener)
@@ -397,44 +398,50 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             }
         }
 
-        // Main-thread heartbeat (independent of Compose Choreographer VSYNC):
-        // enforces immediate screen-off hiding, restores visibility as soon as keyboard opens after screen-on,
-        // keeps the screen-awake lock refreshed while visible/transcribing/running LLM,
-        // and self-heals overlay attachment & notification every 4 seconds.
-        // Adaptive cadence: 200 ms while the screen is on, 1 s while it is off (the SCREEN_ON receiver already
-        // reacts instantly, so the heartbeat only needs to be a cheap safety net then).
+        // Battery-optimized main-thread safety heartbeat:
+        // - Suspends completely (0 CPU wakeups) whenever the display is OFF; screen-on BroadcastReceiver wakes it immediately.
+        // - Uses event-driven flows for instant keyboard reaction and a low-power safety cadence (1.2s active / 4s hidden-idle)
+        //   while the display is ON to refresh screen-awake leases and self-heal overlay/notification every 15s.
         serviceScope.launch {
             var lastHealMs = SystemClock.elapsedRealtime()
             while (isActive) {
-                val nowInteractive = checkScreenInteractive()
-                delay(if (nowInteractive) 200L else 1_000L)
-                val stillInteractive = checkScreenInteractive()
-                val nowMs = SystemClock.elapsedRealtime()
-                val healDue = nowMs - lastHealMs >= 4_000L
-                if (healDue) lastHealMs = nowMs
-
-                if (!stillInteractive) {
+                if (!checkScreenInteractive()) {
                     if (isScreenInteractive.value || isBubbleVisibleFlow.value ||
                         screenKeepAwakeWakeLock?.isHeld == true ||
                         (::layoutParams.isInitialized && layoutParams.alpha > 0f)
                     ) {
                         onScreenTurnedOff()
                     }
-                } else {
-                    if (!isScreenInteractive.value) {
-                        onScreenTurnedOn()
-                    } else {
-                        // Refresh IME window visibility on the main thread as well so devices that require
-                        // AccessibilityService.getWindows() on the main looper never miss a keyboard open event.
-                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
-                        syncBubbleVisibility()
-                        syncScreenKeepAwakeState()
-                    }
-                    if (healDue) {
-                        ensureOverlayAttached()
-                    }
+                    // True 0% CPU sleep until ACTION_SCREEN_ON / ACTION_USER_PRESENT flips isScreenInteractive to true
+                    isScreenInteractive.first { it }
+                    continue
                 }
-                if (healDue) {
+
+                val isActiveSession = isBubbleVisibleFlow.value ||
+                    bubbleState.value != OverlayBubbleState.IDLE ||
+                    smartPipeline.isActivelyProcessing
+                delay(if (isActiveSession) 1_200L else 4_000L)
+
+                val stillInteractive = checkScreenInteractive()
+                if (!stillInteractive) {
+                    onScreenTurnedOff()
+                    continue
+                }
+
+                if (!isScreenInteractive.value) {
+                    onScreenTurnedOn()
+                } else {
+                    if (isBubbleVisibleFlow.value || !TextInjectionAccessibilityService.isServiceConnected.value) {
+                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
+                    }
+                    syncBubbleVisibility()
+                    syncScreenKeepAwakeState()
+                }
+
+                val nowMs = SystemClock.elapsedRealtime()
+                if (nowMs - lastHealMs >= 15_000L) {
+                    lastHealMs = nowMs
+                    ensureOverlayAttached()
                     ensureNotificationPresent()
                 }
             }
@@ -540,6 +547,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         if (bubbleState.value == OverlayBubbleState.RECORDING) {
             bubbleState.value = OverlayBubbleState.IDLE
+            smartPipeline.onRecordingStopped()
             releaseDictationWakeLock()
             streamingSession?.cancel()
             streamingSession = null
@@ -719,18 +727,22 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private var initPipelineJob: Job? = null
 
-    private fun initializePipeline() {
+    /**
+     * Keeps all speech and LLM models unloaded at 0 MB in RAM on service startup for maximum
+     * background battery efficiency. Models are loaded lazily on demand when the bubble is tapped.
+     */
+    private fun prepareStandbyPipeline() {
+        smartPipeline.refreshStatusSnapshot()
         val previousJob = initPipelineJob
-        initPipelineJob = serviceScope.launch(Dispatchers.Default) {
+        initPipelineJob = serviceScope.launch(Dispatchers.IO) {
             previousJob?.cancelAndJoin()
             try {
-                val ready = smartPipeline.initialize(warmUp = true)
-                withContext(Dispatchers.Main) {
-                    if (!ready && !com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDownloaded(
-                            this@FloatingBubbleService,
-                            com.voicebubble.openflow.settings.DesertAntModel.VOZ
-                        )
-                    ) {
+                val vozDownloaded = com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDownloaded(
+                    this@FloatingBubbleService,
+                    com.voicebubble.openflow.settings.DesertAntModel.VOZ
+                )
+                if (!vozDownloaded) {
+                    withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,
                             "Please download the Voz speech model in OpenFlow first.",
@@ -892,6 +904,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val themeContext = android.view.ContextThemeWrapper(this, com.voicebubble.openflow.R.style.Theme_OpenFlow)
         composeView = ComposeView(themeContext).apply {
             keepScreenOn = initiallyKeepScreenOn
+            visibility = if (initiallyVisible) android.view.View.VISIBLE else hiddenOverlayViewVisibility()
             setViewTreeLifecycleOwner(this@FloatingBubbleService)
             setViewTreeViewModelStoreOwner(this@FloatingBubbleService)
             setViewTreeSavedStateRegistryOwner(this@FloatingBubbleService)
@@ -984,10 +997,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             serviceScope.launch {
                                 val started = audioController.startRecording(this)
                                 if (started) {
-                                    // While the user is speaking, pre-fill Gemma's system-prompt KV cache
-                                    // for the active app & cursor context if RAM headroom allows.
+                                    // Lazily load unloaded audio/LLM models into RAM while the user speaks
+                                    // and pre-fill the LLM system-prompt KV cache if headroom allows.
                                     smartPipeline.onRecordingStartedAsync()
                                 } else {
+                                    smartPipeline.onRecordingStopped()
                                     session?.cancel()
                                     if (streamingSession === session) streamingSession = null
                                     bubbleState.value = OverlayBubbleState.IDLE
@@ -1005,6 +1019,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                         },
                         onStopRecording = {
+                            smartPipeline.onRecordingStopped()
                             acquireDictationWakeLock()
                             bubbleState.value = OverlayBubbleState.PROCESSING
                             // Keep the screen awake throughout Voz transcription and LLM post-processing!
@@ -1158,6 +1173,17 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
+    private fun hiddenOverlayViewVisibility(): Int {
+        // On Android 11+ (API 30+), IME visibility uses WindowManager.currentWindowMetrics directly,
+        // so View.GONE completely suspends Compose measure/layout/draw passes while hidden.
+        // On API 26-29, View.INVISIBLE skips draw passes while preserving ViewCompat.getRootWindowInsets.
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            android.view.View.GONE
+        } else {
+            android.view.View.INVISIBLE
+        }
+    }
+
     private fun setOverlayWindowVisibleAndTouchable(
         visible: Boolean,
         touchable: Boolean,
@@ -1184,13 +1210,16 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             touchFlags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
         }
         val newAlpha = if (visible) 1.0f else 0.0f
-        val changed = newFlags != layoutParams.flags || layoutParams.alpha != newAlpha
+        val desiredVisibility = if (visible) android.view.View.VISIBLE else hiddenOverlayViewVisibility()
+        val changed = newFlags != layoutParams.flags ||
+            layoutParams.alpha != newAlpha ||
+            composeView.visibility != desiredVisibility
         if (!changed && !forceUpdate) return
         layoutParams.flags = newFlags
         layoutParams.alpha = newAlpha
         try {
-            if (visible && composeView.visibility != android.view.View.VISIBLE) {
-                composeView.visibility = android.view.View.VISIBLE
+            if (composeView.visibility != desiredVisibility) {
+                composeView.visibility = desiredVisibility
             }
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)
@@ -1324,8 +1353,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     try {
                         val modelId = buildString {
                             append("desert-ant-voz-4.0.0")
-                            if (activeModelSettings.punctEnabled) append("+punct")
-                            if (activeModelSettings.gemmaEnabled) append("+gemma-4-e2b")
+                            if (activeModelSettings.punctEnabled && !activeModelSettings.gemmaEnabled) append("+punct")
+                            if (activeModelSettings.gemmaEnabled) append("+${activeModelSettings.selectedLlmModel.id}")
                         }
                         val dao = AppDatabase.getDatabase(this@FloatingBubbleService).transcriptionDao()
                         dao.insert(

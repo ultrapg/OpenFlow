@@ -2,9 +2,12 @@ package com.voicebubble.openflow.core.accessibility
 
 import android.accessibilityservice.AccessibilityService
 import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
@@ -23,6 +26,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -49,12 +53,39 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var pollingJob: Job? = null
+    private var postEventCheckJob: Job? = null
     private var lastWatchdogCheckMs = 0L
+    @Volatile
+    private var lastKeyboardCheckMs = 0L
+    private var screenReceiverRegistered = false
+
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    postEventCheckJob?.cancel()
+                    isScreenInteractive.value = false
+                    isInputFieldFocused.value = false
+                }
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    isScreenInteractive.value = true
+                    FloatingBubbleService.ensureRunningIfEnabled(
+                        this@TextInjectionAccessibilityService,
+                        reason = "accessibility_screen_on"
+                    )
+                    schedulePostEventKeyboardCheck(delayMs = 120L)
+                }
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = WeakReference(this)
         isServiceConnected.value = true
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        isScreenInteractive.value = try { pm?.isInteractive ?: true } catch (_: Throwable) { true }
+        registerScreenReceiver()
 
         // Automatically start the floating bubble service on phone boot or after process crash recovery
         FloatingBubbleService.ensureRunningIfEnabled(this, reason = "accessibility_onServiceConnected")
@@ -62,23 +93,57 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         startPollingLoop()
     }
 
+    private fun registerScreenReceiver() {
+        if (screenReceiverRegistered) return
+        try {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenStateReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(screenStateReceiver, filter)
+            }
+            screenReceiverRegistered = true
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unregisterScreenReceiver() {
+        if (!screenReceiverRegistered) return
+        try {
+            unregisterReceiver(screenStateReceiver)
+        } catch (_: Throwable) {
+        }
+        screenReceiverRegistered = false
+    }
+
     private fun startPollingLoop() {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
             val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
             while (isActive) {
-                // Self-sufficient power state tracking (never trust a flag that only FloatingBubbleService sets)
                 val interactiveNow = try {
                     powerManager?.isInteractive ?: true
                 } catch (_: Throwable) {
                     true
                 }
-                if (isScreenInteractive.value != interactiveNow) {
-                    isScreenInteractive.value = interactiveNow
+                if (!interactiveNow) {
+                    isScreenInteractive.value = false
+                    isInputFieldFocused.value = false
+                    // Suspend completely (0% CPU / 0 wakeups) while the display is off
+                    isScreenInteractive.first { it }
+                    continue
+                }
+
+                if (!isScreenInteractive.value) {
+                    isScreenInteractive.value = true
                 }
                 refreshKeyboardVisibilityState()
                 val now = SystemClock.elapsedRealtime()
-                if (now - lastWatchdogCheckMs >= 8_000L) {
+                if (now - lastWatchdogCheckMs >= 15_000L) {
                     lastWatchdogCheckMs = now
                     if (!FloatingBubbleService.isRunning.value) {
                         FloatingBubbleService.ensureRunningIfEnabled(
@@ -87,9 +152,9 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                // Back off while the display is off: nothing can be shown, and the screen-on broadcast in
-                // FloatingBubbleService forces an immediate refresh anyway.
-                delay(if (isScreenInteractive.value) 180L else 1_000L)
+                // Event-driven AccessibilityEvents handle instant keyboard transitions; this loop is only a
+                // low-power safety net (1.2s while keyboard is open, 3.5s while closed).
+                delay(if (isInputFieldFocused.value) 1_200L else 3_500L)
             }
         }
     }
@@ -113,23 +178,45 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        unregisterScreenReceiver()
         instance = null
         isServiceConnected.value = false
         isInputFieldFocused.value = false
+        postEventCheckJob?.cancel()
         pollingJob?.cancel()
         serviceScope.cancel()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        val type = event.eventType
-        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            type == AccessibilityEvent.TYPE_VIEW_FOCUSED ||
-            type == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-            type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED
-        ) {
-            refreshKeyboardVisibilityState()
+        if (event == null || !isScreenInteractive.value) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                refreshKeyboardVisibilityState()
+            }
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                refreshKeyboardVisibilityState()
+                // Catch soft-keyboard slide-in animations that finish ~150ms after focus/tap
+                schedulePostEventKeyboardCheck(delayMs = 180L)
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
+                // Avoid traversing windows on every single keystroke when keyboard is already known to be open
+                val elapsed = SystemClock.elapsedRealtime() - lastKeyboardCheckMs
+                if (!isInputFieldFocused.value || elapsed >= 750L) {
+                    refreshKeyboardVisibilityState()
+                }
+            }
+        }
+    }
+
+    private fun schedulePostEventKeyboardCheck(delayMs: Long) {
+        postEventCheckJob?.cancel()
+        postEventCheckJob = serviceScope.launch {
+            delay(delayMs)
+            if (isScreenInteractive.value) {
+                refreshKeyboardVisibilityState()
+            }
         }
     }
 
@@ -141,6 +228,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
      */
     private fun refreshKeyboardVisibilityState() {
         try {
+            lastKeyboardCheckMs = SystemClock.elapsedRealtime()
             isInputFieldFocused.value = isSoftKeyboardWindowVisible()
         } catch (_: Throwable) {
         }

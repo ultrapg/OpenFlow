@@ -101,7 +101,11 @@ fun BubbleOverlayComponent(
 
     val colorScheme = MaterialTheme.colorScheme
     val isLoadingModels = pipelinePhase == PipelinePhase.LOADING || pipelinePhase == PipelinePhase.WARMING_UP
-    val rms by audioController.rmsLevel.collectAsState()
+    val rms = if (bubbleState == OverlayBubbleState.RECORDING) {
+        audioController.rmsLevel.collectAsState().value
+    } else {
+        0f
+    }
 
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()

@@ -2,6 +2,23 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.11.0] - 2026-10-27
+
+### Added & Improved
+- **Configurable Auto-Unload of All Models + Lazy On-Tap Loading (`ModelSettings`, `SmartPipeline`, `StreamingDictationSession`, `FloatingBubbleService`, `MainActivity`, `SpeechRecognitionSettingsSection`):**
+  - Added a configurable **Auto-Unload All Models When Idle (Battery Saver)** setting (`Immediately (0m)`, `1m`, `2m`, `5m` [default], `10m`, `15m`, `30m`, `Never`), plus an instant **Unload Now** action in Settings.
+  - **Zero-RAM Cold Start & Lazy On-Tap Loading:** App launch and background service startup no longer eagerly load `Voz`, `Ear`, or `Punct` into RAM (`0 MB` Standby by default). Models are loaded lazily on demand as soon as the floating dictation bubble is tapped (`onRecordingStartedAsync()`), overlapping model initialization and LLM KV-cache pre-warming with live speech capture so medium and long dictations finish seamlessly.
+  - **Full Pipeline Idle Eviction:** When the configured idle timeout expires (or immediately after dictation when set to `Immediately`), OpenFlow unloads **every** model (`Voz`, `Ear`, `Punct`, AND the active `LiteRT-LM` LLM + standby KV cache) back to `0 MB` in RAM.
+- **Background Service Battery Optimization (`FloatingBubbleService`, `TextInjectionAccessibilityService`, `BubbleOverlayComponent`):**
+  - **True 0% CPU While Screen Is Off:** Eliminated continuous background polling loops while the screen is off in both `FloatingBubbleService` and `TextInjectionAccessibilityService`—both coroutines now suspend completely on `isScreenInteractive.first { it }` (`0` CPU wakeups until `ACTION_SCREEN_ON` / `ACTION_USER_PRESENT`).
+  - **Event-Driven Keyboard Tracking & Low-Power Safety Cadence:** Replaced `180–200 ms` polling with instant `AccessibilityEvent`-driven keyboard detection (with keystroke selection-event throttling and debounced slide-in verification) plus a low-power safety backoff (`1.2s` active / `3.5s–4.0s` idle, `15s` watchdog).
+  - **Zero Idle Overlay Redraws:** Hidden overlay states now switch `ComposeView` to `View.GONE` on Android 11+ (`View.INVISIBLE` on Android 8–10) to suspend Compose layout/draw passes, and `audioController.rmsLevel` is collected strictly during `OverlayBubbleState.RECORDING`.
+- **Concise GB-Only LLM Cards with Zero Speed or RAM Claims (`ModelSettings`, `SpeechRecognitionSettingsSection`):**
+  - Simplified all 5 local LLM selector cards to display exact download sizes in **GB** (`0.32 GB`, `0.57 GB`, `0.91 GB`, `1.49 GB`, `2.41 GB`) alongside ultra-short 3–4 word descriptions and download/load state, removing duplicate MB download badges and removing all speed (`tok/s`) and device RAM (`4 GB+ RAM` / `~MB RAM`) claims.
+- **Major `Gemma 4 E2B` System Prompt & Structural Formatting Upgrade (`ModelSettings`, `GemmaTextProcessor`):**
+  - Replaced `Gemma 4 E2B`'s unstructured wall-of-text system prompt with crisp, numbered, dedicated `FLAGSHIP_GEMMA_4` instructions across all 6 presets (`CLEAN_AND_POLISH`, `STRICT_CLEANUP`, `CONCISE_DIRECT`, `PROFESSIONAL_MESSAGE`, `STRUCTURED_NOTES`, `CUSTOM`), paired with multi-paragraph/numbered-list/spoken-email/German few-shot grounding and a `<35 words` telegraphic reasoning rule (`thinkingTokenBudgetCap = 256`).
+  - Enforced vertical newline formatting on sequential numbered lists (`expandInlineSequentialLists`, spoken `"colon"` normalization before list items, expanded `"number one ... number two ..."` sequence detection, and paragraph-preserving `splitLongTranscript`) so multi-item lists never collapse onto a single paragraph line.
+
 ## [2.10.0] - 2026-10-27
 
 ### Added & Improved
