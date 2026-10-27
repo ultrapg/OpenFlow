@@ -398,10 +398,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             }
         }
 
-        // Battery-optimized main-thread safety heartbeat:
+        // Battery-optimized main-thread heartbeat (independent of Compose Choreographer VSYNC):
         // - Suspends completely (0 CPU wakeups) whenever the display is OFF; screen-on BroadcastReceiver wakes it immediately.
-        // - Uses event-driven flows for instant keyboard reaction and a low-power safety cadence (1.2s active / 4s hidden-idle)
-        //   while the display is ON to refresh screen-awake leases and self-heal overlay/notification every 15s.
+        // - While the display is ON, refreshes IME window visibility on the Main Looper (required by Samsung One UI /
+        //   Android 14-15 AccessibilityService.getWindows()), keeps the screen-awake lock refreshed, and self-heals
+        //   overlay attachment & foreground notification every 6 seconds.
         serviceScope.launch {
             var lastHealMs = SystemClock.elapsedRealtime()
             while (isActive) {
@@ -417,10 +418,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     continue
                 }
 
-                val isActiveSession = isBubbleVisibleFlow.value ||
-                    bubbleState.value != OverlayBubbleState.IDLE ||
-                    smartPipeline.isActivelyProcessing
-                delay(if (isActiveSession) 1_200L else 4_000L)
+                delay(250L)
 
                 val stillInteractive = checkScreenInteractive()
                 if (!stillInteractive) {
@@ -431,15 +429,15 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 if (!isScreenInteractive.value) {
                     onScreenTurnedOn()
                 } else {
-                    if (isBubbleVisibleFlow.value || !TextInjectionAccessibilityService.isServiceConnected.value) {
-                        TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
-                    }
+                    // Always refresh IME window visibility on the Main Looper so OEM ROMs (Samsung One UI, etc.)
+                    // never miss a soft-keyboard open/close transition even when the bubble is currently hidden.
+                    TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
                     syncBubbleVisibility()
                     syncScreenKeepAwakeState()
                 }
 
                 val nowMs = SystemClock.elapsedRealtime()
-                if (nowMs - lastHealMs >= 15_000L) {
+                if (nowMs - lastHealMs >= 6_000L) {
                     lastHealMs = nowMs
                     ensureOverlayAttached()
                     ensureNotificationPresent()
@@ -904,7 +902,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         val themeContext = android.view.ContextThemeWrapper(this, com.voicebubble.openflow.R.style.Theme_OpenFlow)
         composeView = ComposeView(themeContext).apply {
             keepScreenOn = initiallyKeepScreenOn
-            visibility = if (initiallyVisible) android.view.View.VISIBLE else hiddenOverlayViewVisibility()
             setViewTreeLifecycleOwner(this@FloatingBubbleService)
             setViewTreeViewModelStoreOwner(this@FloatingBubbleService)
             setViewTreeSavedStateRegistryOwner(this@FloatingBubbleService)
@@ -971,6 +968,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             // Ensure MICROPHONE foreground service type is active on user tap (if started on boot as SPECIAL_USE)
                             startCustomForeground(smartPipeline.pipelineStatus.value)
                             acquireDictationWakeLock()
+                            processingProgress.value = ""
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             syncScreenKeepAwakeState(forceRefreshWakeLock = true)
@@ -1021,6 +1019,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         onStopRecording = {
                             smartPipeline.onRecordingStopped()
                             acquireDictationWakeLock()
+                            if (processingProgress.value.isEmpty()) {
+                                processingProgress.value = if (smartPipeline.pipelineStatus.value.isReady) {
+                                    "Transcribing..."
+                                } else {
+                                    "Loading Voz..."
+                                }
+                            }
                             bubbleState.value = OverlayBubbleState.PROCESSING
                             // Keep the screen awake throughout Voz transcription and LLM post-processing!
                             syncScreenKeepAwakeState(forceRefreshWakeLock = true)
@@ -1173,17 +1178,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
-    private fun hiddenOverlayViewVisibility(): Int {
-        // On Android 11+ (API 30+), IME visibility uses WindowManager.currentWindowMetrics directly,
-        // so View.GONE completely suspends Compose measure/layout/draw passes while hidden.
-        // On API 26-29, View.INVISIBLE skips draw passes while preserving ViewCompat.getRootWindowInsets.
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            android.view.View.GONE
-        } else {
-            android.view.View.INVISIBLE
-        }
-    }
-
     private fun setOverlayWindowVisibleAndTouchable(
         visible: Boolean,
         touchable: Boolean,
@@ -1210,16 +1204,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             touchFlags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
         }
         val newAlpha = if (visible) 1.0f else 0.0f
-        val desiredVisibility = if (visible) android.view.View.VISIBLE else hiddenOverlayViewVisibility()
-        val changed = newFlags != layoutParams.flags ||
-            layoutParams.alpha != newAlpha ||
-            composeView.visibility != desiredVisibility
+        val changed = newFlags != layoutParams.flags || layoutParams.alpha != newAlpha
         if (!changed && !forceUpdate) return
         layoutParams.flags = newFlags
         layoutParams.alpha = newAlpha
         try {
-            if (composeView.visibility != desiredVisibility) {
-                composeView.visibility = desiredVisibility
+            if (visible && composeView.visibility != android.view.View.VISIBLE) {
+                composeView.visibility = android.view.View.VISIBLE
             }
             if (composeView.isAttachedToWindow) {
                 windowManager.updateViewLayout(composeView, layoutParams)
@@ -1283,7 +1274,13 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         serviceScope.launch {
             try {
-                processingProgress.value = ""
+                if (processingProgress.value.isEmpty()) {
+                    processingProgress.value = if (smartPipeline.pipelineStatus.value.isReady) {
+                        "Transcribing..."
+                    } else {
+                        "Loading Voz..."
+                    }
+                }
 
                 val chunkText = if (session != null) {
                     session.finish(samples).also {
@@ -1380,10 +1377,15 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 DebugLogManager.logError("FloatingBubbleService", "processAudio transcription error", t)
                 processingProgress.value = ""
                 bubbleState.value = OverlayBubbleState.IDLE
+                val errorDetail = if (t is LinkageError) {
+                    "${t.javaClass.simpleName}: ${t.message ?: "initialization error"}"
+                } else {
+                    t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+                }
                 withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         this@FloatingBubbleService,
-                        "Transcription error: ${t.message}",
+                        "Transcription error: $errorDetail",
                         android.widget.Toast.LENGTH_SHORT
                     ).show()
                 }

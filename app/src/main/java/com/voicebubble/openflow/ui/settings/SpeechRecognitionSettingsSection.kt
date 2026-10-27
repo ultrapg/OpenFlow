@@ -1809,7 +1809,11 @@ private fun LlmSpeedBenchmarkSection(
                                 } catch (ce: CancellationException) {
                                     benchmarkError = null
                                 } catch (t: Throwable) {
-                                    benchmarkError = t.message ?: "Benchmark failed"
+                                    benchmarkError = if (t is LinkageError) {
+                                        "${t.javaClass.simpleName}: ${t.message ?: "initialization error"}"
+                                    } else {
+                                        t.message?.takeIf { it.isNotBlank() } ?: "${t.javaClass.simpleName}: Benchmark failed"
+                                    }
                                 } finally {
                                     isRunning = false
                                     progressLabel = ""

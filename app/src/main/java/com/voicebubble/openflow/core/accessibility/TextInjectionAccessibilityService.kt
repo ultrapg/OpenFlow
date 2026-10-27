@@ -51,7 +51,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
     }
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var pollingJob: Job? = null
     private var postEventCheckJob: Job? = null
     private var lastWatchdogCheckMs = 0L
@@ -73,7 +73,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                         this@TextInjectionAccessibilityService,
                         reason = "accessibility_screen_on"
                     )
-                    schedulePostEventKeyboardCheck(delayMs = 120L)
+                    schedulePostEventKeyboardCheck()
                 }
             }
         }
@@ -143,7 +143,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 }
                 refreshKeyboardVisibilityState()
                 val now = SystemClock.elapsedRealtime()
-                if (now - lastWatchdogCheckMs >= 15_000L) {
+                if (now - lastWatchdogCheckMs >= 8_000L) {
                     lastWatchdogCheckMs = now
                     if (!FloatingBubbleService.isRunning.value) {
                         FloatingBubbleService.ensureRunningIfEnabled(
@@ -152,9 +152,8 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                // Event-driven AccessibilityEvents handle instant keyboard transitions; this loop is only a
-                // low-power safety net (1.2s while keyboard is open, 3.5s while closed).
-                delay(if (isInputFieldFocused.value) 1_200L else 3_500L)
+                // Main-looper safety cadence while screen is ON (0% CPU when screen is OFF above).
+                delay(if (isInputFieldFocused.value) 500L else 900L)
             }
         }
     }
@@ -188,7 +187,13 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || !isScreenInteractive.value) return
+        if (event == null) return
+        if (!isScreenInteractive.value) {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val interactiveNow = try { pm?.isInteractive ?: true } catch (_: Throwable) { true }
+            if (!interactiveNow) return
+            isScreenInteractive.value = true
+        }
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                 refreshKeyboardVisibilityState()
@@ -197,24 +202,24 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_FOCUSED,
             AccessibilityEvent.TYPE_VIEW_CLICKED -> {
                 refreshKeyboardVisibilityState()
-                // Catch soft-keyboard slide-in animations that finish ~150ms after focus/tap
-                schedulePostEventKeyboardCheck(delayMs = 180L)
+                // Catch OEM soft-keyboard slide-in animations across fast (80ms) and slower One UI (350-600ms) transitions
+                schedulePostEventKeyboardCheck()
             }
             AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                // Avoid traversing windows on every single keystroke when keyboard is already known to be open
                 val elapsed = SystemClock.elapsedRealtime() - lastKeyboardCheckMs
-                if (!isInputFieldFocused.value || elapsed >= 750L) {
+                if (!isInputFieldFocused.value || elapsed >= 400L) {
                     refreshKeyboardVisibilityState()
                 }
             }
         }
     }
 
-    private fun schedulePostEventKeyboardCheck(delayMs: Long) {
+    private fun schedulePostEventKeyboardCheck() {
         postEventCheckJob?.cancel()
         postEventCheckJob = serviceScope.launch {
-            delay(delayMs)
-            if (isScreenInteractive.value) {
+            for (stepDelayMs in longArrayOf(80L, 100L, 170L, 250L)) {
+                delay(stepDelayMs)
+                if (!isScreenInteractive.value) break
                 refreshKeyboardVisibilityState()
             }
         }

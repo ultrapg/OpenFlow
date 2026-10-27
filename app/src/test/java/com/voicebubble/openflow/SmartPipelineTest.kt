@@ -2242,5 +2242,121 @@ class SmartPipelineTest {
             maxCharsPerSegment = 500
         )
         assertEquals(listOf(multiPara), splitParas)
+
+        // 6. Prose mention "semicolon or colon" does not turn literal "colon" into ":"
+        val proseColon = "Avoid putting a semicolon or colon number one in that title."
+        assertEquals(
+            proseColon,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preNormalizeSpokenConstructs(proseColon)
+        )
+    }
+
+    @Test
+    fun `All compiled Regex patterns across speech and overlay classes obey Android ICU bounded-lookbehind rules`() {
+        val classesToAudit = listOf(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor::class.java,
+            com.voicebubble.openflow.core.speech.SmartPipeline::class.java,
+            com.voicebubble.openflow.core.speech.PunctuationRestorer::class.java,
+            com.voicebubble.openflow.core.speech.StreamingDictationSession::class.java,
+            com.voicebubble.openflow.overlay.FloatingBubbleService::class.java
+        )
+
+        fun extractLookbehindBodies(pattern: String): List<String> {
+            val bodies = mutableListOf<String>()
+            var i = 0
+            while (i < pattern.length - 4) {
+                if (pattern[i] == '\\') {
+                    i += 2
+                    continue
+                }
+                if (pattern.startsWith("(?<=", i) || pattern.startsWith("(?<!", i)) {
+                    val startBody = i + 4
+                    var depth = 1
+                    var inCharClass = false
+                    var j = startBody
+                    while (j < pattern.length && depth > 0) {
+                        val c = pattern[j]
+                        if (c == '\\') {
+                            j += 2
+                            continue
+                        }
+                        if (c == '[' && !inCharClass) {
+                            inCharClass = true
+                        } else if (c == ']' && inCharClass) {
+                            inCharClass = false
+                        } else if (!inCharClass) {
+                            if (c == '(') depth++
+                            else if (c == ')') depth--
+                        }
+                        j++
+                    }
+                    if (depth == 0) {
+                        bodies.add(pattern.substring(startBody, j - 1))
+                    }
+                }
+                i++
+            }
+            return bodies
+        }
+
+        fun hasUnboundedQuantifier(lookbehindBody: String): Boolean {
+            var inCharClass = false
+            var i = 0
+            while (i < lookbehindBody.length) {
+                val c = lookbehindBody[i]
+                if (c == '\\') {
+                    i += 2
+                    continue
+                }
+                if (c == '[' && !inCharClass) {
+                    inCharClass = true
+                } else if (c == ']' && inCharClass) {
+                    inCharClass = false
+                } else if (!inCharClass) {
+                    if (c == '+' || c == '*') return true
+                    if (c == '{') {
+                        val close = lookbehindBody.indexOf('}', i + 1)
+                        if (close > i) {
+                            val spec = lookbehindBody.substring(i + 1, close)
+                            if (spec.endsWith(",")) return true
+                        }
+                    }
+                }
+                i++
+            }
+            return false
+        }
+
+        var auditedRegexCount = 0
+        for (cls in classesToAudit) {
+            val targets = buildList<Pair<Class<*>, Any?>> {
+                add(cls to null)
+                try {
+                    val companionField = cls.getDeclaredField("Companion")
+                    companionField.isAccessible = true
+                    val companionInstance = companionField.get(null)
+                    add(companionInstance.javaClass to companionInstance)
+                } catch (_: NoSuchFieldException) {
+                }
+            }
+            for ((targetClass, instance) in targets) {
+                for (field in targetClass.declaredFields) {
+                    if (field.type == Regex::class.java &&
+                        (instance != null || java.lang.reflect.Modifier.isStatic(field.modifiers))
+                    ) {
+                        field.isAccessible = true
+                        val regex = field.get(instance) as? Regex ?: continue
+                        auditedRegexCount++
+                        for (lb in extractLookbehindBodies(regex.pattern)) {
+                            assertFalse(
+                                "Android ICU4C rejects unbounded quantifier in lookbehind of ${cls.simpleName}.${field.name}: (?<...$lb)",
+                                hasUnboundedQuantifier(lb)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        assertTrue("Expected to audit >= 25 Regex fields, got $auditedRegexCount", auditedRegexCount >= 25)
     }
 }

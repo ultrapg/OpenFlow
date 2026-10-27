@@ -317,11 +317,11 @@ class GemmaTextProcessor(
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val SPOKEN_EM_DASH_REGEX = Regex(
-            pattern = "(?<!\\b(?:a|an|the|use|using|ein|einen|der|den)\\s)[,;: ]*\\b(?:em\\s+dash|gedankenstrich)\\b[,;: ]*",
+            pattern = "[,;: ]*(?<!\\b(?:a|an|the|use|using|ein|einen|der|den)\\s)\\b(?:em\\s+dash|gedankenstrich)\\b[,;: ]*",
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val SPOKEN_COLON_BEFORE_LIST_REGEX = Regex(
-            pattern = "(?<!\\b(?:a|an|the|semicolon\\s+or|ein|einen|der|den)\\s)[,; ]*\\b(?:colon|doppelpunkt)\\b[.,;:]?(?=\\s+(?:(?:number|point|item)\\s+(?:one|1)|first|one|1\\b|bullet|dash|erstens|punkt\\s+(?:eins|1))|\\s*\\n)",
+            pattern = "[,; ]*(?<!\\b(?:a|an|the|or|ein|einen|der|den)\\s)\\b(?:colon|doppelpunkt)\\b[.,;:]?(?=\\s+(?:(?:number|point|item)\\s+(?:one|1)|first|one|1\\b|bullet|dash|erstens|punkt\\s+(?:eins|1))|\\s*\\n)",
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val INLINE_COLON_NUMBERED_LIST_LINE_REGEX = Regex(":\\s+1[.)]\\s+\\S.*\\s+2[.)]\\s+\\S")

@@ -466,6 +466,9 @@ class SmartPipeline(
         promptPrewarmJob = null
         recordingWarmupJob?.cancel()
         recordingWarmupJob = idleScope.launch {
+            var shouldTryLlmOverlap = false
+            // Phase 1: Load speech recognition models (`Voz` + `Ear`/`Punct`) and immediately release pipelineMutex
+            // so live streaming chunks or a quick Stop-tap never block behind multi-GB LLM initialization.
             pipelineMutex.withLock {
                 if (!isRecordingActive || isTranscribing) return@withLock
                 val activeSnap = settings
@@ -529,68 +532,97 @@ class SmartPipeline(
                     messageOverride = "$readyCount/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 )
 
-                if (!isRecordingActive || isTranscribing || !activeSnap.gemmaEnabled) return@withLock
-                if (!isActiveLlmReadyOnDisk(activeSnap)) return@withLock
-                val selectedLlm = activeSnap.selectedLlmModel
+                shouldTryLlmOverlap = isRecordingActive &&
+                    !isTranscribing &&
+                    activeSnap.gemmaEnabled &&
+                    isActiveLlmReadyOnDisk(activeSnap)
+            }
 
-                // Never hold a stale LLM or redundant Punct model in RAM alongside the active LLM
-                if (loadedLlmChoice != null && loadedLlmChoice != selectedLlm) {
-                    closeGemmaLocked()
-                }
-                if (punctRestorer != null) {
-                    closePunctLocked()
-                }
+            if (!shouldTryLlmOverlap || !isRecordingActive || isTranscribing) return@launch
 
-                val memBeforeLlm = evaluateMemoryPressure()
-                if (gemmaProcessor == null &&
-                    memBeforeLlm.canKeepVozAndLlmCoResident(
-                        llmChoice = selectedLlm,
-                        vozAlreadyLoaded = voz != null,
-                        llmAlreadyLoaded = false
-                    )
-                ) {
-                    try {
-                        val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
-                        gemmaProcessor = GemmaTextProcessor(
-                            context = appContext,
-                            modelDir = modelDir,
-                            accelerator = activeSnap.hardwareAccelerator,
-                            memoryMode = memBeforeLlm.gemmaMemoryMode,
-                            llmChoice = selectedLlm
-                        )
-                        loadedLlmChoice = selectedLlm
-                        gemmaWarmedUp = false
-                        DebugLogManager.logInfo(
-                            TAG,
-                            "Loaded ${selectedLlm.title} during recording overlap (${gemmaProcessor?.activeBackendSummary})",
-                            includeMemory = true
-                        )
-                        updateStatusSnapshot(
-                            activeSettings = activeSnap,
-                            phaseOverride = PipelinePhase.READY,
-                            messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
-                        )
-                    } catch (t: Throwable) {
-                        if (t is CancellationException) throw t
-                        DebugLogManager.logWarn(TAG, "Deferred ${selectedLlm.title} overlap load: ${t.message}")
-                        closeGemmaLocked()
-                        return@withLock
+            // Phase 2a: Opportunistically load co-resident LLM only if pipelineMutex is completely uncontended
+            if (pipelineMutex.tryLock()) {
+                try {
+                    if (isRecordingActive && !isTranscribing) {
+                        val activeSnap = settings
+                        if (activeSnap.gemmaEnabled && isActiveLlmReadyOnDisk(activeSnap)) {
+                            val selectedLlm = activeSnap.selectedLlmModel
+                            if (loadedLlmChoice != null && loadedLlmChoice != selectedLlm) {
+                                closeGemmaLocked()
+                            }
+                            if (punctRestorer != null) {
+                                closePunctLocked()
+                            }
+                            val memBeforeLlm = evaluateMemoryPressure()
+                            if (gemmaProcessor == null &&
+                                memBeforeLlm.canKeepVozAndLlmCoResident(
+                                    llmChoice = selectedLlm,
+                                    vozAlreadyLoaded = voz != null,
+                                    llmAlreadyLoaded = false
+                                )
+                            ) {
+                                val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
+                                gemmaProcessor = GemmaTextProcessor(
+                                    context = appContext,
+                                    modelDir = modelDir,
+                                    accelerator = activeSnap.hardwareAccelerator,
+                                    memoryMode = memBeforeLlm.gemmaMemoryMode,
+                                    llmChoice = selectedLlm
+                                )
+                                loadedLlmChoice = selectedLlm
+                                gemmaWarmedUp = false
+                                DebugLogManager.logInfo(
+                                    TAG,
+                                    "Loaded ${selectedLlm.title} during recording overlap (${gemmaProcessor?.activeBackendSummary})",
+                                    includeMemory = true
+                                )
+                                updateStatusSnapshot(
+                                    activeSettings = activeSnap,
+                                    phaseOverride = PipelinePhase.READY,
+                                    messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                                )
+                            }
+                        }
                     }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    DebugLogManager.logWarn(TAG, "Deferred LLM overlap load during recording: ${t.message}")
+                    closeGemmaLocked()
+                } finally {
+                    pipelineMutex.unlock()
                 }
+            }
 
-                if (!isRecordingActive || isTranscribing) return@withLock
-                val gemma = gemmaProcessor ?: return@withLock
-                val memAfterLoad = evaluateMemoryPressure()
-                if (memAfterLoad.canPrewarmLlmPromptCache(selectedLlm)) {
-                    gemma.prewarmSystemPrompt(
-                        preset = activeSnap.gemmaPromptPreset,
-                        customPrompt = activeSnap.gemmaCustomPrompt,
-                        customVocabulary = activeSnap.customVocabulary,
-                        disableThinking = activeSnap.gemmaDisableThinking,
-                        adaptiveThinking = activeSnap.gemmaAdaptiveThinking
-                    )
-                } else {
-                    gemma.evictCachedSystemPrompt()
+            if (!isRecordingActive || isTranscribing) return@launch
+
+            // Phase 2b: Pre-fill system-prompt KV cache while user continues speaking (separate lock scope)
+            if (pipelineMutex.tryLock()) {
+                try {
+                    if (isRecordingActive && !isTranscribing) {
+                        val activeSnap = settings
+                        val gemma = gemmaProcessor
+                        if (activeSnap.gemmaEnabled && gemma != null && loadedLlmChoice == activeSnap.selectedLlmModel) {
+                            val memAfterLoad = evaluateMemoryPressure()
+                            if (memAfterLoad.canPrewarmLlmPromptCache(activeSnap.selectedLlmModel)) {
+                                gemma.prewarmSystemPrompt(
+                                    preset = activeSnap.gemmaPromptPreset,
+                                    customPrompt = activeSnap.gemmaCustomPrompt,
+                                    customVocabulary = activeSnap.customVocabulary,
+                                    disableThinking = activeSnap.gemmaDisableThinking,
+                                    adaptiveThinking = activeSnap.gemmaAdaptiveThinking
+                                )
+                            } else {
+                                gemma.evictCachedSystemPrompt()
+                            }
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    DebugLogManager.logWarn(TAG, "Deferred LLM prompt prewarm during recording: ${t.message}")
+                } finally {
+                    pipelineMutex.unlock()
                 }
             }
         }
@@ -935,6 +967,16 @@ class SmartPipeline(
 
                     // Stage 2: Multilingual Speech-to-Text (`Voz`)
                     ensureMemoryHeadroomForFfiLocked(conditionedChunk.size)
+                    if (voz == null) {
+                        updateSingleModelStateLocked(
+                            activeSettings = activeSettings,
+                            model = DesertAntModel.VOZ,
+                            state = ModelLoadState.LOADING,
+                            message = "Loading Voz speech engine ($activeAcceleratorDescription)..."
+                        )
+                        onStageProgress?.invoke("Loading Voz...")
+                        ensureVozLocked(activeSettings, warmUp = false)
+                    }
                     setModelActiveStatusLocked(
                         activeSettings,
                         DesertAntModel.VOZ,

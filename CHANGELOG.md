@@ -2,6 +2,17 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.11.1] - 2026-10-27
+
+### Fixed
+- **Fixed `GemmaTextProcessor` Crash in Speed Benchmark & AI Post-Processing (`NoClassDefFoundError: com.voicebubble.openflow.core.speech.GemmaTextProcessor`):**
+  - Removed the unbounded `\s+` quantifier inside the negative lookbehind of `SPOKEN_COLON_BEFORE_LIST_REGEX` (`semicolon\s+or` -> `or`) in `GemmaTextProcessor.kt`, which passed OpenJDK desktop regex compilation in JUnit but threw `PatternSyntaxException` (`U_REGEX_LOOK_BEHIND_LIMIT`) inside Android's ICU4C regex engine during `<clinit>` class initialization.
+  - Added automated JUnit reflection verification across all `Regex` fields in `GemmaTextProcessor`, `SmartPipeline`, `PunctuationRestorer`, `StreamingDictationSession`, and `FloatingBubbleService` to enforce strict Android ICU4C bounded-lookbehind compliance.
+- **Fixed Floating Dictation Bubble Appearance, Surface Attachment & Dictation Responsiveness (`FloatingBubbleService`, `TextInjectionAccessibilityService`, `BubbleOverlayComponent`, `SmartPipeline`):**
+  - Restored `ComposeView` `View.VISIBLE` surface attachment on `WindowManager` (`alpha = 0.0f` + `FLAG_NOT_TOUCHABLE` when hidden) instead of `View.GONE` / `View.INVISIBLE`, preventing unallocated surfaces, missing root `WindowInsets`, and untouchable overlay states on Android 11–15 / Samsung One UI.
+  - Moved `TextInjectionAccessibilityService` keyboard inspection onto `Dispatchers.Main` with staggered post-event animation checks (`80 ms` – `600 ms`) and restored unconditional Main-Looper `refreshNow()` checks while the display is interactive so `AccessibilityService.getWindows()` reliably detects `TYPE_INPUT_METHOD` soft keyboards on Samsung One UI and all OEM ROMs—while keeping **true `0%` CPU suspension (`isScreenInteractive.first { it }`)** whenever the screen is off.
+  - Decoupled `SmartPipeline.onRecordingStartedAsync()` into separate lock phases so `Voz` speech loading releases `pipelineMutex` immediately before opportunistic co-resident LLM loading / prompt pre-warming, and added immediate `"Loading Voz..."` / `"Transcribing..."` pill progress feedback when stopping a dictation from `0 MB` Standby.
+
 ## [2.11.0] - 2026-10-27
 
 ### Added & Improved
