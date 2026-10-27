@@ -247,10 +247,11 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        // Gemma 4 E2B (Experimental, Off by default)
+                        // On-Device AI Post-Processing (Off by default; defaults to Qwen 3 0.6B 585 MB)
+                        val onboardingLlm = configuredSettings.selectedLlmModel
                         OnboardingModelRow(
-                            title = "Gemma 4 E2B — AI Post-Processing (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB, Experimental)",
-                            subtitle = DesertAntModel.GEMMA_4_E2B.roleSummary,
+                            title = "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)",
+                            subtitle = "${onboardingLlm.description} (5 AI models selectable in Settings)",
                             checked = gemmaSelected,
                             enabled = true,
                             isLocked = false,

@@ -248,6 +248,46 @@ object ModelDownloadManager {
                 )
             )
             ),
+        DesertAntModel.QWEN_3_0_6B_LITE to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm",
+                    sizeBytes = 344_671_744L,
+                    sha256 = "03e7da1eb1108b50dffaa9bb52cc7bcbad2eb0c66ca990267f480c1e545d2856",
+                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm"
+                )
+            )
+            ),
+        DesertAntModel.QWEN_3_0_6B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "Qwen3-0.6B.litertlm",
+                    sizeBytes = 613_722_264L,
+                    sha256 = "c5f39b4191926786c3e6668b62af4d6eb15248dfc7a5348252a9b406f33f2108",
+                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/Qwen3-0.6B.litertlm"
+                )
+            )
+            ),
+        DesertAntModel.QWEN_3_1_7B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm",
+                    sizeBytes = 977_184_032L,
+                    sha256 = "2a72330b504a6596d53a2c00923c57173b10f1b83e6a541213ffec08d1fc5de8",
+                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-1.7B/resolve/main/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm"
+                )
+            )
+            ),
+        DesertAntModel.QWEN_2_5_1_5B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+                    sizeBytes = 1_597_922_856L,
+                    sha256 = "c4a9b7289365ab80fe599b844b77ad253eb3c53fb0e5d963d699146a6f01255e",
+                    downloadUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
+                )
+            )
+            ),
         DesertAntModel.GEMMA_4_E2B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
@@ -310,17 +350,37 @@ object ModelDownloadManager {
         }
     }
 
+    /**
+     * Cancels all pending LLM auto-enable entries (or all except [keepModel]) so at most one LLM
+     * can ever auto-enable when downloads complete.
+     */
+    fun cancelAllLlmAutoEnables(keepModel: DesertAntModel? = null) {
+        val snapshotPending = synchronized(queueLock) {
+            pendingAutoEnable.removeAll { it.isLlmModel && it != keepModel }
+            pendingAutoEnable.toSet()
+        }
+        updateState {
+            copy(pendingAutoEnableModels = snapshotPending)
+        }
+    }
+
     private fun autoEnableModelIfRequested(context: Context, model: DesertAntModel) {
         val shouldEnable = synchronized(queueLock) {
             pendingAutoEnable.remove(model)
         }
         if (shouldEnable && DesertAntModelStorage.isModelDownloaded(context, model)) {
             val current = ModelSettings.load(context)
-            val updated = when (model) {
-                DesertAntModel.EAR -> current.copy(earEnabled = true)
-                DesertAntModel.PUNCT -> current.copy(punctEnabled = true)
-                DesertAntModel.GEMMA_4_E2B -> current.copy(gemmaEnabled = true)
-                DesertAntModel.VOZ -> current
+            val updated = when {
+                model == DesertAntModel.EAR -> current.copy(earEnabled = true)
+                model == DesertAntModel.PUNCT -> current.copy(punctEnabled = true)
+                model.isLlmModel -> {
+                    val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: current.selectedLlmModel
+                    current.copy(
+                        gemmaEnabled = true,
+                        selectedLlmModel = llmChoice
+                    )
+                }
+                else -> current
             }
             if (updated != current) {
                 ModelSettings.save(context, updated)
@@ -352,6 +412,9 @@ object ModelDownloadManager {
             if (autoEnableOnComplete) {
                 for (m in requested) {
                     if (m != DesertAntModel.VOZ) {
+                        if (m.isLlmModel) {
+                            pendingAutoEnable.removeAll { it.isLlmModel && it != m }
+                        }
                         pendingAutoEnable.add(m)
                     }
                 }

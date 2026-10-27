@@ -51,7 +51,8 @@ enum class DesertAntModel(
     val sizeMb: Int,
     val expectedBytes: Long,
     val isRequired: Boolean,
-    val isExperimental: Boolean = false
+    val isExperimental: Boolean = false,
+    val isLlmModel: Boolean = false
 ) {
     VOZ(
         id = "voz",
@@ -80,24 +81,208 @@ enum class DesertAntModel(
         expectedBytes = 295_740_930L,
         isRequired = false
     ),
+    QWEN_3_0_6B_LITE(
+        id = "qwen3_0_6b_lite",
+        shortLabel = "Qwen 3 0.6B Lite",
+        displayName = "Qwen 3 0.6B Lite — Ultra-Fast AI",
+        roleSummary = "Experimental • Ultra-light 4-bit GPU/CPU LLM (329 MB) for instant filler removal & cleanup",
+        sizeMb = 329,
+        expectedBytes = 344_671_744L,
+        isRequired = false,
+        isExperimental = true,
+        isLlmModel = true
+    ),
+    QWEN_3_0_6B(
+        id = "qwen3_0_6b",
+        shortLabel = "Qwen 3 0.6B",
+        displayName = "Qwen 3 0.6B — Fast & Light AI",
+        roleSummary = "Experimental • Recommended NPU/GPU/CPU LLM (585 MB) for fast multilingual cleanup, numbers & lists",
+        sizeMb = 585,
+        expectedBytes = 613_722_264L,
+        isRequired = false,
+        isExperimental = true,
+        isLlmModel = true
+    ),
+    QWEN_3_1_7B(
+        id = "qwen3_1_7b",
+        shortLabel = "Qwen 3 1.7B",
+        displayName = "Qwen 3 1.7B — Balanced AI",
+        roleSummary = "Experimental • Fast 4-bit GPU LLM (932 MB) balancing sub-second speed with smart backtrack editing",
+        sizeMb = 932,
+        expectedBytes = 977_184_032L,
+        isRequired = false,
+        isExperimental = true,
+        isLlmModel = true
+    ),
+    QWEN_2_5_1_5B(
+        id = "qwen2_5_1_5b",
+        shortLabel = "Qwen 2.5 1.5B",
+        displayName = "Qwen 2.5 1.5B — Direct Instruct AI",
+        roleSummary = "Experimental • Direct non-thinking INT8 LLM (1,524 MB) for instant zero-thought GPU/CPU cleanup",
+        sizeMb = 1524,
+        expectedBytes = 1_597_922_856L,
+        isRequired = false,
+        isExperimental = true,
+        isLlmModel = true
+    ),
     GEMMA_4_E2B(
         id = "gemma4_e2b",
         shortLabel = "Gemma 4 E2B",
-        displayName = "Gemma 4 E2B — AI Reformatting",
-        roleSummary = "Experimental • On-device Gemma 4 E2B LLM on NPU for removing 'um'/fillers, smart reformatting & custom prompts",
+        displayName = "Gemma 4 E2B — Flagship Max Quality",
+        roleSummary = "Experimental • Flagship Google Gemma 4 E2B LLM (2,468 MB) on NPU for nuanced Wispr Flow reformatting",
         sizeMb = 2468,
         expectedBytes = 2_588_147_712L,
         isRequired = false,
-        isExperimental = true
+        isExperimental = true,
+        isLlmModel = true
     );
 }
 
 /**
- * Selectable system prompt presets (plus [CUSTOM]) for Experimental Gemma 4 E2B post-processing.
+ * Prompt optimization tier matched to each on-device LLM's parameter scale, instruction-tuning
+ * behavior, and reasoning architecture.
+ */
+enum class LlmPromptTier {
+    /** Ultra-crisp, positive bullet rules + 1 compact example (~190 tokens) for 0.6B models so attention stays sharp and prefill hits fast 256-token buckets. */
+    COMPACT_0_6B,
+
+    /** Deterministic non-conversational text-filter framing for direct instruct models with no `<think>` scratchpad (prevents answering spoken questions). */
+    DIRECT_INSTRUCT_1_5B,
+
+    /** High-signal multi-rule prompt + 2 grounded examples + bounded reasoning budget for 1.7B models. */
+    BALANCED_1_7B,
+
+    /** Full Wispr Flow multi-clause, nuance-preserving prompt + multilingual examples for flagship Gemma 4 E2B. */
+    FLAGSHIP_GEMMA_4
+}
+
+/**
+ * Selectable on-device LiteRT-LM models for AI post-processing & dictation cleanup, ordered from
+ * smallest/fastest to largest/most capable. Only ONE selected model is ever enabled or loaded into RAM.
+ */
+enum class LlmModelChoice(
+    val id: String,
+    val desertAntModel: DesertAntModel,
+    val modelFileName: String,
+    val title: String,
+    val badgeLabel: String,
+    val speedAndRamSummary: String,
+    val description: String,
+    val estimatedStandaloneRamMb: Int,
+    val estimatedIncrementalRamMb: Int,
+    val supportsThinking: Boolean,
+    val supportsNpuBackend: Boolean,
+    val promptTier: LlmPromptTier,
+    val samplerTopK: Int,
+    val samplerTopP: Double,
+    val samplerTemperature: Double
+) {
+    QWEN_3_0_6B_LITE(
+        id = "qwen3_0_6b_lite",
+        desertAntModel = DesertAntModel.QWEN_3_0_6B_LITE,
+        modelFileName = "Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm",
+        title = "Qwen 3 0.6B Lite",
+        badgeLabel = "TINY & FASTEST",
+        speedAndRamSummary = "329 MB download • ~350 MB RAM • Ultra-fast GPU / CPU",
+        description = "Smallest 4-bit model (~70+ tok/s on GPU). Best for instant filler removal, numbers & light cleanup on any phone (4 GB+ RAM).",
+        estimatedStandaloneRamMb = 480,
+        estimatedIncrementalRamMb = 350,
+        supportsThinking = true,
+        supportsNpuBackend = false,
+        promptTier = LlmPromptTier.COMPACT_0_6B,
+        samplerTopK = 10,
+        samplerTopP = 0.85,
+        samplerTemperature = 0.05
+    ),
+    QWEN_3_0_6B(
+        id = "qwen3_0_6b",
+        desertAntModel = DesertAntModel.QWEN_3_0_6B,
+        modelFileName = "Qwen3-0.6B.litertlm",
+        title = "Qwen 3 0.6B",
+        badgeLabel = "RECOMMENDED",
+        speedAndRamSummary = "585 MB download • ~450 MB RAM • NPU / GPU / CPU",
+        description = "Best all-round light model. Runs natively on NPU, GPU, or CPU with crisp multilingual cleanup, numbers & list formatting (6 GB+ RAM).",
+        estimatedStandaloneRamMb = 650,
+        estimatedIncrementalRamMb = 450,
+        supportsThinking = true,
+        supportsNpuBackend = true,
+        promptTier = LlmPromptTier.COMPACT_0_6B,
+        samplerTopK = 12,
+        samplerTopP = 0.88,
+        samplerTemperature = 0.06
+    ),
+    QWEN_3_1_7B(
+        id = "qwen3_1_7b",
+        desertAntModel = DesertAntModel.QWEN_3_1_7B,
+        modelFileName = "Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm",
+        title = "Qwen 3 1.7B",
+        badgeLabel = "BALANCED",
+        speedAndRamSummary = "932 MB download • ~650 MB RAM • Fast 4-bit GPU",
+        description = "Sweet spot of sub-second GPU speed (~41 tok/s) and stronger multi-clause backtrack & list understanding (6 GB+ RAM).",
+        estimatedStandaloneRamMb = 1_050,
+        estimatedIncrementalRamMb = 650,
+        supportsThinking = true,
+        supportsNpuBackend = false,
+        promptTier = LlmPromptTier.BALANCED_1_7B,
+        samplerTopK = 20,
+        samplerTopP = 0.90,
+        samplerTemperature = 0.08
+    ),
+    QWEN_2_5_1_5B(
+        id = "qwen2_5_1_5b",
+        desertAntModel = DesertAntModel.QWEN_2_5_1_5B,
+        modelFileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+        title = "Qwen 2.5 1.5B Instruct",
+        badgeLabel = "ZERO-THINK",
+        speedAndRamSummary = "1,524 MB download • ~750 MB RAM • Direct GPU / CPU",
+        description = "Direct instruction-tuned INT8 model with zero thinking step (~31–34 tok/s on GPU & CPU). Instant first-token output (6 GB+ RAM).",
+        estimatedStandaloneRamMb = 1_450,
+        estimatedIncrementalRamMb = 750,
+        supportsThinking = false,
+        supportsNpuBackend = false,
+        promptTier = LlmPromptTier.DIRECT_INSTRUCT_1_5B,
+        samplerTopK = 15,
+        samplerTopP = 0.88,
+        samplerTemperature = 0.08
+    ),
+    GEMMA_4_E2B(
+        id = "gemma4_e2b",
+        desertAntModel = DesertAntModel.GEMMA_4_E2B,
+        modelFileName = "gemma-4-E2B-it.litertlm",
+        title = "Gemma 4 E2B",
+        badgeLabel = "MAX QUALITY",
+        speedAndRamSummary = "2,468 MB download • ~850 MB RAM • NPU Flagship",
+        description = "Largest flagship Google Gemma 4 model on NPU/GPU. Highest accuracy on complex mid-sentence backtracks, nuance & custom prompts (8 GB+ RAM).",
+        estimatedStandaloneRamMb = 1_900,
+        estimatedIncrementalRamMb = 850,
+        supportsThinking = true,
+        supportsNpuBackend = true,
+        promptTier = LlmPromptTier.FLAGSHIP_GEMMA_4,
+        samplerTopK = 20,
+        samplerTopP = 0.90,
+        samplerTemperature = 0.10
+    );
+
+    val shortLabel: String
+        get() = desertAntModel.shortLabel
+
+    companion object {
+        fun fromId(id: String?): LlmModelChoice {
+            if (id.isNullOrBlank()) return QWEN_3_0_6B
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: QWEN_3_0_6B
+        }
+
+        fun fromDesertAntModel(model: DesertAntModel): LlmModelChoice? {
+            return entries.firstOrNull { it.desertAntModel == model }
+        }
+    }
+}
+
+/**
+ * Selectable system prompt presets (plus [CUSTOM]) for on-device LLM post-processing.
  *
- * Modeled after Wispr Flow's auto-editing architecture: mid-sentence backtrack/course-correction
- * resolution, disfluency & stutter stripping, automatic spoken list detection, context-aware
- * layout, and natural prose vs. technical number formatting while keeping authentic speaker voice.
+ * Each preset dynamically adapts its prompt structure via [promptForModel] to match the active
+ * LLM's capacity, instruction-following profile, and prefill token sweet spot.
  */
 enum class GemmaPromptPreset(
     val id: String,
@@ -115,7 +300,7 @@ enum class GemmaPromptPreset(
 - Course-correction & backtracks: When the speaker changes their mind mid-thought ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine', 'besser gesagt'), discard BOTH the retracted phrase and the repair cue, keeping only the final intended words. Keep genuine logical contrasts ('not X, but Y').
 - Disfluencies & pauses: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), abandoned false starts, and discourse fillers ('like', 'you know', 'sort of' ONLY when used as hesitation — never remove literal verbs or comparisons like 'I like this' or 'looks like'). Repair false mid-sentence pause periods and broken capitalization.
 - Smart list detection: Automatically format clear spoken sequences ('first... second... third...', 'one... two... three...', '1... 2... 3...', 'erstens... zweitens...') as vertical numbered lists ('1. ', '2. ') with a colon (':') on any lead-in clause, and spoken bullet cues ('bullet point', 'dash item') as '- ' bullet lists. Keep short casual inline series ('milk, eggs, and bread') inline.
-- Numbers, dates & units: Spell out standalone counts one through nine in ordinary prose (and idioms like 'one of the', 'a couple of', 'ein paar'), and convert 10+ plus all decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), version numbers ('2.7.0'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C') into clean digits matching the transcript language.
+- Numbers, dates & units: Spell out standalone counts one through nine in ordinary prose (and idioms like 'one of the', 'a couple of', 'ein paar'), and convert 10+ plus all decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), version numbers ('2.8.0'), ranges ('10–15'), and measurement/tech units ('8 GB', '500 ms', '16 kHz', '24 °C') into clean digits matching the transcript language.
 - Tech terms, emails & structure: Capitalize acronyms and code identifiers accurately ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format dictated email addresses and URLs ('name@example.com'), apply explicit spoken cues ('new line' / 'neue Zeile', 'new paragraph' / 'neuer Absatz') as real breaks (removing the cue), separate spoken greetings/sign-offs cleanly, and never inject corporate buzzwords or unrequested formality."""
     ),
     STRICT_CLEANUP(
@@ -150,9 +335,50 @@ enum class GemmaPromptPreset(
         id = "custom",
         title = "Custom System Prompt",
         shortLabel = "Custom",
-        subtitle = "Write your own custom system instruction for how Gemma 4 E2B transforms dictated speech",
+        subtitle = "Write your own custom system instruction for how the selected AI model transforms dictated speech",
         defaultSystemPrompt = "Resolve mid-sentence self-corrections, remove vocal fillers ('um', 'uh', 'like') and stutters, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning."
     );
+
+    /**
+     * Returns the task instruction specifically optimized for [llmChoice]'s parameter scale,
+     * prefill bucket efficiency, and instruction-following behavior.
+     */
+    fun promptForModel(llmChoice: LlmModelChoice): String = when (llmChoice.promptTier) {
+        LlmPromptTier.COMPACT_0_6B -> when (this) {
+            CLEAN_AND_POLISH -> """Clean and format the dictated speech while keeping the speaker's exact meaning, tone, and language:
+- Self-corrections: When the speaker corrects themselves ('wait', 'no wait', 'actually', 'I mean', 'make that', 'nein warte', 'ich meine'), keep ONLY the final intended phrase.
+- Fillers & punctuation: Remove hesitation sounds ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('I I', 'the the'), and false mid-sentence periods. Fix capitalization and sentence punctuation. Keep spoken questions as questions.
+- Lists: Format spoken sequences ('first... second... third...', 'erstens... zweitens...') as '1. ', '2. ' numbered lines after a ':', and 'bullet point' cues as '- ' lines. Keep short inline series ('milk, eggs, and bread') on one line.
+- Numbers & tech: Write 10+, decimals ('3.5'), percentages ('25%'), money ('$1,500', '49,99 €'), times ('3:30 PM', '14:30'), versions ('2.8.0'), and units ('8 GB', '500 ms') as digits; keep one to nine as words in prose. Capitalize acronyms ('NPU', 'GPU', 'RAM', 'API', 'GitHub') and format spoken emails ('name@example.com')."""
+            STRICT_CLEANUP -> "Clean the dictated text verbatim: remove fillers ('um', 'uh', 'äh', 'ähm', 'hm'), stutters, and mid-sentence self-corrections (keep only the correction), write 10+, decimals, times, money, versions, and units ('8 GB', '500 ms') as digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'API'), and fix punctuation and capitalization without changing the speaker's words."
+            CONCISE_DIRECT -> "Rewrite the dictated speech into short, clear, direct sentences in the same language. Keep only the final wording after any self-correction, strip all fillers and repetition, use '1. ' or '- ' lists for multiple items, and write numbers, times, money, versions, and units cleanly as digits while keeping all facts."
+            PROFESSIONAL_MESSAGE -> "Format the dictated speech as a clean email or work message in the same language. Remove fillers and self-corrections, put spoken greetings ('Hi Sarah,') and sign-offs ('Best,\\nAlex') on separate lines, format action items as '1. ' or '- ' lists, and write dates, times, money, versions, and units as digits. Do not invent greetings that were not spoken."
+            STRUCTURED_NOTES -> "Turn the dictated speech into clean '- ' bullet notes (or '1. ' numbered steps for sequences) in the same language. Remove fillers and self-corrections, and format numbers, times, dates, versions, and units as digits."
+            CUSTOM -> defaultSystemPrompt
+        }
+
+        LlmPromptTier.DIRECT_INSTRUCT_1_5B -> when (this) {
+            CLEAN_AND_POLISH -> """Act as a deterministic speech-to-text cleanup filter (NOT a conversational assistant). Output the speaker's dictated message cleaned and formatted in their own voice and language:
+- Backtracks & self-repairs: If the speaker retracts words mid-sentence ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'make that', 'scratch that', 'nein warte', 'ich meine'), delete both the retracted words and the repair cue, keeping only the corrected wording. Preserve real contrasts ('not X, but Y').
+- Disfluencies & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word repeats ('the the'), and filler 'like'/'you know' when used purely as hesitation (keep literal uses like 'I like this'). Fix false pause periods and capitalization. Preserve questions as questions — never answer them.
+- Automatic lists: Turn explicit spoken enumerations ('first... second... third...', 'one... two... three...', 'erstens... zweitens...') into vertical '1. ', '2. ' lists with a ':' on the lead-in phrase, and 'bullet point'/'dash' cues into '- ' bullets. Keep casual 3-item inline phrases inline.
+- Numbers, dates & tech: Spell out standalone counts one through nine in prose, and use digits for 10+, decimals ('3.5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, times ('3:30 PM', '14:30'), versions ('2.8.0'), ranges ('10–15'), and units ('8 GB', '500 ms', '16 kHz'). Capitalize acronyms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'GitHub'), format dictated emails ('name@example.com'), and apply spoken 'new line'/'new paragraph' breaks cleanly."""
+            STRICT_CLEANUP -> "Act strictly as a verbatim transcript cleaner (never reply as an assistant): remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and mid-sentence self-repairs (keeping only the intended repair), convert 10+, decimals, percentages, currencies, dates, times, versions, and units into digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and fix punctuation and capitalization without rephrasing."
+            else -> defaultSystemPrompt
+        }
+
+        LlmPromptTier.BALANCED_1_7B -> when (this) {
+            CLEAN_AND_POLISH -> """Edit raw spoken dictation into clean, natural written text that reads smoothly while keeping the speaker's exact voice, tone, intent, and language:
+- Mid-sentence backtracks: When the speaker changes course ('actually', 'wait', 'no wait', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine'), remove both the abandoned phrase and the repair cue, keeping only the final intended words. Keep true contrasts ('not X, but Y').
+- Fillers & punctuation: Strip vocal hesitations ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), false starts, and hesitation 'like'/'you know' (never remove literal 'like' in 'I like this' or 'looks like'). Repair mid-sentence pause periods and capitalization.
+- Smart list layout: Format clear spoken sequences ('first... second... third...', 'one... two... three...', 'erstens... zweitens...') as vertical '1. ', '2. ' lists with a colon ':' after any lead-in clause, and 'bullet point'/'dash item' cues as '- ' lists. Keep short casual series ('milk, eggs, and bread') inline.
+- Numbers, times & units: Spell out standalone counts one to nine in ordinary prose (and idioms like 'one of the', 'a couple of'), and format 10+, decimals ('3.5' / '3,5'), percentages ('25%'), currencies ('$1,500', '49,99 €'), dates, clock times ('3:30 PM', '14:30'), versions ('2.8.0'), ranges ('10–15'), and units ('8 GB', '500 ms', '16 kHz', '24 °C') as clean digits.
+- Tech terms, emails & breaks: Capitalize acronyms & identifiers ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format spoken emails/URLs ('name@example.com'), and turn explicit spoken 'new line'/'new paragraph' cues into line breaks without adding unrequested formality."""
+            else -> defaultSystemPrompt
+        }
+
+        LlmPromptTier.FLAGSHIP_GEMMA_4 -> defaultSystemPrompt
+    }
 
     companion object {
         fun fromId(id: String?): GemmaPromptPreset {
@@ -209,6 +435,7 @@ data class ModelSettings(
     val earEnabled: Boolean = true,
     val punctEnabled: Boolean = false,
     val gemmaEnabled: Boolean = false,
+    val selectedLlmModel: LlmModelChoice = LlmModelChoice.QWEN_3_0_6B,
     val gemmaDisableThinking: Boolean = false,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
@@ -222,54 +449,60 @@ data class ModelSettings(
     val vozEnabled: Boolean = true
 
     /**
-     * Resolves the active task instruction for Gemma 4 E2B based on [gemmaPromptPreset] and [gemmaCustomPrompt].
+     * Resolves the active model-optimized task instruction based on [selectedLlmModel],
+     * [gemmaPromptPreset], and [gemmaCustomPrompt].
      */
     fun resolvedGemmaTaskInstruction(): String {
         return if (gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
-            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.defaultSystemPrompt }
+            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForModel(selectedLlmModel) }
         } else {
-            gemmaPromptPreset.defaultSystemPrompt
+            gemmaPromptPreset.promptForModel(selectedLlmModel)
         }
     }
 
     /**
-     * Active disk footprint in MB based on currently enabled models:
-     * - `Voz`: 1,187 MB
-     * - `Ear`: +10 MB
-     * - `Punct`: +282 MB
-     * - `Gemma 4 E2B` (Experimental): +2,468 MB
+     * Active disk footprint in MB based on currently enabled models (at most one selected LLM).
      */
     val activeDiskFootprintMb: Int
         get() = DesertAntModel.VOZ.sizeMb +
             (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
             (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
-            (if (gemmaEnabled) DesertAntModel.GEMMA_4_E2B.sizeMb else 0)
+            (if (gemmaEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on loaded LiteRT/ONNX/LiteRT-LM model weights + runtime buffers:
+     * Estimated peak RAM in MB based on models that can ever co-reside in RAM:
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
-     * - `Punct` (INT8 XLM-RoBERTa token classifier on NPU/XNNPACK): +120 MB
-     * - `Gemma 4 E2B` (2/4/8-bit QAT weights + mmap embeddings via LiteRT-LM): +850 MB
+     * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
+     *   - Active LLM (`Qwen 3 0.6B Lite` +350 MB, `Qwen 3 0.6B` +450 MB, `Qwen 3 1.7B` +650 MB,
+     *     `Qwen 2.5 1.5B` +750 MB, `Gemma 4 E2B` +850 MB), OR
+     *   - `Punct` (+120 MB) when AI post-processing is disabled.
      */
     val estimatedPeakRamMb: Int
         get() = 1400 +
             (if (earEnabled) 50 else 0) +
-            (if (punctEnabled) 120 else 0) +
-            (if (gemmaEnabled) 850 else 0)
+            when {
+                gemmaEnabled -> selectedLlmModel.estimatedIncrementalRamMb
+                punctEnabled -> 120
+                else -> 0
+            }
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
         DesertAntModel.VOZ -> true
         DesertAntModel.EAR -> earEnabled
         DesertAntModel.PUNCT -> punctEnabled
-        DesertAntModel.GEMMA_4_E2B -> gemmaEnabled
+        DesertAntModel.QWEN_3_0_6B_LITE,
+        DesertAntModel.QWEN_3_0_6B,
+        DesertAntModel.QWEN_3_1_7B,
+        DesertAntModel.QWEN_2_5_1_5B,
+        DesertAntModel.GEMMA_4_E2B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
     }
 
     fun enabledModels(): List<DesertAntModel> = buildList {
         add(DesertAntModel.VOZ)
         if (earEnabled) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (gemmaEnabled) add(DesertAntModel.GEMMA_4_E2B)
+        if (gemmaEnabled) add(selectedLlmModel.desertAntModel)
     }
 
     companion object {
@@ -277,6 +510,7 @@ data class ModelSettings(
         const val KEY_EAR_ENABLED = "ear_enabled"
         const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
+        const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
         const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
@@ -309,11 +543,20 @@ data class ModelSettings(
                 prefs.getString(KEY_GEMMA_PROMPT_PRESET, GemmaPromptPreset.CLEAN_AND_POLISH.id)
             )
             val customPrompt = prefs.getString(KEY_GEMMA_CUSTOM_PROMPT, "") ?: ""
+            val gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
+            val selectedLlm = if (prefs.contains(KEY_SELECTED_LLM_MODEL)) {
+                LlmModelChoice.fromId(prefs.getString(KEY_SELECTED_LLM_MODEL, null))
+            } else if (gemmaEnabled || DesertAntModelStorage.isModelDownloaded(context, DesertAntModel.GEMMA_4_E2B)) {
+                LlmModelChoice.GEMMA_4_E2B
+            } else {
+                LlmModelChoice.QWEN_3_0_6B
+            }
 
             return ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
-                gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false),
+                gemmaEnabled = gemmaEnabled,
+                selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, false),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
@@ -342,6 +585,7 @@ data class ModelSettings(
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
+                .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
                 .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
@@ -403,6 +647,10 @@ object DesertAntModelStorage {
         DesertAntModel.VOZ to "v0.4.0",
         DesertAntModel.EAR to "v0.2.0",
         DesertAntModel.PUNCT to "v1.0.0",
+        DesertAntModel.QWEN_3_0_6B_LITE to "v1.0.0",
+        DesertAntModel.QWEN_3_0_6B to "v1.0.0",
+        DesertAntModel.QWEN_3_1_7B to "v1.0.0",
+        DesertAntModel.QWEN_2_5_1_5B to "v1.0.0",
         DesertAntModel.GEMMA_4_E2B to "v1.0.0"
     )
 

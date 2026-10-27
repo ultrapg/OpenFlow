@@ -31,6 +31,7 @@ import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DictationChunkSettings
 import com.voicebubble.openflow.settings.HardwareAccelerator
+import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.CancellationException
@@ -135,34 +136,73 @@ data class MemoryPressureReport(
 
     /**
      * Whether enough free system & JVM RAM exists to hold a pre-prefilled standby system-prompt `Conversation`
-     * in Gemma's KV cache (~150–250 MB) while idle or recording.
+     * in Gemma 4 E2B's KV cache (~150–250 MB) while idle or recording.
      */
     val canPrewarmGemmaPromptCache: Boolean
         get() = !isAnyMemoryTight && systemAvailMb >= 1_350L && jvmFreeHeadroomMb >= 96L
 
     /**
-     * Determines whether `Voz` (~1.3 GB) and `Gemma 4 E2B` (~1.9 GB) can safely stay co-resident in RAM
+     * Scales system-prompt KV-cache pre-warming threshold to the active [llmChoice]'s KV footprint.
+     */
+    fun canPrewarmLlmPromptCache(llmChoice: LlmModelChoice): Boolean {
+        if (llmChoice == LlmModelChoice.GEMMA_4_E2B) return canPrewarmGemmaPromptCache
+        return !isAnyMemoryTight && systemAvailMb >= 900L && jvmFreeHeadroomMb >= 72L
+    }
+
+    /**
+     * Determines whether `Voz` (~1.3 GB) and the selected [llmChoice] can safely stay co-resident in RAM
      * without risking an Android LMKD out-of-memory kill.
      *
      * Accounts for whether each model's memory is *already* reflected in [systemAvailMb] or still needs
      * to be allocated on top of current usage.
      */
+    fun canKeepVozAndLlmCoResident(
+        llmChoice: LlmModelChoice,
+        vozAlreadyLoaded: Boolean,
+        llmAlreadyLoaded: Boolean
+    ): Boolean {
+        if (isAnyMemoryTight) return false
+        if (llmChoice == LlmModelChoice.GEMMA_4_E2B) {
+            return when {
+                vozAlreadyLoaded && llmAlreadyLoaded ->
+                    systemAvailMb >= 1_050L
+                vozAlreadyLoaded && !llmAlreadyLoaded ->
+                    systemTotalMb >= 7_200L && systemAvailMb >= 2_100L
+                !vozAlreadyLoaded && llmAlreadyLoaded ->
+                    systemTotalMb >= 7_200L && systemAvailMb >= 2_150L
+                else ->
+                    systemTotalMb >= 7_500L && systemAvailMb >= 2_500L
+            }
+        }
+        val llmNeedMb = llmChoice.estimatedStandaloneRamMb.toLong()
+        val minTotalRamMb = when {
+            llmNeedMb <= 700L -> 3_600L
+            llmNeedMb <= 1_150L -> 5_200L
+            else -> 5_600L
+        }
+        return when {
+            vozAlreadyLoaded && llmAlreadyLoaded ->
+                systemAvailMb >= 800L
+            vozAlreadyLoaded && !llmAlreadyLoaded ->
+                systemTotalMb >= minTotalRamMb && systemAvailMb >= llmNeedMb + 500L
+            !vozAlreadyLoaded && llmAlreadyLoaded ->
+                systemTotalMb >= minTotalRamMb && systemAvailMb >= 1_850L
+            else ->
+                systemTotalMb >= minTotalRamMb && systemAvailMb >= llmNeedMb + 1_650L
+        }
+    }
+
+    /**
+     * Backwards-compatible helper for Gemma 4 E2B co-residency checks.
+     */
     fun canKeepVozAndGemmaCoResident(
         vozAlreadyLoaded: Boolean,
         gemmaAlreadyLoaded: Boolean
-    ): Boolean {
-        if (isAnyMemoryTight) return false
-        return when {
-            vozAlreadyLoaded && gemmaAlreadyLoaded ->
-                systemAvailMb >= 1_050L
-            vozAlreadyLoaded && !gemmaAlreadyLoaded ->
-                systemTotalMb >= 7_200L && systemAvailMb >= 2_100L
-            !vozAlreadyLoaded && gemmaAlreadyLoaded ->
-                systemTotalMb >= 7_200L && systemAvailMb >= 2_150L
-            else ->
-                systemTotalMb >= 7_500L && systemAvailMb >= 2_500L
-        }
-    }
+    ): Boolean = canKeepVozAndLlmCoResident(
+        llmChoice = LlmModelChoice.GEMMA_4_E2B,
+        vozAlreadyLoaded = vozAlreadyLoaded,
+        llmAlreadyLoaded = gemmaAlreadyLoaded
+    )
 }
 
 /**
@@ -176,12 +216,12 @@ data class PipelineStatus(
     val activeGemmaBackendLabel: String? = null,
     val detectedNpuSummary: String = NpuHardwareManager.detectHardwareProfile().summaryLabel,
     val dynamicLoadingMode: String = "Adaptive Stage Management",
-    val modelStates: Map<DesertAntModel, ModelLoadState> = mapOf(
-        DesertAntModel.VOZ to ModelLoadState.STANDBY,
-        DesertAntModel.EAR to ModelLoadState.STANDBY,
-        DesertAntModel.PUNCT to ModelLoadState.DISABLED,
-        DesertAntModel.GEMMA_4_E2B to ModelLoadState.DISABLED
-    ),
+    val modelStates: Map<DesertAntModel, ModelLoadState> = DesertAntModel.entries.associateWith { model ->
+        when (model) {
+            DesertAntModel.VOZ, DesertAntModel.EAR -> ModelLoadState.STANDBY
+            else -> ModelLoadState.DISABLED
+        }
+    },
     val statusMessage: String = "Models on disk — ready to load",
     val lastInferenceMs: Long? = null,
     val lastAudioDurationMs: Long? = null,
@@ -200,6 +240,7 @@ data class PipelineStatus(
  * 1. `Ear` — Spoken language identification (optional)
  * 2. `Voz` — Multilingual speech-to-text across 25 European languages
  * 3. Cross-chunk stitching & custom vocabulary normalization
+ * 4. Optional single-model AI post-processing (`Qwen 3` / `Qwen 2.5` / `Gemma 4 E2B` via `LiteRT-LM`) or `Punct`
  */
 class SmartPipeline(
     context: Context,
@@ -209,7 +250,8 @@ class SmartPipeline(
     companion object {
         private const val TAG = "SmartPipeline"
         const val SAMPLE_RATE_HZ: Double = 16_000.0
-        const val IDLE_TIMEOUT_MS: Long = 20 * 60_000L // 20 minutes warm retention
+        const val IDLE_TIMEOUT_MS: Long = 20 * 60_000L // 20 minutes warm retention for core audio
+        const val LLM_IDLE_TIMEOUT_MS: Long = 5 * 60_000L // 5 minutes burst retention for on-demand LLM
         private const val SILENCE_THRESHOLD: Float = 0.0035f
         private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
 
@@ -236,6 +278,7 @@ class SmartPipeline(
     private val pipelineMutex = Mutex()
     private val idleScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var idleEvictionJob: Job? = null
+    private var llmIdleEvictionJob: Job? = null
     private var promptPrewarmJob: Job? = null
 
     @Volatile
@@ -253,6 +296,7 @@ class SmartPipeline(
     private var ear: Ear? = null
     private var punctRestorer: PunctuationRestorer? = null
     private var gemmaProcessor: GemmaTextProcessor? = null
+    private var loadedLlmChoice: LlmModelChoice? = null
 
     private var vozWarmedUp: Boolean = false
     private var earWarmedUp: Boolean = false
@@ -328,7 +372,11 @@ class SmartPipeline(
             )
 
             val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
-            ensureAuxiliaryModelsLocked(currentSettings, warmUp = warmUp && !memReport.isAnyMemoryTight)
+            ensureAuxiliaryModelsLocked(
+                activeSettings = currentSettings,
+                warmUp = warmUp && !memReport.isAnyMemoryTight,
+                preloadLlmIfCoResident = forceReload
+            )
             appliedSettingsSnapshot = currentSettings
             resetIdleEvictionTimerLocked()
 
@@ -388,23 +436,73 @@ class SmartPipeline(
 
     /**
      * Triggered asynchronously when the user taps the microphone bubble to start recording.
-     * Pre-fills Gemma 4 E2B's system-prompt KV cache (`prefillPrefaceOnInit = true`) for the currently
-     * focused app & cursor context while the user is speaking, using `pipelineMutex.tryLock()` so it
-     * never blocks or delays live `Voz` chunk transcription.
+     * Lazily loads the single selected LLM into RAM (if on-demand standby and co-residency RAM allows)
+     * and pre-fills its system-prompt KV cache (`prefillPrefaceOnInit = true`) for the currently focused app &
+     * cursor context while the user is speaking, using `pipelineMutex.tryLock()` so it never blocks or delays
+     * live `Voz` chunk transcription.
      */
     fun onRecordingStartedAsync() {
         val snap = settings
         if (!snap.gemmaEnabled || isTranscribing) return
+        llmIdleEvictionJob?.cancel()
+        llmIdleEvictionJob = null
         promptPrewarmJob?.cancel()
         promptPrewarmJob = idleScope.launch {
             if (isTranscribing || !pipelineMutex.tryLock()) return@launch
             try {
                 if (isTranscribing) return@launch
                 val activeSnap = settings
-                val gemma = gemmaProcessor ?: return@launch
-                if (!activeSnap.gemmaEnabled) return@launch
+                if (!isActiveLlmReadyOnDisk(activeSnap)) return@launch
+                val selectedLlm = activeSnap.selectedLlmModel
+
+                // Never hold a stale LLM or redundant Punct model in RAM alongside the active LLM
+                if (loadedLlmChoice != null && loadedLlmChoice != selectedLlm) {
+                    closeGemmaLocked()
+                }
+                if (punctRestorer != null) {
+                    closePunctLocked()
+                }
+
                 val mem = evaluateMemoryPressure()
-                if (mem.canPrewarmGemmaPromptCache) {
+                if (gemmaProcessor == null &&
+                    mem.canKeepVozAndLlmCoResident(
+                        llmChoice = selectedLlm,
+                        vozAlreadyLoaded = voz != null,
+                        llmAlreadyLoaded = false
+                    )
+                ) {
+                    try {
+                        val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
+                        gemmaProcessor = GemmaTextProcessor(
+                            context = appContext,
+                            modelDir = modelDir,
+                            accelerator = activeSnap.hardwareAccelerator,
+                            memoryMode = mem.gemmaMemoryMode,
+                            llmChoice = selectedLlm
+                        )
+                        loadedLlmChoice = selectedLlm
+                        gemmaWarmedUp = false
+                        DebugLogManager.logInfo(
+                            TAG,
+                            "Loaded ${selectedLlm.title} during recording overlap (${gemmaProcessor?.activeBackendSummary})",
+                            includeMemory = true
+                        )
+                        updateStatusSnapshot(
+                            activeSettings = activeSnap,
+                            phaseOverride = null,
+                            messageOverride = null
+                        )
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        DebugLogManager.logWarn(TAG, "Deferred ${selectedLlm.title} overlap load: ${t.message}")
+                        closeGemmaLocked()
+                        return@launch
+                    }
+                }
+
+                val gemma = gemmaProcessor ?: return@launch
+                val memAfterLoad = evaluateMemoryPressure()
+                if (memAfterLoad.canPrewarmLlmPromptCache(selectedLlm)) {
                     gemma.prewarmSystemPrompt(
                         preset = activeSnap.gemmaPromptPreset,
                         customPrompt = activeSnap.gemmaCustomPrompt,
@@ -431,16 +529,18 @@ class SmartPipeline(
                 if (isTranscribing) return@launch
                 val activeSnap = settings
                 val gemma = gemmaProcessor ?: return@launch
-                if (!activeSnap.gemmaEnabled) return@launch
+                if (!activeSnap.gemmaEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
+                val selectedLlm = activeSnap.selectedLlmModel
                 val mem = evaluateMemoryPressure()
-                if (mem.canPrewarmGemmaPromptCache && mem.systemAvailMb >= 1_600L) {
+                val minPostDictationAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 1_600L else 1_100L
+                if (mem.canPrewarmLlmPromptCache(selectedLlm) && mem.systemAvailMb >= minPostDictationAvailMb) {
                     gemma.prewarmSystemPrompt(
                         preset = activeSnap.gemmaPromptPreset,
                         customPrompt = activeSnap.gemmaCustomPrompt,
                         customVocabulary = activeSnap.customVocabulary,
                         disableThinking = activeSnap.gemmaDisableThinking
                     )
-                } else if (!mem.canPrewarmGemmaPromptCache) {
+                } else if (!mem.canPrewarmLlmPromptCache(selectedLlm)) {
                     gemma.evictCachedSystemPrompt()
                 }
             } finally {
@@ -471,6 +571,7 @@ class SmartPipeline(
                 appliedSettingsSnapshot?.earEnabled == snapshot.earEnabled &&
                 appliedSettingsSnapshot?.punctEnabled == snapshot.punctEnabled &&
                 appliedSettingsSnapshot?.gemmaEnabled == snapshot.gemmaEnabled &&
+                appliedSettingsSnapshot?.selectedLlmModel == snapshot.selectedLlmModel &&
                 appliedSettingsSnapshot?.hardwareAccelerator == snapshot.hardwareAccelerator
             if (!accelChanged &&
                 modelSelectionUnchanged &&
@@ -479,9 +580,9 @@ class SmartPipeline(
             ) {
                 appliedSettingsSnapshot = snapshot
                 val currentGemma = gemmaProcessor
-                if (snapshot.gemmaEnabled && currentGemma != null) {
+                if (snapshot.gemmaEnabled && currentGemma != null && loadedLlmChoice == snapshot.selectedLlmModel) {
                     val mem = evaluateMemoryPressure()
-                    if (mem.canPrewarmGemmaPromptCache) {
+                    if (mem.canPrewarmLlmPromptCache(snapshot.selectedLlmModel)) {
                         currentGemma.prewarmSystemPrompt(
                             preset = snapshot.gemmaPromptPreset,
                             customPrompt = snapshot.gemmaCustomPrompt,
@@ -520,8 +621,11 @@ class SmartPipeline(
                 System.gc()
             } else {
                 if (!snapshot.earEnabled) closeEarLocked()
-                if (!snapshot.punctEnabled) closePunctLocked()
-                if (!snapshot.gemmaEnabled) closeGemmaLocked()
+                if (!snapshot.punctEnabled || isActiveLlmReadyOnDisk(snapshot)) closePunctLocked()
+                if (!snapshot.gemmaEnabled || (loadedLlmChoice != null && loadedLlmChoice != snapshot.selectedLlmModel)) {
+                    closeGemmaLocked()
+                    System.gc()
+                }
             }
 
             updateStatusSnapshot(
@@ -531,7 +635,11 @@ class SmartPipeline(
             )
 
             val vozOk = ensureVozLocked(snapshot, warmUp = true)
-            ensureAuxiliaryModelsLocked(snapshot, warmUp = !memReport.isAnyMemoryTight)
+            ensureAuxiliaryModelsLocked(
+                activeSettings = snapshot,
+                warmUp = !memReport.isAnyMemoryTight,
+                preloadLlmIfCoResident = false
+            )
             appliedSettingsSnapshot = snapshot
             resetIdleEvictionTimerLocked()
 
@@ -585,6 +693,8 @@ class SmartPipeline(
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            llmIdleEvictionJob?.cancel()
+            llmIdleEvictionJob = null
             promptPrewarmJob?.cancel()
             promptPrewarmJob = null
             isTranscribing = true
@@ -737,15 +847,20 @@ class SmartPipeline(
                 }
 
                 // Re-attach core & auxiliary models in ready state if memory is healthy,
-                // guaranteeing Voz and Gemma never co-reside when free RAM cannot hold both.
+                // guaranteeing Voz and the selected LLM never co-reside when free RAM cannot hold both.
                 val postMem = evaluateMemoryPressure()
                 if (voz == null && !postMem.isCriticalPressure) {
+                    val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
                     if (gemmaProcessor != null &&
-                        !postMem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true)
+                        !postMem.canKeepVozAndLlmCoResident(
+                            llmChoice = activeLlm,
+                            vozAlreadyLoaded = false,
+                            llmAlreadyLoaded = true
+                        )
                     ) {
                         DebugLogManager.logInfo(
                             TAG,
-                            "Unloading Gemma 4 E2B before reloading Voz so low/moderate-RAM device stays OOM-safe (sysAvail=${postMem.systemAvailMb}MB)"
+                            "Unloading ${activeLlm.title} before reloading Voz so low/moderate-RAM device stays OOM-safe (sysAvail=${postMem.systemAvailMb}MB)"
                         )
                         closeGemmaLocked()
                         System.gc()
@@ -753,7 +868,11 @@ class SmartPipeline(
                     ensureVozLocked(activeSettings, warmUp = false)
                 }
                 if (!postMem.isCriticalPressure) {
-                    ensureAuxiliaryModelsLocked(activeSettings, warmUp = false)
+                    ensureAuxiliaryModelsLocked(
+                        activeSettings = activeSettings,
+                        warmUp = false,
+                        preloadLlmIfCoResident = false
+                    )
                 }
                 if (applyPostProcessing && activeSettings.gemmaEnabled && gemmaProcessor != null) {
                     schedulePostDictationPromptPrewarm()
@@ -793,7 +912,7 @@ class SmartPipeline(
     }
 
     /**
-     * Runs `Punct` (if enabled) and Experimental `Gemma 4 E2B` (if enabled) once over the
+     * Runs single-model AI post-processing (or `Punct` if no LLM is active) once over the
      * complete stitched transcript at the end of a live-streaming dictation session.
      */
     suspend fun postProcessFinalTranscript(
@@ -805,13 +924,14 @@ class SmartPipeline(
         val snapSettings = settings
         val needsPunct = snapSettings.punctEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
-        val needsGemma = snapSettings.gemmaEnabled &&
-            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B)
+        val needsGemma = isActiveLlmReadyOnDisk(snapSettings)
         if (!needsPunct && !needsGemma) return@withContext text
 
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            llmIdleEvictionJob?.cancel()
+            llmIdleEvictionJob = null
             promptPrewarmJob?.cancel()
             promptPrewarmJob = null
             isTranscribing = true
@@ -829,12 +949,17 @@ class SmartPipeline(
                 )
                 val postMem = evaluateMemoryPressure()
                 if (voz == null && !postMem.isCriticalPressure) {
+                    val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
                     if (gemmaProcessor != null &&
-                        !postMem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = false, gemmaAlreadyLoaded = true)
+                        !postMem.canKeepVozAndLlmCoResident(
+                            llmChoice = activeLlm,
+                            vozAlreadyLoaded = false,
+                            llmAlreadyLoaded = true
+                        )
                     ) {
                         DebugLogManager.logInfo(
                             TAG,
-                            "Unloading Gemma 4 E2B before reloading Voz after streaming session (sysAvail=${postMem.systemAvailMb}MB)"
+                            "Unloading ${activeLlm.title} before reloading Voz after streaming session (sysAvail=${postMem.systemAvailMb}MB)"
                         )
                         closeGemmaLocked()
                         System.gc()
@@ -860,13 +985,37 @@ class SmartPipeline(
     }
 
     /**
-     * Evicts optional models (`Ear`, `Punct`, `Gemma 4 E2B`) from native RAM while keeping `Voz` resident.
+     * Evicts an idle on-demand LLM after [LLM_IDLE_TIMEOUT_MS] so RAM returns to baseline between dictation bursts.
+     */
+    private suspend fun evictIdleLlm() = withContext(Dispatchers.Default) {
+        pipelineMutex.withLock {
+            if (!isTranscribing && gemmaProcessor != null) {
+                val evictedName = loadedLlmChoice?.title ?: "LLM"
+                Log.i(TAG, "Evicting idle $evictedName after 5m inactivity; keeping Voz warm.")
+                DebugLogManager.logInfo(TAG, "Evicting idle $evictedName from RAM (on-demand standby)", includeMemory = true)
+                closeGemmaLocked()
+                System.gc()
+                val snap = settings
+                val count = countLoadedModelsLocked(snap)
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                )
+            }
+        }
+    }
+
+    /**
+     * Evicts optional models (`Ear`, `Punct`, active LLM) from native RAM while keeping `Voz` resident.
      */
     suspend fun evictOptionalModels() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             if (!isTranscribing) {
-                Log.i(TAG, "Evicting optional models (Ear, Punct, Gemma 4 E2B) to free native RAM; keeping Voz resident.")
-                DebugLogManager.logInfo(TAG, "Evicting optional models (Ear, Punct, Gemma 4 E2B) from native RAM", includeMemory = true)
+                llmIdleEvictionJob?.cancel()
+                llmIdleEvictionJob = null
+                Log.i(TAG, "Evicting optional models (Ear, Punct, LLM) to free native RAM; keeping Voz resident.")
+                DebugLogManager.logInfo(TAG, "Evicting optional models (Ear, Punct, LLM) from native RAM", includeMemory = true)
                 closeEarLocked()
                 closePunctLocked()
                 closeGemmaLocked()
@@ -883,9 +1032,9 @@ class SmartPipeline(
 
     /**
      * Multi-tier Android OS memory pressure handler:
-     * - Moderate / UI-hidden pressure: immediately evicts Gemma's standby system-prompt KV cache (~150–250 MB)
+     * - Moderate / UI-hidden pressure: immediately evicts the LLM's standby system-prompt KV cache
      *   without unloading model weights.
-     * - Running-low / background pressure: evicts optional native models (`Ear`, `Punct`, `Gemma 4 E2B`).
+     * - Running-low / background pressure: evicts optional native models (`Ear`, `Punct`, active LLM).
      * - Critical pressure with critically low physical RAM: also unloads `Voz` when idle so LMKD never kills
      *   the foreground dictation service (`Voz` reloads transparently on the next tap).
      */
@@ -903,6 +1052,8 @@ class SmartPipeline(
             idleScope.launch {
                 pipelineMutex.withLock {
                     if (!isTranscribing) {
+                        llmIdleEvictionJob?.cancel()
+                        llmIdleEvictionJob = null
                         closeEarLocked()
                         closePunctLocked()
                         closeGemmaLocked()
@@ -935,12 +1086,14 @@ class SmartPipeline(
     }
 
     /**
-     * Releases all native LiteRT/ONNX/LiteRT-LM sessions (`Ear`, `Punct`, `Gemma 4 E2B`, and `Voz`).
+     * Releases all native LiteRT/ONNX/LiteRT-LM sessions (`Ear`, `Punct`, active LLM, and `Voz`).
      */
     suspend fun shutdown() = withContext(Dispatchers.Default) {
         pipelineMutex.withLock {
             idleEvictionJob?.cancel()
             idleEvictionJob = null
+            llmIdleEvictionJob?.cancel()
+            llmIdleEvictionJob = null
             promptPrewarmJob?.cancel()
             promptPrewarmJob = null
             closeEarLocked()
@@ -1040,8 +1193,20 @@ class SmartPipeline(
         }
     }
 
+    private fun isActiveLlmReadyOnDisk(activeSettings: ModelSettings): Boolean {
+        return activeSettings.gemmaEnabled &&
+            DesertAntModelStorage.isModelDownloaded(appContext, activeSettings.selectedLlmModel.desertAntModel)
+    }
+
     private fun areEnabledModelsReadyOrStandbyLocked(activeSettings: ModelSettings): Boolean {
         if (voz == null) return false
+        if (!activeSettings.gemmaEnabled && gemmaProcessor != null) return false
+        if (activeSettings.gemmaEnabled && loadedLlmChoice != null && loadedLlmChoice != activeSettings.selectedLlmModel) {
+            return false
+        }
+        val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
+        if (activeLlmOnDisk && punctRestorer != null) return false
+
         val mem = evaluateMemoryPressure()
         if (!mem.isCriticalPressure) {
             if (activeSettings.earEnabled &&
@@ -1051,15 +1216,9 @@ class SmartPipeline(
                 return false
             }
             if (activeSettings.punctEnabled &&
+                !activeLlmOnDisk &&
                 DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT) &&
                 punctRestorer == null
-            ) {
-                return false
-            }
-            if (activeSettings.gemmaEnabled &&
-                DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B) &&
-                mem.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = voz != null, gemmaAlreadyLoaded = gemmaProcessor != null) &&
-                gemmaProcessor == null
             ) {
                 return false
             }
@@ -1284,8 +1443,13 @@ class SmartPipeline(
         return true
     }
 
-    private suspend fun ensureAuxiliaryModelsLocked(activeSettings: ModelSettings, warmUp: Boolean) {
+    private suspend fun ensureAuxiliaryModelsLocked(
+        activeSettings: ModelSettings,
+        warmUp: Boolean,
+        preloadLlmIfCoResident: Boolean = false
+    ) {
         val mem = evaluateMemoryPressure()
+        val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
 
         if (mem.isCriticalPressure) {
             DebugLogManager.logInfo(
@@ -1341,7 +1505,13 @@ class SmartPipeline(
         }
 
         // Punct (Neural Punctuation & Casing Restoration on NPU/XNNPACK)
-        if (activeSettings.punctEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)) {
+        // Never keep Punct loaded in RAM when an on-device LLM is enabled & downloaded (LLM handles punctuation in one pass)
+        if (activeLlmOnDisk) {
+            if (punctRestorer != null) {
+                DebugLogManager.logInfo(TAG, "Unloading Punct because ${activeSettings.selectedLlmModel.title} handles punctuation & formatting")
+                closePunctLocked()
+            }
+        } else if (activeSettings.punctEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)) {
             if (punctRestorer == null && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
@@ -1386,60 +1556,69 @@ class SmartPipeline(
             closePunctLocked()
         }
 
-        // Experimental Gemma 4 E2B (LiteRT-LM on NPU / GPU / CPU)
-        if (activeSettings.gemmaEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B)) {
-            val gemmaMem = evaluateMemoryPressure()
-            val canPreloadGemma = gemmaMem.canKeepVozAndGemmaCoResident(
+        // Single Selected On-Device LLM (LiteRT-LM on NPU / GPU / CPU)
+        // Strict single-model rule: immediately unload any previously loaded LLM before considering the selected one.
+        val selectedLlm = activeSettings.selectedLlmModel
+        if (!activeSettings.gemmaEnabled || (loadedLlmChoice != null && loadedLlmChoice != selectedLlm)) {
+            closeGemmaLocked()
+        }
+
+        if (activeLlmOnDisk) {
+            val llmMem = evaluateMemoryPressure()
+            val canKeepCoResident = llmMem.canKeepVozAndLlmCoResident(
+                llmChoice = selectedLlm,
                 vozAlreadyLoaded = voz != null,
-                gemmaAlreadyLoaded = gemmaProcessor != null
+                llmAlreadyLoaded = gemmaProcessor != null
             )
-            if (gemmaProcessor == null && canPreloadGemma) {
+            if (gemmaProcessor == null && preloadLlmIfCoResident && canKeepCoResident) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
-                        model = DesertAntModel.GEMMA_4_E2B,
+                        model = selectedLlm.desertAntModel,
                         state = ModelLoadState.LOADING,
-                        message = "Loading Gemma 4 E2B on NPU / LiteRT-LM..."
+                        message = "Loading ${selectedLlm.title} on LiteRT-LM..."
                     )
-                    val gemmaDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.GEMMA_4_E2B)
+                    val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
                     gemmaProcessor = GemmaTextProcessor(
                         context = appContext,
-                        modelDir = gemmaDir,
+                        modelDir = modelDir,
                         accelerator = activeSettings.hardwareAccelerator,
-                        memoryMode = gemmaMem.gemmaMemoryMode
+                        memoryMode = llmMem.gemmaMemoryMode,
+                        llmChoice = selectedLlm
                     )
+                    loadedLlmChoice = selectedLlm
                     gemmaWarmedUp = false
                     DebugLogManager.logInfo(
                         TAG,
-                        "Gemma 4 E2B loaded into RAM (${gemmaProcessor?.activeBackendSummary}, memMode=${gemmaMem.gemmaMemoryMode})",
+                        "${selectedLlm.title} loaded into RAM (${gemmaProcessor?.activeBackendSummary}, memMode=${llmMem.gemmaMemoryMode})",
                         includeMemory = true
                     )
                 } catch (t: Throwable) {
-                    Log.w(TAG, "Could not pre-load Gemma 4 E2B (will retry dynamically): ${t.message}")
-                    DebugLogManager.logError(TAG, "Could not pre-load Gemma 4 E2B", t)
+                    Log.w(TAG, "Could not pre-load ${selectedLlm.title} (will retry dynamically): ${t.message}")
+                    DebugLogManager.logError(TAG, "Could not pre-load ${selectedLlm.title}", t)
                     closeGemmaLocked()
                 }
-            } else if (gemmaProcessor != null && !canPreloadGemma) {
+            } else if (gemmaProcessor != null && !canKeepCoResident) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Releasing co-resident Gemma 4 E2B to preserve Voz RAM headroom (sysAvail=${gemmaMem.systemAvailMb}MB)"
+                    "Releasing co-resident ${selectedLlm.title} to preserve Voz RAM headroom (sysAvail=${llmMem.systemAvailMb}MB)"
                 )
                 closeGemmaLocked()
             } else if (gemmaProcessor == null) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Keeping Gemma 4 E2B on dynamic standby until post-processing stage (sysAvail=${gemmaMem.systemAvailMb}MB, total=${gemmaMem.systemTotalMb}MB)"
+                    "Keeping ${selectedLlm.title} on zero-RAM standby until recording starts (sysAvail=${llmMem.systemAvailMb}MB, total=${llmMem.systemTotalMb}MB)"
                 )
             }
 
             val currentGemma = gemmaProcessor
-            if (warmUp && currentGemma != null && !gemmaWarmedUp && !gemmaMem.isCriticalPressure) {
+            if (warmUp && currentGemma != null && !gemmaWarmedUp && !llmMem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
                         activeSettings = activeSettings,
-                        model = DesertAntModel.GEMMA_4_E2B,
+                        model = selectedLlm.desertAntModel,
                         state = ModelLoadState.LOADING,
-                        message = "Warming up Gemma 4 E2B & caching system prompt (${currentGemma.activeBackendSummary})..."
+                        message = "Warming up ${selectedLlm.title} & caching system prompt (${currentGemma.activeBackendSummary})..."
                     )
                     currentGemma.warmUp(
                         preset = activeSettings.gemmaPromptPreset,
@@ -1450,12 +1629,10 @@ class SmartPipeline(
                     gemmaWarmedUp = true
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
-                    Log.w(TAG, "Gemma 4 E2B warm-up deferred: ${t.message}")
-                    DebugLogManager.logWarn(TAG, "Gemma 4 E2B warm-up deferred", t)
+                    Log.w(TAG, "${selectedLlm.title} warm-up deferred: ${t.message}")
+                    DebugLogManager.logWarn(TAG, "${selectedLlm.title} warm-up deferred", t)
                 }
             }
-        } else if (!activeSettings.gemmaEnabled) {
-            closeGemmaLocked()
         }
     }
 
@@ -1468,8 +1645,40 @@ class SmartPipeline(
     ): String {
         if (text.isBlank()) return text
         var current = text
+        val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
 
-        // Stage 4: Neural Punctuation & Casing Restoration (`Punct`)
+        // When the selected LLM is enabled & downloaded, never load or run Punct alongside it
+        // (the LLM restores punctuation, casing, numbers, and formatting in a single pass).
+        if (activeLlmOnDisk) {
+            if (punctRestorer != null) {
+                closePunctLocked()
+            }
+            val (llmResult, llmSucceeded) = runGemmaLocked(
+                text = current,
+                language = resolvedLanguage,
+                activeSettings = activeSettings,
+                dynamicStageRelease = dynamicStageRelease,
+                onStageProgress = onStageProgress
+            )
+            current = llmResult
+            if (!llmSucceeded &&
+                activeSettings.punctEnabled &&
+                DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
+            ) {
+                current = runPunctLocked(
+                    text = current,
+                    language = resolvedLanguage,
+                    activeSettings = activeSettings,
+                    onStageProgress = onStageProgress
+                )
+                if (dynamicStageRelease && punctRestorer != null) {
+                    closePunctLocked()
+                }
+            }
+            return current
+        }
+
+        // Stage 4: Neural Punctuation & Casing Restoration (`Punct` — only when no LLM is active)
         if (activeSettings.punctEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
         ) {
@@ -1482,19 +1691,6 @@ class SmartPipeline(
             if (dynamicStageRelease && punctRestorer != null) {
                 closePunctLocked()
             }
-        }
-
-        // Stage 5: Experimental Gemma 4 E2B AI Post-Processing & Reformatting (`LiteRT-LM`)
-        if (activeSettings.gemmaEnabled &&
-            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.GEMMA_4_E2B)
-        ) {
-            current = runGemmaLocked(
-                text = current,
-                language = resolvedLanguage,
-                activeSettings = activeSettings,
-                dynamicStageRelease = dynamicStageRelease,
-                onStageProgress = onStageProgress
-            )
         }
 
         return current
@@ -1547,20 +1743,37 @@ class SmartPipeline(
         activeSettings: ModelSettings,
         dynamicStageRelease: Boolean,
         onStageProgress: ((String) -> Unit)?
-    ): String {
-        if (text.isBlank()) return text
+    ): Pair<String, Boolean> {
+        if (text.isBlank()) return text to true
+        val selectedLlm = activeSettings.selectedLlmModel
+
+        // Enforce strict single-LLM residency: close any different LLM immediately
+        if (loadedLlmChoice != null && loadedLlmChoice != selectedLlm) {
+            closeGemmaLocked()
+            System.gc()
+        }
+        // Never keep Punct loaded alongside an active LLM
+        if (punctRestorer != null) {
+            closePunctLocked()
+        }
 
         if (gemmaProcessor == null) {
             val preLoadMem = evaluateMemoryPressure()
-            if (preLoadMem.isAnyMemoryTight || preLoadMem.systemAvailMb < 2_200L) {
+            val earReleaseThresholdMb = selectedLlm.estimatedStandaloneRamMb.toLong() + 650L
+            if (preLoadMem.isAnyMemoryTight || preLoadMem.systemAvailMb < earReleaseThresholdMb) {
                 closeEarLocked()
-                closePunctLocked()
             }
             val memAfterAux = evaluateMemoryPressure()
-            if (voz != null && !memAfterAux.canKeepVozAndGemmaCoResident(vozAlreadyLoaded = true, gemmaAlreadyLoaded = false)) {
+            if (voz != null &&
+                !memAfterAux.canKeepVozAndLlmCoResident(
+                    llmChoice = selectedLlm,
+                    vozAlreadyLoaded = true,
+                    llmAlreadyLoaded = false
+                )
+            ) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Temporarily releasing Voz session to guarantee OOM-safe NPU/RAM headroom for Gemma 4 E2B (sysAvail=${memAfterAux.systemAvailMb}MB, total=${memAfterAux.systemTotalMb}MB)",
+                    "Temporarily releasing Voz session to guarantee OOM-safe RAM headroom for ${selectedLlm.title} (sysAvail=${memAfterAux.systemAvailMb}MB, total=${memAfterAux.systemTotalMb}MB)",
                     includeMemory = true
                 )
                 closeVozLocked()
@@ -1569,40 +1782,48 @@ class SmartPipeline(
         }
 
         val instance = gemmaProcessor ?: run {
-            val gemmaDir = DesertAntModelStorage.modelRevisionDir(appContext, DesertAntModel.GEMMA_4_E2B)
+            val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
             val memNow = evaluateMemoryPressure()
             try {
                 updateSingleModelStateLocked(
                     activeSettings = activeSettings,
-                    model = DesertAntModel.GEMMA_4_E2B,
+                    model = selectedLlm.desertAntModel,
                     state = ModelLoadState.LOADING,
-                    message = "Loading Gemma 4 E2B on NPU / LiteRT-LM..."
+                    message = "Loading ${selectedLlm.title} on LiteRT-LM..."
                 )
-                onStageProgress?.invoke("Loading Gemma 4 E2B")
+                onStageProgress?.invoke("Loading ${selectedLlm.shortLabel}")
                 GemmaTextProcessor(
                     context = appContext,
-                    modelDir = gemmaDir,
+                    modelDir = modelDir,
                     accelerator = activeSettings.hardwareAccelerator,
-                    memoryMode = memNow.gemmaMemoryMode
-                ).also { gemmaProcessor = it }
+                    memoryMode = memNow.gemmaMemoryMode,
+                    llmChoice = selectedLlm
+                ).also {
+                    gemmaProcessor = it
+                    loadedLlmChoice = selectedLlm
+                }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                Log.w(TAG, "Failed to dynamically load Gemma 4 E2B: ${t.message}")
-                DebugLogManager.logError(TAG, "Failed to dynamically load Gemma 4 E2B", t)
+                Log.w(TAG, "Failed to dynamically load ${selectedLlm.title}: ${t.message}")
+                DebugLogManager.logError(TAG, "Failed to dynamically load ${selectedLlm.title}", t)
                 closeGemmaLocked()
-                return text
+                return text to false
             }
         }
 
         return try {
             val presetLabel = activeSettings.gemmaPromptPreset.shortLabel
-            val thinkingLabel = if (activeSettings.gemmaDisableThinking) "No-Think" else "Thinking"
+            val thinkingLabel = when {
+                !selectedLlm.supportsThinking -> "Direct"
+                activeSettings.gemmaDisableThinking -> "No-Think"
+                else -> "Thinking"
+            }
             setModelActiveStatusLocked(
                 activeSettings,
-                DesertAntModel.GEMMA_4_E2B,
-                "Reformatting with Gemma 4 E2B ($presetLabel • $thinkingLabel • ${instance.activeBackendSummary})..."
+                selectedLlm.desertAntModel,
+                "Cleaning with ${selectedLlm.title} ($presetLabel • $thinkingLabel • ${instance.activeBackendSummary})..."
             )
-            onStageProgress?.invoke("Gemma 4 E2B")
+            onStageProgress?.invoke(selectedLlm.shortLabel)
             val processed = instance.process(
                 text = text,
                 preset = activeSettings.gemmaPromptPreset,
@@ -1613,25 +1834,27 @@ class SmartPipeline(
             )
             gemmaWarmedUp = true
             val postGemmaMem = evaluateMemoryPressure()
-            val cannotKeepAlongsideVoz = !postGemmaMem.canKeepVozAndGemmaCoResident(
+            val cannotKeepAlongsideVoz = !postGemmaMem.canKeepVozAndLlmCoResident(
+                llmChoice = selectedLlm,
                 vozAlreadyLoaded = voz != null,
-                gemmaAlreadyLoaded = true
+                llmAlreadyLoaded = true
             )
-            if (dynamicStageRelease || postGemmaMem.systemAvailMb < 950L || cannotKeepAlongsideVoz) {
+            val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
+            if (dynamicStageRelease || postGemmaMem.systemAvailMb < minPostPassAvailMb || cannotKeepAlongsideVoz) {
                 DebugLogManager.logInfo(
                     TAG,
-                    "Releasing Gemma 4 E2B session after pass so Voz & system RAM stay healthy (sysAvail=${postGemmaMem.systemAvailMb}MB)"
+                    "Releasing ${selectedLlm.title} session after pass so Voz & system RAM stay healthy (sysAvail=${postGemmaMem.systemAvailMb}MB)"
                 )
                 closeGemmaLocked()
                 System.gc()
             }
-            processed
+            processed to true
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
-            Log.w(TAG, "Gemma 4 E2B inference failed, keeping transcript: ${t.message}")
-            DebugLogManager.logWarn(TAG, "Gemma 4 E2B inference failed, keeping transcript", t)
+            Log.w(TAG, "${selectedLlm.title} inference failed, keeping transcript: ${t.message}")
+            DebugLogManager.logWarn(TAG, "${selectedLlm.title} inference failed, keeping transcript", t)
             closeGemmaLocked()
-            text
+            text to false
         }
     }
 
@@ -1640,7 +1863,9 @@ class SmartPipeline(
         if (voz != null) count++
         if (activeSettings.earEnabled && ear != null) count++
         if (activeSettings.punctEnabled && punctRestorer != null) count++
-        if (activeSettings.gemmaEnabled && gemmaProcessor != null) count++
+        if (activeSettings.gemmaEnabled && gemmaProcessor != null && loadedLlmChoice == activeSettings.selectedLlmModel) {
+            count++
+        }
         return count
     }
 
@@ -1657,11 +1882,12 @@ class SmartPipeline(
             } catch (_: Throwable) {
                 false
             }
-            val instanceLoaded = when (model) {
-                DesertAntModel.VOZ -> voz != null
-                DesertAntModel.EAR -> ear != null
-                DesertAntModel.PUNCT -> punctRestorer != null
-                DesertAntModel.GEMMA_4_E2B -> gemmaProcessor != null
+            val instanceLoaded = when {
+                model == DesertAntModel.VOZ -> voz != null
+                model == DesertAntModel.EAR -> ear != null
+                model == DesertAntModel.PUNCT -> punctRestorer != null
+                model.isLlmModel -> gemmaProcessor != null && loadedLlmChoice?.desertAntModel == model
+                else -> false
             }
             result[model] = when {
                 !enabled -> ModelLoadState.DISABLED
@@ -1745,6 +1971,15 @@ class SmartPipeline(
             delay(IDLE_TIMEOUT_MS)
             evictOptionalModels()
         }
+        llmIdleEvictionJob?.cancel()
+        llmIdleEvictionJob = if (gemmaProcessor != null) {
+            idleScope.launch {
+                delay(LLM_IDLE_TIMEOUT_MS)
+                evictIdleLlm()
+            }
+        } else {
+            null
+        }
     }
 
     private fun closeVozLocked() {
@@ -1786,6 +2021,7 @@ class SmartPipeline(
     private fun closeGemmaLocked() {
         val instance = gemmaProcessor
         gemmaProcessor = null
+        loadedLlmChoice = null
         gemmaWarmedUp = false
         if (instance != null) {
             try {

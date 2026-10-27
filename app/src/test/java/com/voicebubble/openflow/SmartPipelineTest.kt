@@ -108,8 +108,13 @@ class SmartPipelineTest {
         assertTrue(defaultSettings.vozEnabled)
         assertTrue(defaultSettings.earEnabled)
         assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
-        assertFalse("Gemma 4 E2B must be OFF by default (Experimental)", defaultSettings.gemmaEnabled)
+        assertFalse("AI Post-Processing must be OFF by default", defaultSettings.gemmaEnabled)
         assertFalse("Disable Model Thinking must be OFF by default", defaultSettings.gemmaDisableThinking)
+        assertEquals(
+            "Default selected LLM must be compact Qwen 3 0.6B",
+            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            defaultSettings.selectedLlmModel
+        )
         assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
         assertEquals(
             com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
@@ -117,10 +122,45 @@ class SmartPipelineTest {
         )
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
-        assertEquals(2300, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(3665, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
-        assertEquals(2420, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(3947, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
+
+        // Default LLM (Qwen 3 0.6B: 585 MB disk, +450 MB incremental RAM)
+        assertEquals(1900, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(1782, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
+
+        // Punct is never loaded into RAM alongside an active LLM (zero double-loading)
+        assertEquals(1900, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(2064, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
+
+        // Flagship Gemma 4 E2B (2,468 MB disk, +850 MB incremental RAM)
+        val gemma4Settings = ModelSettings(
+            earEnabled = true,
+            punctEnabled = false,
+            gemmaEnabled = true,
+            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        )
+        assertEquals(2300, gemma4Settings.estimatedPeakRamMb)
+        assertEquals(3665, gemma4Settings.activeDiskFootprintMb)
+
+        // Ultra-compact Qwen 3 0.6B Lite (329 MB disk, +350 MB incremental RAM)
+        val qwenLiteSettings = ModelSettings(
+            earEnabled = true,
+            punctEnabled = false,
+            gemmaEnabled = true,
+            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B_LITE
+        )
+        assertEquals(1800, qwenLiteSettings.estimatedPeakRamMb)
+        assertEquals(1526, qwenLiteSettings.activeDiskFootprintMb)
+
+        // Strict single-LLM exclusivity in enabledModels() and isModelEnabled()
+        for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+            val singleActive = ModelSettings(earEnabled = true, gemmaEnabled = true, selectedLlmModel = choice)
+            val enabledLlms = singleActive.enabledModels().filter { it.isLlmModel }
+            assertEquals("Strictly 1 LLM may be enabled at a time", listOf(choice.desertAntModel), enabledLlms)
+            for (other in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+                assertEquals(other == choice, singleActive.isModelEnabled(other.desertAntModel))
+            }
+        }
+
         assertEquals(
             listOf(
                 com.voicebubble.openflow.settings.DesertAntModel.VOZ,
@@ -142,6 +182,10 @@ class SmartPipelineTest {
                 "expectedBytes mismatch for $model",
                 com.voicebubble.openflow.settings.ModelDownloadManager.modelTotalBytes(model),
                 model.expectedBytes
+            )
+            assertTrue(
+                "Missing storage revision for $model",
+                com.voicebubble.openflow.settings.DesertAntModelStorage.modelRevision(model).startsWith("v")
             )
         }
 
@@ -1488,5 +1532,148 @@ class SmartPipelineTest {
         assertEquals(499, table.getRange(composite, start, end - 1))
         val missing = "prefix:▁piece_9999:suffix"
         assertEquals(-1, table.getRange(missing, start, start + "▁piece_9999".length))
+    }
+
+    @Test
+    fun `LlmModelChoice catalog aligns with downloadable artifacts and optimizes prompts per model tier`() {
+        assertEquals(5, com.voicebubble.openflow.settings.LlmModelChoice.entries.size)
+        assertEquals(
+            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            com.voicebubble.openflow.settings.LlmModelChoice.fromId("unknown_model")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            com.voicebubble.openflow.settings.LlmModelChoice.fromId(null)
+        )
+
+        for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+            assertEquals(choice, com.voicebubble.openflow.settings.LlmModelChoice.fromId(choice.id))
+            assertEquals(choice, com.voicebubble.openflow.settings.LlmModelChoice.fromDesertAntModel(choice.desertAntModel))
+            assertTrue("${choice.id} must map to an isLlmModel entry", choice.desertAntModel.isLlmModel)
+
+            val spec = com.voicebubble.openflow.settings.ModelDownloadManager.MODEL_SPECS[choice.desertAntModel]
+            assertTrue("Missing download spec for ${choice.id}", spec != null)
+            val artifacts = spec!!.second
+            assertEquals(1, artifacts.size)
+            assertEquals(choice.modelFileName, artifacts.single().relativePath)
+            assertTrue(choice.modelFileName.endsWith(".litertlm"))
+        }
+
+        // Per-model default CLEAN_AND_POLISH optimization checks
+        val compactPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+        )
+        assertTrue(compactPrompt.contains("under 15 words"))
+        assertTrue(compactPrompt.contains("Hey Alex, can we meet Wednesday at 3:30 PM for two things:"))
+        assertFalse("Compact 0.6B prompt should stay concise without heavy 2-example wall", compactPrompt.contains("Example 2 Input:"))
+
+        val directInstructPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+        )
+        assertTrue(directInstructPrompt.contains("NOT a conversational chatbot"))
+        assertFalse("Non-thinking Qwen 2.5 must never receive internal reasoning hints", directInstructPrompt.contains("internal reasoning"))
+
+        // Qwen 2.5 1.5B must allocate zero thinking token headroom even when disableThinking=false
+        val sample = "um let's ship version two point eight point zero today"
+        val qwen25DefaultTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sample,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            maxContextTokens = 4_096,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+        )
+        val qwen25NoThinkTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+            inputText = sample,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true,
+            maxContextTokens = 4_096,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+        )
+        assertEquals("Non-thinking Qwen 2.5 must use tight direct token budget", qwen25NoThinkTokens, qwen25DefaultTokens)
+
+        // Switching LLM model must invalidate cached system prompt keys
+        val keyQwen06 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "",
+            customVocabulary = emptyList(),
+            fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(),
+            disableThinking = false,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+        )
+        val keyGemma4 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            customPrompt = "",
+            customVocabulary = emptyList(),
+            fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(),
+            disableThinking = false,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        )
+        org.junit.Assert.assertNotEquals(keyQwen06, keyGemma4)
+    }
+
+    @Test
+    fun `sanitizeGemmaOutput strips Qwen think blocks unclosed think tags and ChatML special tokens`() {
+        val rawFallback = "um call lukas at three thirty pm"
+
+        // Closed Qwen 3 <think>...</think> + <|im_end|>
+        assertEquals(
+            "Call Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<think>\nRemove um and format time.\n</think>\n\nCall Lukas at 3:30 PM.<|im_end|>",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Truncated unclosed <think>... falls back cleanly to raw input instead of leaking reasoning
+        assertEquals(
+            rawFallback,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<think>\nLet me analyze every word of the user's dictation carefully...",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
+
+    @Test
+    fun `MemoryPressureReport allows compact Qwen co-residency on mid-range phones while staging Gemma 4 safely`() {
+        // 6 GB phone with 1,350 MB free while Voz is already loaded:
+        // Qwen 3 0.6B Lite (450 MB) and Qwen 3 0.6B (650 MB) fit comfortably alongside Voz,
+        // whereas 2.5 GB Gemma 4 E2B must stage sequentially.
+        val midPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 1_350L,
+            systemTotalMb = 5_800L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 60L,
+            jvmMaxMb = 256L,
+            jvmFreeHeadroomMb = 196L,
+            nativeAllocatedMb = 1_300L
+        )
+        assertTrue(
+            midPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B_LITE,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+        assertTrue(
+            midPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+        assertFalse(
+            midPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
     }
 }

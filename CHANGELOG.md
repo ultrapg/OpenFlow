@@ -2,6 +2,25 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.8.0] - 2026-10-27
+
+### Added & Improved
+- **5 Selectable Local AI Post-Processing LLMs — Mainly Smaller & Faster (`LlmModelChoice`, `DesertAntModel`, `ModelDownloadManager`, `GemmaTextProcessor`):**
+  - Expanded on-device AI cleanup & reformatting beyond the 2.5 GB `Gemma 4 E2B` with 4 smaller, faster, un-gated, multilingual (all 25 European languages) official Google AI Edge `LiteRT-LM` models:
+    - **`Qwen 3 0.6B Lite` (`329 MB`, INT4 dynamic `wi4b32`):** Tiny download & ultra-fast cleanup (`+350 MB` incremental RAM, `4 GB+` phones).
+    - **`Qwen 3 0.6B` (`585 MB`, Recommended Default):** Ideal speed-to-accuracy sweet spot across European languages (`+450 MB` incremental RAM, `6 GB+` phones; existing `Gemma 4 E2B` users automatically retain their selection on upgrade).
+    - **`Qwen 3 1.7B` (`932 MB`, INT4 dynamic `wi4b32`):** Balanced accuracy & fast cleanup on mid-sentence backtracks, numbers, and lists (`+650 MB` incremental RAM, `6 GB+` phones).
+    - **`Qwen 2.5 1.5B Instruct` (`1,524 MB`, INT8 multi-prefill):** Direct non-thinking instruct model with zero reasoning overhead (`+750 MB` incremental RAM, `6 GB+` phones).
+    - **`Gemma 4 E2B` (`2,468 MB`, Experimental Flagship):** Maximum accuracy with Qualcomm QNN / MediaTek NeuroPilot / Google Tensor NPU + GPU/CPU MTP support (`+850 MB` incremental RAM, `8 GB+` phones).
+- **Zero Unnecessary Multi-Model RAM Loading (`SmartPipeline`, `ModelSettings`, `ModelDownloadManager`):**
+  - **Strict Single-LLM Residency:** At most 1 LLM can ever be enabled or loaded into RAM at any instant; switching models or disabling AI post-processing immediately closes and frees the previous `Engine` + KV cache before loading anything else.
+  - **Zero `Punct` + LLM Overlap:** Automatically unloads and bypasses `Punct` (~120 MB) whenever the selected LLM is enabled & downloaded (retaining `Punct` purely as an automatic fallback if an LLM fails to load).
+  - **Zero-RAM Cold Start & 5-Minute Burst Eviction:** Keeps LLMs at **`0 MB` RAM** during app launch and idle Settings browsing, overlaps loading + system-prompt KV-cache pre-warming inside `onRecordingStartedAsync()` *while you speak* when `canKeepVozAndLlmCoResident(...)` allows, and automatically evicts idle LLMs after `5 minutes` while keeping `Voz` warm for `20 minutes`.
+- **Per-Model Prompt, Token-Budget & Sampler Optimization (`GemmaPromptPreset.promptForModel`, `GemmaTextProcessor`):**
+  - Tailored system instructions (especially the default **`Wispr Flow Auto-Edit`** preset), role framing, few-shot example density, reasoning-token caps, `SamplerConfig`, and `ModelInfo` capability detection across `COMPACT_0_6B`, `DIRECT_INSTRUCT_1_5B`, `BALANCED_1_7B`, and `FLAGSHIP_GEMMA_4` tiers, plus Qwen `<think>...</think>` / `<|im_end|>` output sanitization.
+- **Intuitive AI Post-Processing Selector & Clean Storage UI (`SpeechRecognitionSettingsSection`, `OnboardingScreen`):**
+  - Added a clean 5-model selector showing speed, download size, RAM impact, live status badges (**Loaded in RAM** / **Ready on Disk** / **Downloading**), model-aware **`Disable Model Thinking`** state, per-model optimized prompt preview, and streamlined status/storage lists.
+
 ## [2.7.2] - 2026-10-26
 
 ### Added & Improved

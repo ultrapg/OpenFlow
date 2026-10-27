@@ -18,6 +18,7 @@ package com.voicebubble.openflow.ui.settings
 
 import ai.desertant.voz.Voz
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -90,6 +91,7 @@ import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.HardwareAccelerator
+import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
@@ -151,28 +153,43 @@ fun SpeechRecognitionSettingsSection(
 
     val handleOptionalToggle: (DesertAntModel, Boolean) -> Unit = { model, targetEnabled ->
         if (!targetEnabled) {
-            ModelDownloadManager.cancelAutoEnable(model)
-            val updated = when (model) {
-                DesertAntModel.EAR -> settings.copy(earEnabled = false)
-                DesertAntModel.PUNCT -> settings.copy(punctEnabled = false)
-                DesertAntModel.GEMMA_4_E2B -> settings.copy(gemmaEnabled = false)
-                DesertAntModel.VOZ -> settings
+            if (model.isLlmModel) {
+                ModelDownloadManager.cancelAllLlmAutoEnables()
+                persistAndReload(settings.copy(gemmaEnabled = false))
+            } else {
+                ModelDownloadManager.cancelAutoEnable(model)
+                val updated = when (model) {
+                    DesertAntModel.EAR -> settings.copy(earEnabled = false)
+                    DesertAntModel.PUNCT -> settings.copy(punctEnabled = false)
+                    else -> settings
+                }
+                persistAndReload(updated)
             }
-            persistAndReload(updated)
         } else {
             scope.launch {
                 val alreadyDownloaded = withContext(Dispatchers.IO) {
                     DesertAntModelStorage.isModelDownloaded(context, model)
                 }
                 if (alreadyDownloaded) {
-                    val updated = when (model) {
-                        DesertAntModel.EAR -> settings.copy(earEnabled = true)
-                        DesertAntModel.PUNCT -> settings.copy(punctEnabled = true)
-                        DesertAntModel.GEMMA_4_E2B -> settings.copy(gemmaEnabled = true)
-                        DesertAntModel.VOZ -> settings
+                    if (model.isLlmModel) {
+                        ModelDownloadManager.cancelAllLlmAutoEnables()
+                        val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: settings.selectedLlmModel
+                        persistAndReload(settings.copy(gemmaEnabled = true, selectedLlmModel = llmChoice))
+                    } else {
+                        val updated = when (model) {
+                            DesertAntModel.EAR -> settings.copy(earEnabled = true)
+                            DesertAntModel.PUNCT -> settings.copy(punctEnabled = true)
+                            else -> settings
+                        }
+                        persistAndReload(updated)
                     }
-                    persistAndReload(updated)
                 } else {
+                    if (model.isLlmModel) {
+                        val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: settings.selectedLlmModel
+                        ModelDownloadManager.cancelAllLlmAutoEnables(keepModel = model)
+                        // Immediately unload any previously active LLM while downloading the newly chosen model
+                        persistAndReload(settings.copy(gemmaEnabled = false, selectedLlmModel = llmChoice))
+                    }
                     // Settings Toggle-On Background Resumable Download Flow (supports queuing multiple models)
                     ModelDownloadManager.startQueue(
                         context = context,
@@ -187,6 +204,20 @@ fun SpeechRecognitionSettingsSection(
                     )
                 }
             }
+        }
+    }
+
+    val handleLlmSelection: (LlmModelChoice) -> Unit = { choice ->
+        val anyLlmActiveOrPending = settings.gemmaEnabled ||
+            downloadState.pendingAutoEnableModels.any { it.isLlmModel }
+        if (!anyLlmActiveOrPending) {
+            if (settings.selectedLlmModel != choice) {
+                persistAndReload(settings.copy(selectedLlmModel = choice))
+            }
+        } else {
+            // Switching models while AI Post-Processing is enabled (or downloading):
+            // immediately switch & unload any previous LLM, or download + auto-enable the newly chosen model
+            handleOptionalToggle(choice.desertAntModel, true)
         }
     }
 
@@ -262,13 +293,19 @@ fun SpeechRecognitionSettingsSection(
                     color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
 
-                // Per-model live status pills
+                // Per-model live status pills (core audio + single selected AI model)
+                val visibleStatusModels = listOf(
+                    DesertAntModel.VOZ,
+                    DesertAntModel.EAR,
+                    DesertAntModel.PUNCT,
+                    settings.selectedLlmModel.desertAntModel
+                )
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    DesertAntModel.entries.forEach { model ->
+                    visibleStatusModels.forEach { model ->
                         val state = pipelineStatus.modelStates[model] ?: ModelLoadState.STANDBY
                         ModelStatusChip(model = model, state = state)
                     }
@@ -313,7 +350,7 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount/${DesertAntModel.entries.size})",
+                            text = "Active Disk: ${settings.activeDiskFootprintMb} MB ($downloadedCount downloaded)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -490,9 +527,14 @@ fun SpeechRecognitionSettingsSection(
                 HorizontalDivider()
 
                 // Punct (Off by default)
+                val punctSubtitle = if (settings.gemmaEnabled) {
+                    "Automatically bypassed & kept out of RAM while ${settings.selectedLlmModel.shortLabel} is active"
+                } else {
+                    DesertAntModel.PUNCT.roleSummary
+                }
                 ModelToggleItem(
                     title = "Punct — Text & Punctuation Cleanup (${DesertAntModel.PUNCT.sizeMb} MB)",
-                    subtitle = DesertAntModel.PUNCT.roleSummary,
+                    subtitle = punctSubtitle,
                     loadState = pipelineStatus.modelStates[DesertAntModel.PUNCT],
                     checked = settings.punctEnabled || DesertAntModel.PUNCT in downloadState.pendingAutoEnableModels,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.PUNCT),
@@ -540,7 +582,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3b. Experimental: Gemma 4 E2B AI Post-Processing & Reformatting (NPU / LiteRT-LM)
+        // 3b. AI Post-Processing & Reformatting (5 Selectable Local LLMs • Smart Single-Model RAM)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -551,6 +593,10 @@ fun SpeechRecognitionSettingsSection(
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                val selectedLlm = settings.selectedLlmModel
+                val selectedDesertModel = selectedLlm.desertAntModel
+                val anyLlmPendingAutoEnable = downloadState.pendingAutoEnableModels.any { it.isLlmModel }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -568,7 +614,7 @@ fun SpeechRecognitionSettingsSection(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Gemma 4 E2B — AI Post-Processing",
+                            text = "AI Post-Processing & Cleanup",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold
                         )
@@ -578,7 +624,7 @@ fun SpeechRecognitionSettingsSection(
                         color = MaterialTheme.colorScheme.tertiaryContainer
                     ) {
                         Text(
-                            text = "EXPERIMENTAL",
+                            text = "ON-DEMAND RAM",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onTertiaryContainer,
@@ -588,7 +634,7 @@ fun SpeechRecognitionSettingsSection(
                 }
 
                 Text(
-                    text = "Runs Google's Gemma 4 E2B (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB) 100% offline via LiteRT-LM on your phone's NPU (Qualcomm Hexagon QNN, MediaTek NeuroPilot, Google Tensor TPU) with automatic GPU/CPU fallback. Removes 'um'/'uh'/'like', stutters, and false starts, or reformats speech using your chosen system prompt. Off by default • 8 GB+ RAM recommended.",
+                    text = "Removes 'um'/'uh'/'like', fixes numbers & lists, or reformats speech 100% offline via LiteRT-LM. Strictly 1 AI model is ever loaded on demand when you dictate — idle RAM stays at 0 MB, and Punct is bypassed automatically. Off by default.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -596,7 +642,7 @@ fun SpeechRecognitionSettingsSection(
                 val activeGemmaBackend = pipelineStatus.activeGemmaBackendLabel
                 if (!activeGemmaBackend.isNullOrBlank()) {
                     Text(
-                        text = "Active Gemma 4 E2B runtime: $activeGemmaBackend",
+                        text = "Active ${selectedLlm.title} runtime: $activeGemmaBackend",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.primary
@@ -604,25 +650,56 @@ fun SpeechRecognitionSettingsSection(
                 }
 
                 ModelToggleItem(
-                    title = "Enable Gemma 4 E2B (${DesertAntModel.GEMMA_4_E2B.sizeMb} MB)",
-                    subtitle = DesertAntModel.GEMMA_4_E2B.roleSummary,
-                    loadState = pipelineStatus.modelStates[DesertAntModel.GEMMA_4_E2B],
-                    checked = settings.gemmaEnabled || DesertAntModel.GEMMA_4_E2B in downloadState.pendingAutoEnableModels,
-                    enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.GEMMA_4_E2B),
+                    title = "Enable AI Post-Processing (${selectedLlm.title})",
+                    subtitle = "${selectedLlm.speedAndRamSummary} • Unloads automatically when idle",
+                    loadState = pipelineStatus.modelStates[selectedDesertModel],
+                    checked = settings.gemmaEnabled || anyLlmPendingAutoEnable,
+                    enabled = !(downloadState.isRunning && downloadState.activeModel == selectedDesertModel),
                     isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.GEMMA_4_E2B && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                    activeDownloadState = if (downloadState.activeModel == selectedDesertModel && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
                     onPause = { ModelDownloadManager.pauseDownloads() },
-                    onResume = { handleOptionalToggle(DesertAntModel.GEMMA_4_E2B, true) },
-                    onCheckedChange = { handleOptionalToggle(DesertAntModel.GEMMA_4_E2B, it) }
+                    onResume = { handleOptionalToggle(selectedDesertModel, true) },
+                    onCheckedChange = { handleOptionalToggle(selectedDesertModel, it) }
                 )
 
                 HorizontalDivider()
 
+                Text(
+                    text = "Choose AI Model (Only 1 Loaded at a Time)",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Prompts & token budgets automatically adapt to your selected model. Switching models immediately frees the previous model from RAM.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                LlmModelChoice.entries.forEach { choice ->
+                    val modelEnum = choice.desertAntModel
+                    val isSelected = selectedLlm == choice
+                    val isDownloaded = downloadedStatusMap[modelEnum] == true
+                    val loadState = pipelineStatus.modelStates[modelEnum]
+                    val isDownloadingThis = downloadState.activeModel == modelEnum &&
+                        (downloadState.isRunning || downloadState.isPaused)
+                    LlmModelOptionCard(
+                        choice = choice,
+                        selected = isSelected,
+                        isDownloaded = isDownloaded,
+                        loadState = loadState,
+                        isDownloading = isDownloadingThis,
+                        onSelect = { handleLlmSelection(choice) }
+                    )
+                }
+
+                HorizontalDivider()
+
+                val supportsThinking = selectedLlm.supportsThinking
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable {
+                        .clickable(enabled = supportsThinking) {
                             persistAndReload(settings.copy(gemmaDisableThinking = !settings.gemmaDisableThinking))
                         }
                         .padding(vertical = 4.dp),
@@ -635,20 +712,31 @@ fun SpeechRecognitionSettingsSection(
                             .padding(end = 12.dp)
                     ) {
                         Text(
-                            text = "Disable Model Thinking",
+                            text = if (supportsThinking) {
+                                "Disable Model Thinking"
+                            } else {
+                                "Disable Model Thinking (Always Direct)"
+                            },
                             style = MaterialTheme.typography.bodyLarge,
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            text = "Significantly speeds up cleanup and reformatting by skipping Gemma 4's reasoning step, though accuracy on complex edits may decrease. Off by default.",
+                            text = if (supportsThinking) {
+                                "Significantly speeds up cleanup and reformatting by skipping ${selectedLlm.title}'s reasoning step, though accuracy on complex edits may decrease. Off by default."
+                            } else {
+                                "${selectedLlm.title} is a direct non-thinking model — it outputs cleaned text immediately with zero reasoning overhead."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     Switch(
-                        checked = settings.gemmaDisableThinking,
+                        checked = if (supportsThinking) settings.gemmaDisableThinking else true,
+                        enabled = supportsThinking,
                         onCheckedChange = { disableThinking ->
-                            persistAndReload(settings.copy(gemmaDisableThinking = disableThinking))
+                            if (supportsThinking) {
+                                persistAndReload(settings.copy(gemmaDisableThinking = disableThinking))
+                            }
                         }
                     )
                 }
@@ -661,7 +749,7 @@ fun SpeechRecognitionSettingsSection(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "Choose how Gemma 4 E2B cleans or reformats your dictated text, or write a custom system prompt.",
+                    text = "Each preset is tuned specifically for ${selectedLlm.title}'s size and architecture, or you can write a custom system prompt.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -712,7 +800,7 @@ fun SpeechRecognitionSettingsSection(
                             persistAndReload(settings.copy(gemmaCustomPrompt = updatedText))
                         },
                         label = { Text("Custom System Prompt") },
-                        placeholder = { Text(GemmaPromptPreset.CUSTOM.defaultSystemPrompt) },
+                        placeholder = { Text(GemmaPromptPreset.CUSTOM.promptForModel(selectedLlm)) },
                         minLines = 3,
                         maxLines = 8,
                         modifier = Modifier.fillMaxWidth()
@@ -725,7 +813,7 @@ fun SpeechRecognitionSettingsSection(
                     ) {
                         Text(
                             text = if (customPromptDraft.isBlank()) {
-                                "Using default fallback instruction until you enter custom text."
+                                "Using ${selectedLlm.title}'s fallback instruction until you enter custom text."
                             } else {
                                 "Anti-chatter & Custom Vocabulary guardrails are applied automatically."
                             },
@@ -752,6 +840,7 @@ fun SpeechRecognitionSettingsSection(
                         }
                     }
                 } else {
+                    val activeOptimizedPrompt = settings.gemmaPromptPreset.promptForModel(selectedLlm)
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
@@ -762,24 +851,23 @@ fun SpeechRecognitionSettingsSection(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "Active System Instruction:",
+                                text = "Active System Instruction (Optimized for ${selectedLlm.title}):",
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.primary
                             )
                             Text(
-                                text = settings.gemmaPromptPreset.defaultSystemPrompt,
+                                text = activeOptimizedPrompt,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             OutlinedButton(
                                 onClick = {
-                                    val presetPrompt = settings.gemmaPromptPreset.defaultSystemPrompt
-                                    customPromptDraft = presetPrompt
+                                    customPromptDraft = activeOptimizedPrompt
                                     persistAndReload(
                                         settings.copy(
                                             gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
-                                            gemmaCustomPrompt = presetPrompt
+                                            gemmaCustomPrompt = activeOptimizedPrompt
                                         )
                                     )
                                 },
@@ -945,7 +1033,19 @@ fun SpeechRecognitionSettingsSection(
                     fontWeight = FontWeight.SemiBold
                 )
 
-                DesertAntModel.entries.forEach { model ->
+                val storageModels = buildList {
+                    add(DesertAntModel.VOZ)
+                    add(DesertAntModel.EAR)
+                    add(DesertAntModel.PUNCT)
+                    add(settings.selectedLlmModel.desertAntModel)
+                    DesertAntModel.entries.forEach { candidate ->
+                        if (candidate.isLlmModel && downloadedStatusMap[candidate] == true && candidate !in this) {
+                            add(candidate)
+                        }
+                    }
+                }
+
+                storageModels.forEach { model ->
                     val isDownloaded = downloadedStatusMap[model] == true
                     val isEnabled = settings.isModelEnabled(model)
                     val canDelete = !model.isRequired && !isEnabled && isDownloaded
@@ -1030,6 +1130,121 @@ fun SpeechRecognitionSettingsSection(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.align(Alignment.CenterHorizontally)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LlmModelOptionCard(
+    choice: LlmModelChoice,
+    selected: Boolean,
+    isDownloaded: Boolean,
+    loadState: ModelLoadState?,
+    isDownloading: Boolean,
+    onSelect: () -> Unit
+) {
+    val borderColor = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+    }
+    val containerColor = if (selected) {
+        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+    } else {
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.55f)
+    }
+    val statusBadgeText = when {
+        isDownloading -> "Downloading..."
+        loadState == ModelLoadState.LOADED || loadState == ModelLoadState.ACTIVE -> "Loaded in RAM"
+        isDownloaded -> "Ready on Disk"
+        else -> "${choice.desertAntModel.sizeMb} MB Download"
+    }
+    val statusBadgeColor = when {
+        isDownloading -> Color(0xFFEF6C00)
+        loadState == ModelLoadState.LOADED || loadState == ModelLoadState.ACTIVE -> Color(0xFF2E7D32)
+        isDownloaded -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = containerColor,
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = if (selected) 1.5.dp else 1.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onSelect() }
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            RadioButton(
+                selected = selected,
+                onClick = onSelect
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = choice.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (choice == LlmModelChoice.QWEN_3_0_6B) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.secondaryContainer
+                        }
+                    ) {
+                        Text(
+                            text = choice.badgeLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (choice == LlmModelChoice.QWEN_3_0_6B) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSecondaryContainer
+                            },
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Text(
+                    text = choice.speedAndRamSummary,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = choice.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = statusBadgeText,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Medium,
+                    color = statusBadgeColor
                 )
             }
         }
