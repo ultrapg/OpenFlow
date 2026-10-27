@@ -306,6 +306,13 @@ class SmartPipeline(
     @Volatile
     private var isTranscribing: Boolean = false
 
+    /**
+     * `true` whenever audio transcription (`Ear` / `Voz`) or post-processing (`Punct` / on-device LLM)
+     * is actively executing (including live-streaming chunk cleanup and final post-processing).
+     */
+    val isActivelyProcessing: Boolean
+        get() = isTranscribing
+
     private val _pipelineStatus = MutableStateFlow(
         PipelineStatus(
             configuredAccelerator = initialSettings.hardwareAccelerator,
@@ -978,6 +985,13 @@ class SmartPipeline(
                 if (succeeded) cleaned else null
             } finally {
                 isTranscribing = false
+                val snap = settings
+                val count = countLoadedModelsLocked(snap)
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                )
                 resetIdleEvictionTimerLocked()
             }
         }
@@ -1046,6 +1060,140 @@ class SmartPipeline(
                     schedulePostDictationPromptPrewarm()
                 }
                 result
+            } finally {
+                isTranscribing = false
+                val snap = settings
+                val count = countLoadedModelsLocked(snap)
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                )
+                resetIdleEvictionTimerLocked()
+            }
+        }
+    }
+
+    /**
+     * Runs an on-demand speed & quality benchmark on the currently selected [LlmModelChoice]
+     * (comparing cold/uncached system prompt vs warm KV-cached system prompt in tokens/sec)
+     * while enforcing strict single-LLM RAM bounds and keeping the screen awake.
+     */
+    suspend fun runLlmBenchmark(
+        inputText: String,
+        onProgress: ((String) -> Unit)? = null
+    ): LlmBenchmarkResult = withContext(Dispatchers.Default) {
+        pipelineMutex.withLock {
+            val activeSettings = settings
+            val selectedLlm = activeSettings.selectedLlmModel
+            if (!DesertAntModelStorage.isModelDownloaded(appContext, selectedLlm.desertAntModel)) {
+                throw IllegalStateException("${selectedLlm.title} is not downloaded yet.")
+            }
+
+            idleEvictionJob?.cancel()
+            idleEvictionJob = null
+            llmIdleEvictionJob?.cancel()
+            llmIdleEvictionJob = null
+            promptPrewarmJob?.cancel()
+            promptPrewarmJob = null
+            isTranscribing = true
+
+            try {
+                // Strictly 1 LLM loaded at a time
+                if (gemmaProcessor != null && loadedLlmChoice != selectedLlm) {
+                    closeGemmaLocked()
+                    System.gc()
+                }
+                if (punctRestorer != null && activeSettings.gemmaEnabled) {
+                    closePunctLocked()
+                }
+
+                if (gemmaProcessor == null) {
+                    val preLoadMem = evaluateMemoryPressure()
+                    val earReleaseThresholdMb = selectedLlm.estimatedStandaloneRamMb.toLong() + 650L
+                    if (preLoadMem.isAnyMemoryTight || preLoadMem.systemAvailMb < earReleaseThresholdMb) {
+                        closeEarLocked()
+                    }
+                    val memAfterAux = evaluateMemoryPressure()
+                    if (voz != null &&
+                        !memAfterAux.canKeepVozAndLlmCoResident(
+                            llmChoice = selectedLlm,
+                            vozAlreadyLoaded = true,
+                            llmAlreadyLoaded = false
+                        )
+                    ) {
+                        DebugLogManager.logInfo(
+                            TAG,
+                            "Temporarily staging Voz out of RAM to safely benchmark ${selectedLlm.title} (sysAvail=${memAfterAux.systemAvailMb}MB)",
+                            includeMemory = true
+                        )
+                        closeVozLocked()
+                        System.gc()
+                    }
+                }
+
+                val instance = gemmaProcessor ?: run {
+                    val modelDir = DesertAntModelStorage.modelRevisionDir(appContext, selectedLlm.desertAntModel)
+                    val memNow = evaluateMemoryPressure()
+                    onProgress?.invoke("Loading ${selectedLlm.title} into RAM...")
+                    updateSingleModelStateLocked(
+                        activeSettings = activeSettings,
+                        model = selectedLlm.desertAntModel,
+                        state = ModelLoadState.LOADING,
+                        message = "Loading ${selectedLlm.title} for benchmark..."
+                    )
+                    GemmaTextProcessor(
+                        context = appContext,
+                        modelDir = modelDir,
+                        accelerator = activeSettings.hardwareAccelerator,
+                        memoryMode = memNow.gemmaMemoryMode,
+                        llmChoice = selectedLlm
+                    ).also {
+                        gemmaProcessor = it
+                        loadedLlmChoice = selectedLlm
+                    }
+                }
+
+                setModelActiveStatusLocked(
+                    activeSettings,
+                    selectedLlm.desertAntModel,
+                    "Benchmarking ${selectedLlm.title} (${instance.activeBackendSummary})..."
+                )
+
+                val benchResult = instance.benchmarkPromptCaching(
+                    rawInput = inputText,
+                    languageCode = activeSettings.preferredLanguage,
+                    preset = activeSettings.gemmaPromptPreset,
+                    customPrompt = activeSettings.gemmaCustomPrompt,
+                    customVocabulary = activeSettings.customVocabulary,
+                    disableThinking = activeSettings.gemmaDisableThinking,
+                    adaptiveThinking = activeSettings.gemmaAdaptiveThinking,
+                    onProgress = onProgress
+                )
+
+                val postMem = evaluateMemoryPressure()
+                val cannotKeepWithVoz = !postMem.canKeepVozAndLlmCoResident(
+                    llmChoice = selectedLlm,
+                    vozAlreadyLoaded = voz != null,
+                    llmAlreadyLoaded = true
+                )
+                val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
+                if (!activeSettings.gemmaEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
+                    closeGemmaLocked()
+                    System.gc()
+                }
+                if (voz == null && !postMem.isCriticalPressure) {
+                    ensureVozLocked(activeSettings, warmUp = false)
+                }
+                if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                    schedulePostDictationPromptPrewarm()
+                }
+
+                benchResult
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                closeGemmaLocked()
+                throw t
             } finally {
                 isTranscribing = false
                 val snap = settings
@@ -2042,7 +2190,11 @@ class SmartPipeline(
             loadingModel = if (state == ModelLoadState.LOADING) model else null
         )
         _pipelineStatus.value = _pipelineStatus.value.copy(
-            phase = if (state == ModelLoadState.ACTIVE) PipelinePhase.TRANSCRIBING else PipelinePhase.LOADING,
+            phase = if (state == ModelLoadState.ACTIVE || isTranscribing) {
+                PipelinePhase.TRANSCRIBING
+            } else {
+                PipelinePhase.LOADING
+            },
             configuredAccelerator = activeSettings.hardwareAccelerator,
             activeAcceleratorLabel = activeAcceleratorDescription,
             activeGemmaBackendLabel = gemmaProcessor?.activeBackendSummary,

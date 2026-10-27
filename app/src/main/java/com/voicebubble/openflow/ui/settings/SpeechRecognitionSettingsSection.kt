@@ -17,6 +17,7 @@
 package com.voicebubble.openflow.ui.settings
 
 import ai.desertant.voz.Voz
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -36,13 +37,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
@@ -54,6 +59,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -67,6 +74,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -81,8 +89,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.voicebubble.openflow.core.speech.LlmBenchmarkResult
+import com.voicebubble.openflow.core.speech.LlmSinglePassMetrics
 import com.voicebubble.openflow.core.speech.ModelLoadState
 import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.SmartPipeline
@@ -91,11 +102,14 @@ import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.HardwareAccelerator
+import com.voicebubble.openflow.settings.LlmBenchmarkSample
 import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -923,6 +937,16 @@ fun SpeechRecognitionSettingsSection(
                         }
                     }
                 }
+
+                val isSelectedLlmDownloaded = downloadedStatusMap[selectedDesertModel] == true
+                if (isSelectedLlmDownloaded) {
+                    HorizontalDivider()
+                    LlmSpeedBenchmarkSection(
+                        selectedLlm = selectedLlm,
+                        smartPipeline = smartPipeline,
+                        isPipelineBusy = pipelineStatus.phase == PipelinePhase.TRANSCRIBING || downloadState.isRunning
+                    )
+                }
             }
         }
 
@@ -1472,6 +1496,504 @@ private fun ModelToggleItem(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun LlmSpeedBenchmarkSection(
+    selectedLlm: LlmModelChoice,
+    smartPipeline: SmartPipeline,
+    isPipelineBusy: Boolean
+) {
+    val scope = rememberCoroutineScope()
+    val localView = LocalView.current
+
+    // Collapsed by default, expandable / collapsible by tapping the header
+    var expanded by remember { mutableStateOf(false) }
+    var dropdownExpanded by remember { mutableStateOf(false) }
+    var selectedSample by remember { mutableStateOf(LlmBenchmarkSample.EXAMPLE_1_CASUAL_FILLERS) }
+    var customInputText by remember { mutableStateOf(LlmBenchmarkSample.CUSTOM_INPUT.sampleText) }
+
+    var isRunning by remember { mutableStateOf(false) }
+    var progressLabel by remember { mutableStateOf("") }
+    var benchmarkJob by remember { mutableStateOf<Job?>(null) }
+    var benchmarkResult by remember { mutableStateOf<LlmBenchmarkResult?>(null) }
+    var benchmarkError by remember { mutableStateOf<String?>(null) }
+
+    // Keep the display awake while benchmarking in Settings
+    DisposableEffect(isRunning) {
+        val prevKeepOn = localView.keepScreenOn
+        if (isRunning) {
+            localView.keepScreenOn = true
+        }
+        onDispose {
+            localView.keepScreenOn = prevKeepOn
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { expanded = !expanded }
+                .padding(vertical = 4.dp, horizontal = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Speed,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text(
+                        text = "Speed Benchmark (${selectedLlm.title})",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Test Uncached vs Cached System Prompt (tokens/sec & output)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Icon(
+                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = if (expanded) "Collapse benchmark" else "Expand benchmark",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        AnimatedVisibility(visible = expanded) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Sample selector dropdown (5 examples + 2 really complex ones + Custom Input)
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(
+                                width = 1.dp,
+                                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable(enabled = !isRunning) { dropdownExpanded = true }
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Benchmark Input",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = selectedSample.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                            if (selectedSample.isComplex) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = MaterialTheme.colorScheme.tertiaryContainer
+                                ) {
+                                    Text(
+                                        text = "COMPLEX",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ArrowDropDown,
+                                contentDescription = "Choose benchmark input"
+                            )
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = dropdownExpanded,
+                        onDismissRequest = { dropdownExpanded = false },
+                        modifier = Modifier.fillMaxWidth(0.88f)
+                    ) {
+                        LlmBenchmarkSample.entries.forEach { sample ->
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = sample.label,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = if (sample == selectedSample) {
+                                                FontWeight.SemiBold
+                                            } else {
+                                                FontWeight.Normal
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (sample.isComplex) {
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = MaterialTheme.colorScheme.tertiaryContainer
+                                            ) {
+                                                Text(
+                                                    text = "COMPLEX",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    selectedSample = sample
+                                    dropdownExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                val activeInputText = if (selectedSample.isCustom) {
+                    customInputText
+                } else {
+                    selectedSample.sampleText
+                }
+
+                if (selectedSample.isCustom) {
+                    OutlinedTextField(
+                        value = customInputText,
+                        onValueChange = { customInputText = it },
+                        enabled = !isRunning,
+                        label = { Text("Custom Benchmark Input") },
+                        placeholder = { Text("Type or dictate text to benchmark...") },
+                        minLines = 2,
+                        maxLines = 6,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Text(
+                                text = "Raw Input (${activeInputText.length} chars):",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = activeInputText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = {
+                            val inputToRun = activeInputText.trim()
+                            if (inputToRun.isEmpty()) return@Button
+                            benchmarkError = null
+                            isRunning = true
+                            progressLabel = "Preparing ${selectedLlm.title}..."
+                            benchmarkJob = scope.launch {
+                                try {
+                                    val result = smartPipeline.runLlmBenchmark(
+                                        inputText = inputToRun,
+                                        onProgress = { msg ->
+                                            scope.launch(Dispatchers.Main) {
+                                                progressLabel = msg
+                                            }
+                                        }
+                                    )
+                                    benchmarkResult = result
+                                } catch (ce: CancellationException) {
+                                    benchmarkError = null
+                                } catch (t: Throwable) {
+                                    benchmarkError = t.message ?: "Benchmark failed"
+                                } finally {
+                                    isRunning = false
+                                    progressLabel = ""
+                                    benchmarkJob = null
+                                }
+                            }
+                        },
+                        enabled = !isRunning && !isPipelineBusy && activeInputText.trim().isNotEmpty(),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (isRunning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Benchmarking...")
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Bolt,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Benchmark ${selectedLlm.shortLabel}")
+                        }
+                    }
+
+                    if (isRunning) {
+                        OutlinedButton(
+                            onClick = {
+                                benchmarkJob?.cancel()
+                            }
+                        ) {
+                            Text("Cancel")
+                        }
+                    }
+                }
+
+                if (isRunning && progressLabel.isNotBlank()) {
+                    Text(
+                        text = progressLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (!benchmarkError.isNullOrBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = benchmarkError.orEmpty(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+
+                val result = benchmarkResult
+                if (result != null) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "${result.modelTitle} • ${result.backendSummary}",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "Preset: ${result.promptPresetTitle} • ${result.thinkingModeSummary}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                BenchmarkMetricPassCard(
+                                    title = "Prompt Uncached",
+                                    metrics = result.uncached,
+                                    highlighted = false,
+                                    extraNote = "Prefill: ${result.uncached.prefillTokens} tok (${String.format(Locale.US, "%.0f", result.uncached.prefillTokensPerSec)} tok/s)",
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (result.cached != null) {
+                                    BenchmarkMetricPassCard(
+                                        title = "Prompt Cached",
+                                        metrics = result.cached,
+                                        highlighted = true,
+                                        extraNote = if (result.cachedSystemPromptTokens > 0) {
+                                            "Cached ${result.cachedSystemPromptTokens} tok (prewarm ${result.cachePrewarmMs} ms)"
+                                        } else {
+                                            "KV prewarm: ${result.cachePrewarmMs} ms"
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+
+                            val cachedPass = result.cached
+                            val speedup = result.speedupFactor
+                            if (cachedPass != null && speedup != null) {
+                                val savedMs = result.uncached.totalMs - cachedPass.totalMs
+                                val summaryText = if (savedMs > 0L) {
+                                    String.format(
+                                        Locale.US,
+                                        "KV Cache Speedup: %.2f× faster end-to-end (saved %d ms • TTFT %d ms → %d ms)",
+                                        speedup,
+                                        savedMs,
+                                        result.uncached.ttftMs,
+                                        cachedPass.ttftMs
+                                    )
+                                } else {
+                                    String.format(
+                                        Locale.US,
+                                        "TTFT: %d ms uncached → %d ms cached (one-time prewarm %d ms)",
+                                        result.uncached.ttftMs,
+                                        cachedPass.ttftMs,
+                                        result.cachePrewarmMs
+                                    )
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = summaryText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            } else if (!result.cacheUnavailableReason.isNullOrBlank()) {
+                                Text(
+                                    text = result.cacheUnavailableReason,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            HorizontalDivider()
+
+                            Text(
+                                text = "Model Output:",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                SelectionContainer {
+                                    Text(
+                                        text = result.cleanedOutput,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BenchmarkMetricPassCard(
+    title: String,
+    metrics: LlmSinglePassMetrics,
+    highlighted: Boolean,
+    extraNote: String,
+    modifier: Modifier = Modifier
+) {
+    val borderColor = if (highlighted) {
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+    } else {
+        MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+    }
+    val containerColor = if (highlighted) {
+        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.32f)
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+    }
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = containerColor,
+        modifier = modifier.border(1.dp, borderColor, RoundedCornerShape(8.dp))
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = if (highlighted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = String.format(Locale.US, "%.1f tok/s", metrics.effectiveTokensPerSec),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = if (highlighted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = String.format(Locale.US, "Decode: %.1f tok/s (%d tok)", metrics.decodeTokensPerSec, metrics.decodeTokens),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "Total: ${metrics.totalMs} ms • TTFT: ${metrics.ttftMs} ms",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = extraNote,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }

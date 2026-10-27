@@ -2,6 +2,18 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.10.0] - 2026-10-27
+
+### Added & Improved
+- **Smart Screen Keep-Awake While Bubble Is Visible, Transcribing & Running LLM (`FloatingBubbleService`, `SmartPipeline`):**
+  - Keeps the display bright and prevents screen dimming/timeout whenever the floating dictation bubble is visible on screen (`IDLE`), while recording (`RECORDING`), and throughout speech transcription (`Ear` / `Voz` / `Punct`) and on-device LLM loading & post-processing (`PROCESSING` / `PipelinePhase.TRANSCRIBING` / `isActivelyProcessing`).
+  - Removed the premature `setKeepScreenOn(false)` call in `onStopRecording` that previously allowed the display to sleep mid-transcription/LLM pass.
+  - Combines `WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON` + `ComposeView.keepScreenOn` with a bounded, auto-renewed `PowerManager` display wake lock (`SCREEN_BRIGHT_WAKE_LOCK or ON_AFTER_RELEASE`, without `ACQUIRE_CAUSES_WAKEUP`) so OEM Android skins that ignore `FLAG_KEEP_SCREEN_ON` on `FLAG_NOT_FOCUSABLE` overlays also keep the display on, while immediately releasing in `0 ms` when the bubble hides, on manual hardware Power-button screen off (`ACTION_SCREEN_OFF`), or in `onDestroy()`.
+- **Collapsible On-Device LLM Speed Benchmark — Uncached vs Cached System Prompt (`SpeechRecognitionSettingsSection`, `GemmaTextProcessor`, `SmartPipeline`, `ModelSettings`):**
+  - Added a collapsible (**collapsed by default**, expandable on tap) **Speed Benchmark** section at the bottom of *AI Post-Processing & Cleanup* whenever the selected LLM is downloaded on disk.
+  - Includes a sample selector dropdown with **5 realistic everyday dictation examples**, **2 complex multi-clause/self-correction/spec stress-test examples**, and a **Custom Text Input** option.
+  - Benchmarks the selected model with your active system prompt preset & thinking configuration across **Prompt Uncached** (cold prefill) vs **Prompt Cached** (warm `prefillPrefaceOnInit` KV cache) in **tokens/sec** (end-to-end effective `tok/s` + decode `tok/s` + prefill `tok/s`), **TTFT (`ms`)**, **total latency (`ms`)**, and **KV-cache speedup (`×`)**, and displays the actual cleaned **Model Output** below.
+
 ## [2.9.0] - 2026-10-27
 
 ### Added & Improved

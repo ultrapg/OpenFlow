@@ -63,6 +63,7 @@ import com.voicebubble.openflow.core.audio.AudioRecordingController
 import com.voicebubble.openflow.core.database.AppDatabase
 import com.voicebubble.openflow.core.database.TranscriptionRecord
 import com.voicebubble.openflow.core.debug.DebugLogManager
+import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.PipelineStatus
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.core.speech.StreamingDictationSession
@@ -110,6 +111,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         private const val CHANNEL_ID = "bubble_service_channel_min"
         private const val NOTIFICATION_ID = 1001
         private const val REQUEST_CODE_RESTORE_NOTIFICATION = 1002
+        private const val DICTATION_WAKE_LOCK_LEASE_MS = 15 * 60 * 1000L
+        private const val SCREEN_WAKE_LOCK_LEASE_MS = 15 * 60 * 1000L
+        private const val SCREEN_WAKE_LOCK_REFRESH_INTERVAL_MS = 60_000L
 
         private val SPACE_BEFORE_PUNCT_REGEX = Regex(" +([.,!?:;%€])")
         private val WHITESPACE_RUN_REGEX = Regex("\\s+")
@@ -250,6 +254,26 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             if (!showOnlyOnInputs) return !isDeviceLocked
             return false
         }
+
+        /**
+         * Determines whether the display should be prevented from dimming or turning off.
+         * Keeps the screen awake whenever the dictation bubble is visible on screen, while recording,
+         * or while transcribing speech (`Ear` / `Voz` / `Punct`) or running an on-device LLM (`LiteRT-LM`).
+         * Always returns `false` when the screen is already non-interactive so hardware Power-off is respected.
+         */
+        internal fun computeShouldKeepScreenOn(
+            isScreenInteractive: Boolean,
+            isBubbleVisible: Boolean,
+            bubbleState: OverlayBubbleState,
+            pipelinePhase: PipelinePhase,
+            isPipelineActivelyProcessing: Boolean = false
+        ): Boolean {
+            if (!isScreenInteractive) return false
+            return isBubbleVisible ||
+                bubbleState != OverlayBubbleState.IDLE ||
+                isPipelineActivelyProcessing ||
+                pipelinePhase == PipelinePhase.TRANSCRIBING
+        }
     }
 
     override val viewModelStore: ViewModelStore = ViewModelStore()
@@ -270,6 +294,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var dictationWakeLock: PowerManager.WakeLock? = null
+    private var screenKeepAwakeWakeLock: PowerManager.WakeLock? = null
+    private var lastScreenWakeLockRefreshMs: Long = 0L
 
     /** Active "transcribe while recording" session, or `null` when live transcription is off / not recording. */
     private var streamingSession: StreamingDictationSession? = null
@@ -361,11 +387,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         serviceScope.launch {
             bubbleState.collect {
                 syncBubbleVisibility()
+                syncScreenKeepAwakeState()
+            }
+        }
+        serviceScope.launch {
+            smartPipeline.pipelineStatus.collect {
+                syncBubbleVisibility()
+                syncScreenKeepAwakeState()
             }
         }
 
         // Main-thread heartbeat (independent of Compose Choreographer VSYNC):
         // enforces immediate screen-off hiding, restores visibility as soon as keyboard opens after screen-on,
+        // keeps the screen-awake lock refreshed while visible/transcribing/running LLM,
         // and self-heals overlay attachment & notification every 4 seconds.
         // Adaptive cadence: 200 ms while the screen is on, 1 s while it is off (the SCREEN_ON receiver already
         // reacts instantly, so the heartbeat only needs to be a cheap safety net then).
@@ -381,6 +415,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
                 if (!stillInteractive) {
                     if (isScreenInteractive.value || isBubbleVisibleFlow.value ||
+                        screenKeepAwakeWakeLock?.isHeld == true ||
                         (::layoutParams.isInitialized && layoutParams.alpha > 0f)
                     ) {
                         onScreenTurnedOff()
@@ -393,6 +428,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         // AccessibilityService.getWindows() on the main looper never miss a keyboard open event.
                         TextInjectionAccessibilityService.getSharedInstance()?.refreshNow()
                         syncBubbleVisibility()
+                        syncScreenKeepAwakeState()
                     }
                     if (healDue) {
                         ensureOverlayAttached()
@@ -504,7 +540,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         if (bubbleState.value == OverlayBubbleState.RECORDING) {
             bubbleState.value = OverlayBubbleState.IDLE
-            setKeepScreenOn(false)
             releaseDictationWakeLock()
             streamingSession?.cancel()
             streamingSession = null
@@ -516,7 +551,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             }
         }
 
-        // Synchronously hide WindowManager overlay surface with 0ms delay
+        // Release screen wake lock immediately so we never contest a manual hardware Power-button press
+        releaseScreenWakeLock()
+
+        // Synchronously hide WindowManager overlay surface and clear FLAG_KEEP_SCREEN_ON with 0ms delay
         setOverlayWindowVisibleAndTouchable(visible = false, touchable = false, forceUpdate = true)
     }
 
@@ -616,6 +654,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         }
                     } finally {
                         hideDelayJob = null
+                        syncScreenKeepAwakeState()
                     }
                 }
             }
@@ -827,6 +866,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         TextInjectionAccessibilityService.isScreenInteractive.value = interactive
         val initiallyVisible = shouldShowBubbleNow()
         isBubbleVisibleFlow.value = initiallyVisible
+        val initiallyKeepScreenOn = shouldKeepScreenOnNow()
 
         layoutParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -839,7 +879,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             },
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                (if (initiallyVisible) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                (if (initiallyVisible) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) or
+                (if (initiallyKeepScreenOn) WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON else 0),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.LEFT
@@ -850,6 +891,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         val themeContext = android.view.ContextThemeWrapper(this, com.voicebubble.openflow.R.style.Theme_OpenFlow)
         composeView = ComposeView(themeContext).apply {
+            keepScreenOn = initiallyKeepScreenOn
             setViewTreeLifecycleOwner(this@FloatingBubbleService)
             setViewTreeViewModelStoreOwner(this@FloatingBubbleService)
             setViewTreeSavedStateRegistryOwner(this@FloatingBubbleService)
@@ -918,7 +960,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             acquireDictationWakeLock()
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
-                            setKeepScreenOn(true)
+                            syncScreenKeepAwakeState(forceRefreshWakeLock = true)
 
                             // "Transcribe while recording": create the session now, start it before the mic so a very
                             // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
@@ -949,8 +991,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                     session?.cancel()
                                     if (streamingSession === session) streamingSession = null
                                     bubbleState.value = OverlayBubbleState.IDLE
-                                    setKeepScreenOn(false)
                                     releaseDictationWakeLock()
+                                    syncBubbleVisibility()
+                                    syncScreenKeepAwakeState()
                                     withContext(Dispatchers.Main) {
                                         android.widget.Toast.makeText(
                                             this@FloatingBubbleService,
@@ -962,8 +1005,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                         },
                         onStopRecording = {
+                            acquireDictationWakeLock()
                             bubbleState.value = OverlayBubbleState.PROCESSING
-                            setKeepScreenOn(false)
+                            // Keep the screen awake throughout Voz transcription and LLM post-processing!
+                            syncScreenKeepAwakeState(forceRefreshWakeLock = true)
                             val session = streamingSession
                             streamingSession = null
                             serviceScope.launch {
@@ -986,6 +1031,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         try {
             windowManager.addView(composeView, layoutParams)
             isOverlayAttached = true
+            syncScreenKeepAwakeState()
         } catch (t: Throwable) {
             t.printStackTrace()
             isOverlayAttached = false
@@ -1016,18 +1062,99 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
-    private fun setKeepScreenOn(keep: Boolean) {
-        if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
-        if (keep) {
-            layoutParams.flags = layoutParams.flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+    private fun shouldKeepScreenOnNow(): Boolean {
+        val interactive = isScreenInteractive.value && checkScreenInteractive()
+        if (!interactive) return false
+        val phase = if (::smartPipeline.isInitialized) {
+            smartPipeline.pipelineStatus.value.phase
         } else {
-            layoutParams.flags = layoutParams.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+            PipelinePhase.UNINITIALIZED
         }
+        val activeProcessing = ::smartPipeline.isInitialized && smartPipeline.isActivelyProcessing
+        return computeShouldKeepScreenOn(
+            isScreenInteractive = true,
+            isBubbleVisible = isBubbleVisibleFlow.value,
+            bubbleState = bubbleState.value,
+            pipelinePhase = phase,
+            isPipelineActivelyProcessing = activeProcessing
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireOrRefreshScreenWakeLock(forceRefresh: Boolean = false) {
         try {
-            if (composeView.isAttachedToWindow) {
-                windowManager.updateViewLayout(composeView, layoutParams)
+            if (!checkScreenInteractive()) {
+                releaseScreenWakeLock()
+                return
             }
+            val nowMs = SystemClock.elapsedRealtime()
+            val existing = screenKeepAwakeWakeLock
+            if (existing?.isHeld == true &&
+                !forceRefresh &&
+                nowMs - lastScreenWakeLockRefreshMs < SCREEN_WAKE_LOCK_REFRESH_INTERVAL_MS
+            ) {
+                return
+            }
+            val lock = existing ?: run {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                // SCREEN_BRIGHT_WAKE_LOCK (without ACQUIRE_CAUSES_WAKEUP) keeps an already-on display
+                // from dimming/sleeping even on OEM ROMs that ignore FLAG_KEEP_SCREEN_ON on FLAG_NOT_FOCUSABLE
+                // overlays, while ON_AFTER_RELEASE resets the normal user-activity timeout upon release.
+                pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+                    "OpenFlow::BubbleScreenAwakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+            }
+            lock.acquire(SCREEN_WAKE_LOCK_LEASE_MS)
+            screenKeepAwakeWakeLock = lock
+            lastScreenWakeLockRefreshMs = nowMs
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun releaseScreenWakeLock() {
+        try {
+            screenKeepAwakeWakeLock?.let {
+                if (it.isHeld) it.release()
+            }
+            screenKeepAwakeWakeLock = null
+            lastScreenWakeLockRefreshMs = 0L
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Synchronizes both WindowManager `FLAG_KEEP_SCREEN_ON` / `View.keepScreenOn` AND
+     * [screenKeepAwakeWakeLock] so the display never turns off while the bubble is visible,
+     * recording, transcribing (`Ear` / `Voz` / `Punct`), or running an on-device LLM.
+     */
+    private fun syncScreenKeepAwakeState(forceRefreshWakeLock: Boolean = false) {
+        val keepAwake = shouldKeepScreenOnNow()
+        if (keepAwake) {
+            acquireOrRefreshScreenWakeLock(forceRefresh = forceRefreshWakeLock)
+        } else {
+            releaseScreenWakeLock()
+        }
+
+        if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
+        if (composeView.keepScreenOn != keepAwake) {
+            composeView.keepScreenOn = keepAwake
+        }
+        val desiredFlags = if (keepAwake) {
+            layoutParams.flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        } else {
+            layoutParams.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+        }
+        if (desiredFlags != layoutParams.flags) {
+            layoutParams.flags = desiredFlags
+            try {
+                if (composeView.isAttachedToWindow) {
+                    windowManager.updateViewLayout(composeView, layoutParams)
+                }
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -1036,11 +1163,25 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         touchable: Boolean,
         forceUpdate: Boolean = false
     ) {
+        val keepAwake = shouldKeepScreenOnNow()
+        if (keepAwake) {
+            acquireOrRefreshScreenWakeLock()
+        } else {
+            releaseScreenWakeLock()
+        }
         if (!::layoutParams.isInitialized || !::composeView.isInitialized) return
-        val newFlags = if (touchable) {
+        if (composeView.keepScreenOn != keepAwake) {
+            composeView.keepScreenOn = keepAwake
+        }
+        val touchFlags = if (touchable) {
             layoutParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
         } else {
             layoutParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        val newFlags = if (keepAwake) {
+            touchFlags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        } else {
+            touchFlags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
         }
         val newAlpha = if (visible) 1.0f else 0.0f
         val changed = newFlags != layoutParams.flags || layoutParams.alpha != newAlpha
@@ -1064,15 +1205,18 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private fun acquireDictationWakeLock() {
         try {
-            if (dictationWakeLock?.isHeld == true) return
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            dictationWakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "OpenFlow::DictationWakeLock"
-            ).apply {
-                setReferenceCounted(false)
-                acquire(10 * 60 * 1000L) // 10-minute safety timeout per dictation (live chunking allows long dictations)
+            val lock = dictationWakeLock ?: run {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "OpenFlow::DictationWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
             }
+            // Refresh lease so long live-streaming dictations + final LLM post-processing never time out
+            lock.acquire(DICTATION_WAKE_LOCK_LEASE_MS)
+            dictationWakeLock = lock
         } catch (_: Throwable) {
         }
     }
@@ -1216,6 +1360,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 }
             } finally {
                 releaseDictationWakeLock()
+                syncBubbleVisibility()
+                syncScreenKeepAwakeState()
             }
         }
     }
@@ -1230,6 +1376,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         streamingSession?.cancel()
         streamingSession = null
         unregisterScreenStateReceiver()
+        releaseScreenWakeLock()
         releaseDictationWakeLock()
         try {
             val modelPrefs = ModelSettings.getPreferences(this)

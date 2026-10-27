@@ -1988,4 +1988,150 @@ class SmartPipelineTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `screen stays awake while bubble is visible or transcribing or using LLM and releases when hidden or screen off`() {
+        // 1. Visible idle bubble on screen keeps display awake
+        assertTrue(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                isScreenInteractive = true,
+                isBubbleVisible = true,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.READY,
+                isPipelineActivelyProcessing = false
+            )
+        )
+
+        // 2. Recording, Processing (Voz / LLM), or Success keeps display awake even if keyboard closes
+        for (activeBubbleState in listOf(
+            com.voicebubble.openflow.overlay.OverlayBubbleState.RECORDING,
+            com.voicebubble.openflow.overlay.OverlayBubbleState.PROCESSING,
+            com.voicebubble.openflow.overlay.OverlayBubbleState.SUCCESS
+        )) {
+            assertTrue(
+                com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                    isScreenInteractive = true,
+                    isBubbleVisible = false,
+                    bubbleState = activeBubbleState,
+                    pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.READY,
+                    isPipelineActivelyProcessing = false
+                )
+            )
+        }
+
+        // 3. Active pipeline transcription or LLM cleanup/benchmark keeps display awake
+        assertTrue(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                isScreenInteractive = true,
+                isBubbleVisible = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.TRANSCRIBING,
+                isPipelineActivelyProcessing = false
+            )
+        )
+        assertTrue(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                isScreenInteractive = true,
+                isBubbleVisible = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.LOADING,
+                isPipelineActivelyProcessing = true
+            )
+        )
+
+        // 4. Hidden idle bubble with idle pipeline allows normal screen timeout
+        assertFalse(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                isScreenInteractive = true,
+                isBubbleVisible = false,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.IDLE,
+                pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.READY,
+                isPipelineActivelyProcessing = false
+            )
+        )
+
+        // 5. Manual hardware Power-button screen off always releases screen wake lock immediately
+        assertFalse(
+            com.voicebubble.openflow.overlay.FloatingBubbleService.computeShouldKeepScreenOn(
+                isScreenInteractive = false,
+                isBubbleVisible = true,
+                bubbleState = com.voicebubble.openflow.overlay.OverlayBubbleState.PROCESSING,
+                pipelinePhase = com.voicebubble.openflow.core.speech.PipelinePhase.TRANSCRIBING,
+                isPipelineActivelyProcessing = true
+            )
+        )
+    }
+
+    @Test
+    fun `LlmBenchmarkSample provides 5 standard examples, 2 complex examples, and 1 custom input option`() {
+        val all = com.voicebubble.openflow.settings.LlmBenchmarkSample.entries
+        val standardExamples = all.filter { !it.isComplex && !it.isCustom }
+        val complexExamples = all.filter { it.isComplex && !it.isCustom }
+        val customOptions = all.filter { it.isCustom }
+
+        assertEquals(5, standardExamples.size)
+        assertEquals(2, complexExamples.size)
+        assertEquals(1, customOptions.size)
+        all.forEach { sample ->
+            assertTrue(sample.label.isNotBlank())
+            assertTrue(sample.sampleText.isNotBlank())
+        }
+        complexExamples.forEach { complex ->
+            assertTrue("Complex benchmark sample should be substantial", complex.sampleText.length >= 350)
+        }
+    }
+
+    @Test
+    fun `LLM benchmark metrics accurately compute uncached vs cached tokens per second and speedup`() {
+        val uncached = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computePassMetrics(
+            wallTotalMs = 800L,
+            streamTtftMs = 300L,
+            streamDecodeDurationMs = 500L,
+            streamedTokenChunks = 25,
+            tokensBeforeTurn = 0,
+            tokensAfterTurn = 285,
+            fallbackInputChars = 900,
+            fallbackOutputChars = 100,
+            nativeTtftSec = 0.30,
+            nativePrefillTokens = 260,
+            nativeDecodeTokens = 25,
+            nativePrefillTokPerSec = 866.6,
+            nativeDecodeTokPerSec = 50.0
+        )
+        assertEquals(800L, uncached.totalMs)
+        assertEquals(300L, uncached.ttftMs)
+        assertEquals(260, uncached.prefillTokens)
+        assertEquals(25, uncached.decodeTokens)
+        assertEquals(50.0, uncached.decodeTokensPerSec, 0.01)
+        assertEquals(31.25, uncached.effectiveTokensPerSec, 0.01)
+
+        val cached = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computePassMetrics(
+            wallTotalMs = 525L,
+            streamTtftMs = 25L,
+            streamDecodeDurationMs = 500L,
+            streamedTokenChunks = 25,
+            tokensBeforeTurn = 230,
+            tokensAfterTurn = 285,
+            fallbackInputChars = 120,
+            fallbackOutputChars = 100
+        )
+        assertEquals(525L, cached.totalMs)
+        assertEquals(25L, cached.ttftMs)
+        assertEquals(25, cached.decodeTokens)
+        assertTrue("Cached effective tok/s must exceed uncached effective tok/s", cached.effectiveTokensPerSec > uncached.effectiveTokensPerSec)
+
+        val result = com.voicebubble.openflow.core.speech.LlmBenchmarkResult(
+            modelTitle = "Qwen 3 0.6B",
+            backendSummary = "GPU OpenCL/Vulkan",
+            promptPresetTitle = "Default — Clean & Format",
+            thinkingModeSummary = "Adaptive (Direct fast-path)",
+            inputText = "um hey sarah running fifteen minutes late",
+            cleanedOutput = "Hey Sarah, running 15 minutes late.",
+            uncached = uncached,
+            cached = cached,
+            cachePrewarmMs = 190L,
+            cachedSystemPromptTokens = 230
+        )
+        assertEquals(800.0 / 525.0, result.speedupFactor!!, 0.001)
+    }
 }

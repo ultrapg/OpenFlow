@@ -1005,3 +1005,59 @@ object DesertAntModelStorage {
         return deletedCount
     }
 }
+
+/**
+ * Built-in dictation benchmark samples (5 standard examples + 2 complex multi-edit stress tests)
+ * plus a user-editable custom input option for testing on-device LLM speed (cached vs uncached system prompt).
+ */
+enum class LlmBenchmarkSample(
+    val id: String,
+    val label: String,
+    val sampleText: String,
+    val isComplex: Boolean = false,
+    val isCustom: Boolean = false
+) {
+    EXAMPLE_1_CASUAL_FILLERS(
+        id = "example_1_casual",
+        label = "Example 1: Casual Message & Fillers",
+        sampleText = "um hey sarah i was just calling to say uh i am running about fifteen minutes late see you around three thirty"
+    ),
+    EXAMPLE_2_NUMBERS_DATES(
+        id = "example_2_numbers",
+        label = "Example 2: Numbers, Currency & Dates",
+        sampleText = "the total invoice comes out to four thousand two hundred fifty dollars and seventy five cents due on november twenty fourth twenty twenty six at five pm"
+    ),
+    EXAMPLE_3_SELF_CORRECTION(
+        id = "example_3_correction",
+        label = "Example 3: Spoken Self-Correction",
+        sampleText = "let us schedule the design review for tuesday at ten am actually scratch that make it thursday at two thirty pm instead"
+    ),
+    EXAMPLE_4_EMAIL_FORMATTING(
+        id = "example_4_email",
+        label = "Example 4: Work Email & Spoken Address",
+        sampleText = "hi alex new paragraph please send the updated q three deck to marcus dot weber at acme dash corp dot com before noon tomorrow new paragraph thanks"
+    ),
+    EXAMPLE_5_ACTION_LIST(
+        id = "example_5_list",
+        label = "Example 5: Spoken Numbered List",
+        sampleText = "three quick reminders for today number one merge the android release branch number two verify the benchmark numbers number three publish version two point ten"
+    ),
+    COMPLEX_1_MULTI_EDIT_SPECS(
+        id = "complex_1_specs",
+        label = "Complex 1: Multi-Correction, Specs, List & Email",
+        sampleText = "um okay team quick architecture recap new paragraph we tested three local models on eight gigabytes of ram wait no make that six gigabytes of ram and uh here is what we saw colon number one qwen three zero point six b finished in about three hundred eighty milliseconds at forty two point five tokens per second number two gemma four e two b used around two point one gigabytes actually sorry one point nine gigabytes with ninety eight percent formatting accuracy number three idle memory dropped to zero megabytes after five minutes new paragraph please ping elena dot kovacs at openflow dot dev if throughput dips below twenty five percent",
+        isComplex = true
+    ),
+    COMPLEX_2_MEETING_RECAP(
+        id = "complex_2_meeting",
+        label = "Complex 2: Dense Technical Dictation & Course-Corrections",
+        sampleText = "so uh for the quarterly engineering update i want to cover four things first latency dropped from one thousand four hundred twenty milliseconds down to six hundred ten milliseconds when the system prompt kv cache is warm second uh on devices with less than twelve hundred megabytes free wait scratch that fifteen hundred megabytes free we dynamically cap the context window at two thousand forty eight tokens instead of four thousand ninety six tokens third please remind david and priya that the deadline is friday october thirtieth at four forty five pm sharp not monday morning and fourth if the screen timeout is set to fifteen seconds or thirty seconds the floating dictation bubble now keeps the display awake during both voz transcription and llm cleanup",
+        isComplex = true
+    ),
+    CUSTOM_INPUT(
+        id = "custom_input",
+        label = "Custom Text Input...",
+        sampleText = "um type or dictate your own test text here and tap benchmark to compare cached versus uncached speed",
+        isCustom = true
+    );
+}

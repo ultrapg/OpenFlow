@@ -58,6 +58,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToLong
 
 /**
  * Target application category detected from the focused input node's package name,
@@ -118,6 +119,46 @@ internal data class SystemPromptCacheKey(
     val disableThinking: Boolean,
     val loraAdapterName: String? = null
 )
+
+/**
+ * Token throughput and latency metrics for a single LLM inference pass.
+ */
+data class LlmSinglePassMetrics(
+    val totalMs: Long,
+    val ttftMs: Long,
+    val prefillTokens: Int,
+    val decodeTokens: Int,
+    val prefillTokensPerSec: Double,
+    val decodeTokensPerSec: Double,
+    val effectiveTokensPerSec: Double
+)
+
+/**
+ * Side-by-side benchmark result comparing cold/uncached system-prompt execution against
+ * warm KV-cached system-prompt execution on the active [LlmModelChoice] and hardware backend.
+ */
+data class LlmBenchmarkResult(
+    val modelTitle: String,
+    val backendSummary: String,
+    val promptPresetTitle: String,
+    val thinkingModeSummary: String,
+    val inputText: String,
+    val cleanedOutput: String,
+    val uncached: LlmSinglePassMetrics,
+    val cached: LlmSinglePassMetrics?,
+    val cachePrewarmMs: Long,
+    val cachedSystemPromptTokens: Int,
+    val cacheUnavailableReason: String? = null
+) {
+    val speedupFactor: Double?
+        get() = cached?.let { c ->
+            if (c.totalMs > 0L && uncached.totalMs > 0L) {
+                uncached.totalMs.toDouble() / c.totalMs.toDouble()
+            } else {
+                null
+            }
+        }
+}
 
 internal data class SieveSpan(
     val text: String,
@@ -1949,6 +1990,72 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             } catch (_: Throwable) {
             }
         }
+
+        internal fun computePassMetrics(
+            wallTotalMs: Long,
+            streamTtftMs: Long,
+            streamDecodeDurationMs: Long,
+            streamedTokenChunks: Int,
+            tokensBeforeTurn: Int,
+            tokensAfterTurn: Int,
+            fallbackInputChars: Int,
+            fallbackOutputChars: Int,
+            nativeTtftSec: Double = 0.0,
+            nativePrefillTokens: Int = 0,
+            nativeDecodeTokens: Int = 0,
+            nativePrefillTokPerSec: Double = 0.0,
+            nativeDecodeTokPerSec: Double = 0.0
+        ): LlmSinglePassMetrics {
+            val safeWallMs = wallTotalMs.coerceAtLeast(1L)
+            val ttftMs = when {
+                nativeTtftSec.isFinite() && nativeTtftSec > 0.0 ->
+                    (nativeTtftSec * 1000.0).roundToLong().coerceIn(1L, safeWallMs)
+                streamTtftMs > 0L -> streamTtftMs.coerceIn(1L, safeWallMs)
+                else -> safeWallMs
+            }
+
+            val kvDelta = (tokensAfterTurn - tokensBeforeTurn).coerceAtLeast(0)
+            val approxOutTokens = max(1, (fallbackOutputChars + 3) / 4)
+            val approxInTokens = max(1, (fallbackInputChars + 3) / 4)
+
+            val decodeTokens = when {
+                nativeDecodeTokens > 0 -> nativeDecodeTokens
+                streamedTokenChunks > 0 -> streamedTokenChunks
+                kvDelta > approxInTokens -> kvDelta - approxInTokens
+                else -> approxOutTokens
+            }.coerceAtLeast(1)
+
+            val prefillTokens = when {
+                nativePrefillTokens > 0 -> nativePrefillTokens
+                kvDelta > decodeTokens -> kvDelta - decodeTokens
+                else -> approxInTokens
+            }.coerceAtLeast(1)
+
+            val decodeTokPerSec = when {
+                nativeDecodeTokPerSec.isFinite() && nativeDecodeTokPerSec > 0.0 -> nativeDecodeTokPerSec
+                streamDecodeDurationMs >= 5L && decodeTokens > 1 ->
+                    ((decodeTokens - 1).toDouble() * 1000.0) / streamDecodeDurationMs.toDouble()
+                else ->
+                    (decodeTokens.toDouble() * 1000.0) / max(1L, safeWallMs - ttftMs + 1L).toDouble()
+            }
+
+            val prefillTokPerSec = when {
+                nativePrefillTokPerSec.isFinite() && nativePrefillTokPerSec > 0.0 -> nativePrefillTokPerSec
+                else -> (prefillTokens.toDouble() * 1000.0) / ttftMs.coerceAtLeast(1L).toDouble()
+            }
+
+            val effectiveTokPerSec = (decodeTokens.toDouble() * 1000.0) / safeWallMs.toDouble()
+
+            return LlmSinglePassMetrics(
+                totalMs = safeWallMs,
+                ttftMs = ttftMs,
+                prefillTokens = prefillTokens,
+                decodeTokens = decodeTokens,
+                prefillTokensPerSec = prefillTokPerSec,
+                decodeTokensPerSec = decodeTokPerSec,
+                effectiveTokensPerSec = effectiveTokPerSec
+            )
+        }
     }
 
     private data class BackendCandidate(
@@ -1970,7 +2077,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private data class StreamingTurnOutput(
         val visibleText: String,
         val thoughtChars: Int,
-        val earlyAborted: Boolean
+        val earlyAborted: Boolean,
+        val ttftMs: Long = 0L,
+        val decodeDurationMs: Long = 0L,
+        val streamedTokenChunks: Int = 0
     )
 
     private val appContext: Context = context.applicationContext
@@ -2039,11 +2149,19 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                             maxNumTokens = maxTokens,
                             cacheDir = cacheDirectory.absolutePath
                         )
-                        ExperimentalFlags.enableBenchmark = false
+                        ExperimentalFlags.enableBenchmark = true
                         ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
                         ExperimentalFlags.filterChannelContentFromKvCache = true
-                        createdEngine = Engine(config)
                         try {
+                            createdEngine = Engine(config)
+                            createdEngine.initialize()
+                        } catch (benchInitErr: Throwable) {
+                            createdEngine?.let { runCatching { it.close() } }
+                            createdEngine = null
+                            ExperimentalFlags.enableBenchmark = false
+                            ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
+                            ExperimentalFlags.filterChannelContentFromKvCache = true
+                            createdEngine = Engine(config)
                             createdEngine.initialize()
                         } finally {
                             ExperimentalFlags.enableSpeculativeDecoding = false
@@ -3208,6 +3326,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val streamLock = Any()
         val visibleBuilder = StringBuilder(min(maxVisibleChars, 512))
         var thoughtChars = 0
+        var streamedChunks = 0
+        var firstTokenNs = 0L
+        var doneNs = 0L
         var lastRepetitionCheckLen = 0
 
         val doneLatch = CountDownLatch(1)
@@ -3224,14 +3345,22 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             640
         }
         val noRepeatNgram = if (isNpu) null else NoRepeatNgramConfig(6, 64)
+        val sendStartNs = SystemClock.elapsedRealtimeNanos()
 
         val callback = object : MessageCallback {
             override fun onMessage(message: Message) {
                 val deltaText = message.toString()
                 val deltaThought = message.channels["thought"].orEmpty()
+                val callbackNs = SystemClock.elapsedRealtimeNanos()
                 var triggerCancel = false
 
                 synchronized(streamLock) {
+                    if (deltaText.isNotEmpty() || deltaThought.isNotEmpty()) {
+                        streamedChunks++
+                        if (firstTokenNs == 0L) {
+                            firstTokenNs = callbackNs
+                        }
+                    }
                     if (deltaThought.isNotEmpty()) {
                         thoughtChars += deltaThought.length
                     }
@@ -3277,10 +3406,16 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             }
 
             override fun onDone() {
+                synchronized(streamLock) {
+                    doneNs = SystemClock.elapsedRealtimeNanos()
+                }
                 doneLatch.countDown()
             }
 
             override fun onError(throwable: Throwable) {
+                synchronized(streamLock) {
+                    doneNs = SystemClock.elapsedRealtimeNanos()
+                }
                 errorRef.set(throwable)
                 doneLatch.countDown()
             }
@@ -3308,10 +3443,15 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 maxOutTokens,
                 thinkingConfig
             )
+            val syncEndNs = SystemClock.elapsedRealtimeNanos()
+            val syncElapsedMs = ((syncEndNs - sendStartNs) / 1_000_000L).coerceAtLeast(1L)
             return StreamingTurnOutput(
                 visibleText = syncResponse.toString(),
                 thoughtChars = syncResponse.channels["thought"]?.length ?: 0,
-                earlyAborted = false
+                earlyAborted = false,
+                ttftMs = syncElapsedMs,
+                decodeDurationMs = 0L,
+                streamedTokenChunks = 0
             )
         }
 
@@ -3327,9 +3467,24 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         val finalVisible: String
         val finalThoughtChars: Int
+        val finalStreamedChunks: Int
+        val resolvedTtftMs: Long
+        val resolvedDecodeMs: Long
         synchronized(streamLock) {
             finalVisible = visibleBuilder.toString()
             finalThoughtChars = thoughtChars
+            finalStreamedChunks = streamedChunks
+            val endNs = if (doneNs > 0L) doneNs else SystemClock.elapsedRealtimeNanos()
+            resolvedTtftMs = if (firstTokenNs > sendStartNs) {
+                ((firstTokenNs - sendStartNs) / 1_000_000L).coerceAtLeast(1L)
+            } else {
+                ((endNs - sendStartNs) / 1_000_000L).coerceAtLeast(1L)
+            }
+            resolvedDecodeMs = if (firstTokenNs > 0L && endNs > firstTokenNs) {
+                ((endNs - firstTokenNs) / 1_000_000L).coerceAtLeast(1L)
+            } else {
+                0L
+            }
         }
 
         if (abortedForThoughtCap.get()) {
@@ -3345,7 +3500,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             return StreamingTurnOutput(
                 visibleText = segmentFallback,
                 thoughtChars = finalThoughtChars,
-                earlyAborted = true
+                earlyAborted = true,
+                ttftMs = resolvedTtftMs,
+                decodeDurationMs = resolvedDecodeMs,
+                streamedTokenChunks = finalStreamedChunks
             )
         }
         if (abortedForRepetition.get()) {
@@ -3357,7 +3515,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             return StreamingTurnOutput(
                 visibleText = trimmedLoop,
                 thoughtChars = finalThoughtChars,
-                earlyAborted = true
+                earlyAborted = true,
+                ttftMs = resolvedTtftMs,
+                decodeDurationMs = resolvedDecodeMs,
+                streamedTokenChunks = finalStreamedChunks
             )
         }
 
@@ -3369,7 +3530,379 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         return StreamingTurnOutput(
             visibleText = finalVisible,
             thoughtChars = finalThoughtChars,
-            earlyAborted = false
+            earlyAborted = false,
+            ttftMs = resolvedTtftMs,
+            decodeDurationMs = resolvedDecodeMs,
+            streamedTokenChunks = finalStreamedChunks
+        )
+    }
+
+    /**
+     * Benchmarks the currently initialized [llmChoice] on [rawInput] both **without** system-prompt
+     * KV caching (cold prefill) and **with** system-prompt KV caching (`prefillPrefaceOnInit = true`),
+     * strictly maintaining a single live `Conversation` in RAM at any instant.
+     */
+    @OptIn(ExperimentalApi::class)
+    @Suppress("DEPRECATION")
+    suspend fun benchmarkPromptCaching(
+        rawInput: String,
+        languageCode: String? = "en",
+        preset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
+        customPrompt: String = "",
+        customVocabulary: List<String> = emptyList(),
+        disableThinking: Boolean = false,
+        adaptiveThinking: Boolean = true,
+        onProgress: ((String) -> Unit)? = null
+    ): LlmBenchmarkResult {
+        val callerJob = coroutineContext[Job]
+        val trimmedRaw = rawInput.trim().ifEmpty { "hello world this is a quick speed test" }
+        val normalized = preNormalizeSpokenConstructs(trimmedRaw, preset)
+        val (currentCtx, modelSupportsThinking) = synchronized(engineLock) {
+            activeMaxContextTokens to effectiveSupportsThinking
+        }
+        val maxSegChars = when {
+            memoryMode == GemmaMemoryMode.LOW_MEMORY -> MAX_CHARS_PER_PASS_LOW_MEM
+            currentCtx <= LOW_MEM_MAX_CONTEXT_TOKENS ->
+                if (disableThinking || !modelSupportsThinking || adaptiveThinking) {
+                    MAX_CHARS_PER_PASS_THINK_2K
+                } else {
+                    MAX_CHARS_PER_PASS_LOW_MEM
+                }
+            (!disableThinking && !adaptiveThinking && modelSupportsThinking) && currentCtx < 4_096 ->
+                MAX_CHARS_PER_PASS_THINK_2K
+            else -> MAX_CHARS_PER_PASS
+        }
+        val segment: String = splitLongTranscript(normalized, maxSegChars).firstOrNull()?.takeIf { it.isNotBlank() } ?: normalized
+        val effectiveDisableThinking = when {
+            disableThinking || !modelSupportsThinking -> true
+            adaptiveThinking -> !shouldEnableThinkingForSegment(segment, preset, llmChoice)
+            else -> false
+        }
+        val thinkingSummary = when {
+            !modelSupportsThinking -> "Direct (non-thinking model)"
+            disableThinking -> "Thinking Off"
+            adaptiveThinking && effectiveDisableThinking -> "Adaptive (Direct fast-path)"
+            adaptiveThinking -> "Adaptive (Thinking enabled)"
+            else -> "Thinking On"
+        }
+
+        val userPromptText = buildUserPrompt(segment, languageCode)
+
+        // Pass 1: Cold / Uncached System Prompt
+        onProgress?.invoke("1/2 Benchmarking uncached prompt on ${llmChoice.title}...")
+        val (uncachedMetrics, uncachedCleaned, systemInstructionUsed) = synchronized(engineLock) {
+            val activeEngine = engine ?: throw IllegalStateException("${llmChoice.title} engine is not initialized")
+            evictCachedSystemPromptLocked()
+
+            val candidate = candidates.getOrNull(activeCandidateIndex)
+            val isNpu = candidate?.isNpu == true
+            val useMtp = candidate?.enableMtp == true
+            val loraConfig = buildActiveLoraConfig(isNpu)
+            var passDisableThinking = effectiveDisableThinking
+
+            fun buildInstruction(noThink: Boolean): String = if (loraConfig != null) {
+                buildCompactLoraSystemInstruction(
+                    preset = preset,
+                    customPrompt = customPrompt,
+                    languageCode = null,
+                    customVocabulary = customVocabulary,
+                    fieldContext = FlowFieldContext.NONE,
+                    precedingSegmentTail = null
+                )
+            } else {
+                buildSystemInstruction(
+                    preset = preset,
+                    customPrompt = customPrompt,
+                    languageCode = null,
+                    customVocabulary = customVocabulary,
+                    fieldContext = FlowFieldContext.NONE,
+                    precedingSegmentTail = null,
+                    disableThinking = noThink,
+                    llmChoice = llmChoice
+                )
+            }
+
+            fun runUncachedAttempt(noThink: Boolean): Triple<LlmSinglePassMetrics, String, String> {
+                val sysText = buildInstruction(noThink)
+                val maxOutTokens = computeMaxOutputTokens(
+                    inputText = segment,
+                    preset = preset,
+                    disableThinking = noThink,
+                    maxContextTokens = activeMaxContextTokens,
+                    llmChoice = llmChoice
+                )
+                val thinkingCfg = buildTurnThinkingConfig(
+                    modelSupportsThinking = modelSupportsThinking,
+                    effectiveDisableThinking = noThink,
+                    isNpu = isNpu
+                )
+                val templateCtx: Map<String, Any> = if (!modelSupportsThinking) {
+                    emptyMap()
+                } else {
+                    mapOf("enable_thinking" to !noThink)
+                }
+                val maxVisChars = if (preset == GemmaPromptPreset.CUSTOM) {
+                    max(segment.length * 4, 1_200)
+                } else {
+                    max(segment.length * 2 + 180, 340)
+                }
+
+                ExperimentalFlags.filterChannelContentFromKvCache = true
+                val startNs = SystemClock.elapsedRealtimeNanos()
+                val conv = activeEngine.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(sysText),
+                        samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                        automaticToolCalling = false,
+                        extraContext = templateCtx,
+                        loraConfig = loraConfig,
+                        maxOutputToken = maxOutTokens,
+                        thinkingConfig = thinkingCfg,
+                        prefillPrefaceOnInit = false,
+                        enableSpeculativeDecoding = if (isNpu) null else useMtp
+                    )
+                )
+                conv.use { activeConv ->
+                    val tokensBefore = runCatching { activeConv.getTokenCount() }.getOrDefault(0)
+                    val cancelHandle = callerJob?.invokeOnCompletion { cause ->
+                        if (cause != null) runCatching { activeConv.cancelProcess() }
+                    }
+                    val turnOut = try {
+                        executeStreamingMessageLocked(
+                            conversation = activeConv,
+                            userMessage = Message.user(userPromptText),
+                            templateContext = templateCtx,
+                            isNpu = isNpu,
+                            maxOutTokens = maxOutTokens,
+                            thinkingConfig = thinkingCfg,
+                            effectiveDisableThinking = noThink,
+                            maxVisibleChars = maxVisChars,
+                            segmentFallback = segment,
+                            callerJob = callerJob
+                        )
+                    } finally {
+                        cancelHandle?.dispose()
+                    }
+                    val wallMs = ((SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                    if (!noThink && isVisibleContentEmptyAfterStrippingThought(turnOut.visibleText)) {
+                        throw ThinkingBudgetExhaustedException("Thinking exhausted budget during uncached benchmark")
+                    }
+                    val nativeBench = runCatching { activeConv.getBenchmarkInfo() }.getOrNull()
+                    val tokensAfter = runCatching { activeConv.getTokenCount() }.getOrDefault(0)
+                    val metrics = computePassMetrics(
+                        wallTotalMs = wallMs,
+                        streamTtftMs = turnOut.ttftMs,
+                        streamDecodeDurationMs = turnOut.decodeDurationMs,
+                        streamedTokenChunks = turnOut.streamedTokenChunks,
+                        tokensBeforeTurn = tokensBefore,
+                        tokensAfterTurn = tokensAfter,
+                        fallbackInputChars = sysText.length + userPromptText.length,
+                        fallbackOutputChars = turnOut.visibleText.length + turnOut.thoughtChars,
+                        nativeTtftSec = nativeBench?.timeToFirstTokenInSecond ?: 0.0,
+                        nativePrefillTokens = nativeBench?.lastPrefillTokenCount ?: 0,
+                        nativeDecodeTokens = nativeBench?.lastDecodeTokenCount ?: 0,
+                        nativePrefillTokPerSec = nativeBench?.lastPrefillTokensPerSecond ?: 0.0,
+                        nativeDecodeTokPerSec = nativeBench?.lastDecodeTokensPerSecond ?: 0.0
+                    )
+                    val sanitized = finalizePostFormatting(
+                        text = sanitizeGemmaOutput(
+                            rawOutput = turnOut.visibleText,
+                            fallbackInput = segment,
+                            preset = preset,
+                            customPrompt = customPrompt,
+                            precedingSegmentTail = null
+                        ),
+                        preset = preset,
+                        languageCode = languageCode,
+                        customVocabulary = customVocabulary,
+                        fieldContext = FlowFieldContext.NONE,
+                        applyLeadingCursorContinuation = false
+                    )
+                    return Triple(metrics, sanitized, sysText)
+                }
+            }
+
+            try {
+                runUncachedAttempt(passDisableThinking)
+            } catch (ise: IllegalStateException) {
+                if (!passDisableThinking && modelSupportsThinking && callerJob?.isActive != false) {
+                    passDisableThinking = true
+                    runUncachedAttempt(true)
+                } else {
+                    throw ise
+                }
+            }
+        }
+
+        if (callerJob?.isActive == false) {
+            throw CancellationException("Benchmark cancelled")
+        }
+
+        // Pass 2: Warm / Cached System Prompt (KV Cache Prefilled)
+        if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
+            return LlmBenchmarkResult(
+                modelTitle = llmChoice.title,
+                backendSummary = activeBackendSummary,
+                promptPresetTitle = preset.title,
+                thinkingModeSummary = thinkingSummary,
+                inputText = trimmedRaw,
+                cleanedOutput = uncachedCleaned,
+                uncached = uncachedMetrics,
+                cached = null,
+                cachePrewarmMs = 0L,
+                cachedSystemPromptTokens = 0,
+                cacheUnavailableReason = "System-prompt KV cache is disabled in low-RAM mode (< 1.2 GB free) to prevent OOM."
+            )
+        }
+
+        onProgress?.invoke("2/2 Benchmarking cached system prompt on ${llmChoice.title}...")
+        var cachePrewarmMs = 0L
+        var cachedSysTokens = 0
+        var cachedCleaned: String? = null
+        var cacheFailureReason: String? = null
+
+        val cachedMetrics: LlmSinglePassMetrics? = synchronized(engineLock) {
+            val activeEngine = engine ?: throw IllegalStateException("${llmChoice.title} engine is not initialized")
+            evictCachedSystemPromptLocked()
+
+            val candidate = candidates.getOrNull(activeCandidateIndex)
+            val isNpu = candidate?.isNpu == true
+            val useMtp = candidate?.enableMtp == true
+            val loraConfig = buildActiveLoraConfig(isNpu)
+            val noThink = effectiveDisableThinking ||
+                (systemInstructionUsed.contains("Thinking is off") || !modelSupportsThinking)
+            val maxOutTokens = computeMaxOutputTokens(
+                inputText = segment,
+                preset = preset,
+                disableThinking = noThink,
+                maxContextTokens = activeMaxContextTokens,
+                llmChoice = llmChoice
+            )
+            val thinkingCfg = buildTurnThinkingConfig(
+                modelSupportsThinking = modelSupportsThinking,
+                effectiveDisableThinking = noThink,
+                isNpu = isNpu
+            )
+            val templateCtx: Map<String, Any> = if (!modelSupportsThinking) {
+                emptyMap()
+            } else {
+                mapOf("enable_thinking" to !noThink)
+            }
+            val maxVisChars = if (preset == GemmaPromptPreset.CUSTOM) {
+                max(segment.length * 4, 1_200)
+            } else {
+                max(segment.length * 2 + 180, 340)
+            }
+
+            ExperimentalFlags.filterChannelContentFromKvCache = true
+            val prewarmStartNs = SystemClock.elapsedRealtimeNanos()
+            val warmConv = try {
+                activeEngine.createConversation(
+                    ConversationConfig(
+                        systemInstruction = Contents.of(systemInstructionUsed),
+                        samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                        automaticToolCalling = false,
+                        extraContext = templateCtx,
+                        loraConfig = loraConfig,
+                        maxOutputToken = maxOutTokens,
+                        thinkingConfig = thinkingCfg,
+                        prefillPrefaceOnInit = true,
+                        enableSpeculativeDecoding = if (isNpu) null else useMtp
+                    )
+                )
+            } catch (t: Throwable) {
+                cacheFailureReason = "Backend does not support KV preface prefill (${t.message?.take(80)})"
+                null
+            }
+
+            if (warmConv == null) {
+                null
+            } else {
+                cachePrewarmMs = ((SystemClock.elapsedRealtimeNanos() - prewarmStartNs) / 1_000_000L).coerceAtLeast(1L)
+                warmConv.use { activeConv ->
+                    cachedSysTokens = runCatching { activeConv.getTokenCount() }.getOrDefault(0)
+                    val cancelHandle = callerJob?.invokeOnCompletion { cause ->
+                        if (cause != null) runCatching { activeConv.cancelProcess() }
+                    }
+                    val startNs = SystemClock.elapsedRealtimeNanos()
+                    val turnOut = try {
+                        executeStreamingMessageLocked(
+                            conversation = activeConv,
+                            userMessage = Message.user(userPromptText),
+                            templateContext = templateCtx,
+                            isNpu = isNpu,
+                            maxOutTokens = maxOutTokens,
+                            thinkingConfig = thinkingCfg,
+                            effectiveDisableThinking = noThink,
+                            maxVisibleChars = maxVisChars,
+                            segmentFallback = segment,
+                            callerJob = callerJob
+                        )
+                    } finally {
+                        cancelHandle?.dispose()
+                    }
+                    val wallMs = ((SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                    val nativeBench = runCatching { activeConv.getBenchmarkInfo() }.getOrNull()
+                    val tokensAfter = runCatching { activeConv.getTokenCount() }.getOrDefault(0)
+                    if (!isVisibleContentEmptyAfterStrippingThought(turnOut.visibleText)) {
+                        cachedCleaned = finalizePostFormatting(
+                            text = sanitizeGemmaOutput(
+                                rawOutput = turnOut.visibleText,
+                                fallbackInput = segment,
+                                preset = preset,
+                                customPrompt = customPrompt,
+                                precedingSegmentTail = null
+                            ),
+                            preset = preset,
+                            languageCode = languageCode,
+                            customVocabulary = customVocabulary,
+                            fieldContext = FlowFieldContext.NONE,
+                            applyLeadingCursorContinuation = false
+                        )
+                    }
+                    computePassMetrics(
+                        wallTotalMs = wallMs,
+                        streamTtftMs = turnOut.ttftMs,
+                        streamDecodeDurationMs = turnOut.decodeDurationMs,
+                        streamedTokenChunks = turnOut.streamedTokenChunks,
+                        tokensBeforeTurn = cachedSysTokens,
+                        tokensAfterTurn = tokensAfter,
+                        fallbackInputChars = userPromptText.length,
+                        fallbackOutputChars = turnOut.visibleText.length + turnOut.thoughtChars,
+                        nativeTtftSec = nativeBench?.timeToFirstTokenInSecond ?: 0.0,
+                        nativePrefillTokens = nativeBench?.lastPrefillTokenCount ?: 0,
+                        nativeDecodeTokens = nativeBench?.lastDecodeTokenCount ?: 0,
+                        nativePrefillTokPerSec = nativeBench?.lastPrefillTokensPerSecond ?: 0.0,
+                        nativeDecodeTokPerSec = nativeBench?.lastDecodeTokensPerSecond ?: 0.0
+                    )
+                }
+            }
+        }
+
+        if (cachedSysTokens <= 0 && cachedMetrics != null) {
+            cachedSysTokens = (uncachedMetrics.prefillTokens - cachedMetrics.prefillTokens).coerceAtLeast(0)
+        }
+
+        val finalOut = cachedCleaned?.takeIf { it.isNotBlank() } ?: uncachedCleaned
+        DebugLogManager.logInfo(
+            TAG,
+            "Benchmark ${llmChoice.title} on $activeBackendSummary: uncached=${uncachedMetrics.totalMs}ms (${String.format(Locale.US, "%.1f", uncachedMetrics.effectiveTokensPerSec)} tok/s, decode=${String.format(Locale.US, "%.1f", uncachedMetrics.decodeTokensPerSec)} tok/s), " +
+                "cached=${cachedMetrics?.totalMs ?: -1}ms (${String.format(Locale.US, "%.1f", cachedMetrics?.effectiveTokensPerSec ?: 0.0)} tok/s, prewarm=${cachePrewarmMs}ms)",
+            includeMemory = true
+        )
+
+        return LlmBenchmarkResult(
+            modelTitle = llmChoice.title,
+            backendSummary = activeBackendSummary,
+            promptPresetTitle = preset.title,
+            thinkingModeSummary = thinkingSummary,
+            inputText = trimmedRaw,
+            cleanedOutput = finalOut,
+            uncached = uncachedMetrics,
+            cached = cachedMetrics,
+            cachePrewarmMs = cachePrewarmMs,
+            cachedSystemPromptTokens = cachedSysTokens,
+            cacheUnavailableReason = cacheFailureReason
         )
     }
 

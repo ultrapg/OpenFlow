@@ -187,7 +187,7 @@ class MainActivity : ComponentActivity() {
                                 try {
                                     context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.9.0"
                                 } catch (_: Throwable) {
-                                    "2.9.0"
+                                    "2.10.0"
                                 }
                             }
                             var versionTapCount by remember { mutableIntStateOf(0) }
