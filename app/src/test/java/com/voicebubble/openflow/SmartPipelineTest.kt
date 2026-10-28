@@ -2529,5 +2529,122 @@ class SmartPipelineTest {
                 false, "Buy apples", 10, 10
             )
         )
+
+        // 8. Disguised placeholder ("Ask anything", wasShowingHint=false, 0..0) replaced even by identical words -> true
+        assertTrue(
+            check(
+                false, "Ask anything", 0, 0,
+                false, "Ask anything", 12, 12
+            )
+        )
+
+        // 9. WebView / Flutter editor whose selection initializes from -1 to > 0 upon paste -> true
+        assertTrue(
+            check(
+                false, "", -1, -1,
+                false, "", 15, 15
+            )
+        )
+    }
+
+    @Test
+    fun `Disguised placeholder sanitizer strips Compose, Material TextInputLayout, and custom hint text while preserving user text`() {
+        val sanitize = com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService::sanitizeEditableNodeText
+
+        // 1. Standard Android isShowingHintText == true -> stripped
+        assertEquals(
+            "",
+            sanitize("Message", true, false, 0, 0, "Message", null, null, null, emptyList())
+        )
+
+        // 2. Password field -> stripped
+        assertEquals(
+            "",
+            sanitize("••••••", false, true, 6, 6, null, null, null, null, emptyList())
+        )
+
+        // 3. Static/wrapper node with no active selection span (-1, -1) -> stripped
+        assertEquals(
+            "",
+            sanitize("Write a comment", false, false, -1, -1, null, null, null, null, emptyList())
+        )
+
+        // 4. Disguised hintText match when isShowingHintText == false -> stripped
+        assertEquals(
+            "",
+            sanitize("Type a message", false, false, 0, 0, "Type a message", null, null, null, emptyList())
+        )
+
+        // 5. Material TextInputLayout combined empty-field label + placeholder -> stripped
+        assertEquals(
+            "",
+            sanitize("Email, Enter your work email", false, false, 0, 0, "Email", null, null, null, emptyList())
+        )
+
+        // 6. Jetpack Compose DecorationBox / BasicTextField merged child placeholder Text -> stripped
+        assertEquals(
+            "",
+            sanitize("Ask anything", false, false, 0, 0, null, null, null, null, listOf("Ask anything"))
+        )
+
+        // 7. Ellipsis placeholder prompt at 0..0 without isShowingHintText -> stripped
+        assertEquals(
+            "",
+            sanitize("Search messages...", false, false, 0, 0, null, null, null, null, emptyList())
+        )
+
+        // 8. Material TextInputLayout ", <hint>" suffix stripped from genuine non-empty user text
+        assertEquals(
+            "Hello Sarah",
+            sanitize("Hello Sarah, Message", false, false, 11, 11, "Message", null, null, null, emptyList())
+        )
+
+        // 9. Genuine user-typed text with cursor > 0 is preserved verbatim
+        assertEquals(
+            "Hi Sarah, ",
+            sanitize("Hi Sarah, ", false, false, 10, 10, "Message", null, null, null, listOf("Message"))
+        )
+    }
+
+    @Test
+    fun `Smart paste payload formats back-to-back dictations and mid-sentence insertions without touching placeholders or URLs`() {
+        val payload = com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService::computeSmartPastePayload
+        val textType = android.text.InputType.TYPE_CLASS_TEXT
+
+        // 1. Empty or 0..0 placeholder-ambiguous field -> never adds leading or trailing spaces
+        assertEquals("Hello world.", payload("", 0, 0, "Hello world.", textType))
+        assertEquals("Hello world.", payload("Unmarked gray hint", 0, 0, "Hello world.", textType))
+
+        // 2. Back-to-back dictation right after a period -> prepends single space
+        assertEquals(
+            " How is your day going?",
+            payload("Hello world.", 12, 12, "How is your day going?", textType)
+        )
+
+        // 3. Mid-sentence insertion ("That is a |car" at 10..10) -> appends trailing space before "car"
+        assertEquals(
+            "really fast ",
+            payload("That is a car", 10, 10, "really fast", textType)
+        )
+
+        // 4. Highlighted range replacement ("Buy [apples] today" at 4..10 and "[Buy] apples" at 0..3)
+        assertEquals(
+            "fresh oranges",
+            payload("Buy apples today", 4, 10, "fresh oranges", textType)
+        )
+        assertEquals(
+            "Get",
+            payload("Buy apples", 0, 3, "Get", textType)
+        )
+
+        // 5. Email, Number, and spaceless URL fields suppress automatic word spaces
+        val emailType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        val uriType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+        assertEquals("gmail.com", payload("alex@", 5, 5, "gmail.com", emailType))
+        assertEquals("openflow", payload("https://github.com/", 19, 19, "openflow", uriType))
+        assertEquals("com", payload("https://example.", 16, 16, "com", uriType))
+
+        // 6. Browser omnibox multi-word search query (URI inputType containing spaces) still spaces words naturally
+        assertEquals(" recipe", payload("best sourdough", 14, 14, "recipe", uriType))
     }
 }

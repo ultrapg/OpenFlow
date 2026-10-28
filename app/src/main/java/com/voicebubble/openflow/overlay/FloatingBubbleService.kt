@@ -1390,19 +1390,20 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     return@launch
                 }
 
-                // Always guarantee the transcribed text is placed on the clipboard as a reliable safety net
-                copyTextToClipboardSafely(finalText)
-
                 val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
                 val accessibilityService = TextInjectionAccessibilityService.getSharedInstance()
-                val injected = if (autoPasteEnabled && accessibilityService != null) {
+                val injectionResult = if (autoPasteEnabled && accessibilityService != null) {
                     accessibilityService.injectTextSuspend(finalText)
                 } else {
-                    false
+                    copyTextToClipboardSafely(finalText)
+                    TextInjectionAccessibilityService.TextInjectionResult.COPIED_TO_CLIPBOARD_ONLY
                 }
 
+                val injected = injectionResult == TextInjectionAccessibilityService.TextInjectionResult.INJECTED
                 if (!injected) {
-                    copyTextToClipboardSafely(finalText)
+                    if (injectionResult == TextInjectionAccessibilityService.TextInjectionResult.NOT_INJECTED_NO_CLIPBOARD) {
+                        copyTextToClipboardSafely(finalText)
+                    }
                     withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,

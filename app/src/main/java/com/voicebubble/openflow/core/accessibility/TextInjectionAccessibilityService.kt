@@ -37,6 +37,12 @@ import java.util.ArrayDeque
 
 class TextInjectionAccessibilityService : AccessibilityService() {
 
+    enum class TextInjectionResult {
+        INJECTED,
+        COPIED_TO_CLIPBOARD_ONLY,
+        NOT_INJECTED_NO_CLIPBOARD
+    }
+
     data class SplicedTextResult(
         val newText: String,
         val newCursorPosition: Int
@@ -44,8 +50,8 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "TextInjectionA11y"
-        private const val MAX_DRILL_NODES = 96
-        private const val MAX_BFS_NODES = 120
+        private const val MAX_DRILL_NODES = 192
+        private const val MAX_BFS_NODES = 320
         private const val MAX_PINNED_NODE_AGE_MS = 10 * 60_000L
 
         private val NO_SPACE_AFTER_CHARS = charArrayOf(
@@ -124,7 +130,168 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
 
         /**
-         * Verifies whether an Accessibility `ACTION_SET_TEXT` or `ACTION_PASTE` call actually modified
+         * Strips disguised placeholder, hint, label, and Material `TextInputLayout` / Compose `DecorationBox`
+         * decoration strings from `AccessibilityNodeInfo.getText()` so screen-reader text is never mistaken
+         * for user-typed editable content.
+         */
+        internal fun sanitizeEditableNodeText(
+            rawText: String,
+            isShowingHintText: Boolean,
+            isPassword: Boolean,
+            selectionStart: Int,
+            selectionEnd: Int,
+            hintText: String? = null,
+            contentDescription: String? = null,
+            tooltipText: String? = null,
+            paneTitle: String? = null,
+            nonEditableChildTexts: List<String> = emptyList()
+        ): String {
+            if (isPassword || isShowingHintText || rawText.isEmpty()) {
+                return ""
+            }
+
+            // Focused editable buffers (`EditText`, Compose `TextField`, `<input>`/`<textarea>`) maintain a
+            // non-negative selection span (`0..length`). When both selection bounds are negative (`-1`), `rawText`
+            // comes from a static/placeholder/container accessibility property rather than an active editable buffer.
+            if (selectionStart < 0 && selectionEnd < 0) {
+                return ""
+            }
+
+            val rawTrimmed = rawText.trim()
+            if (rawTrimmed.isEmpty()) {
+                return rawText
+            }
+
+            val caretAtStartOrEmpty = selectionStart <= 0 && selectionEnd <= 0
+            if (caretAtStartOrEmpty) {
+                val metadataCandidates = listOfNotNull(hintText, contentDescription, tooltipText, paneTitle)
+                for (candidate in metadataCandidates) {
+                    val clean = candidate.trim()
+                    if (clean.isEmpty()) continue
+                    if (rawTrimmed.equals(clean, ignoreCase = true)) {
+                        return ""
+                    }
+                    // Material TextInputLayout empty-field combined format ("Label, Placeholder" / "Placeholder, Label")
+                    if (rawTrimmed.startsWith("$clean, ", ignoreCase = true) ||
+                        rawTrimmed.endsWith(", $clean", ignoreCase = true)
+                    ) {
+                        return ""
+                    }
+                }
+
+                if (nonEditableChildTexts.isNotEmpty()) {
+                    val trimmedChildren = nonEditableChildTexts.map { it.trim() }.filter { it.isNotEmpty() }
+                    if (trimmedChildren.any { rawTrimmed.equals(it, ignoreCase = true) }) {
+                        return ""
+                    }
+                    if (trimmedChildren.size > 1) {
+                        val commaJoined = trimmedChildren.joinToString(", ")
+                        val spaceJoined = trimmedChildren.joinToString(" ")
+                        if (rawTrimmed.equals(commaJoined, ignoreCase = true) ||
+                            rawTrimmed.equals(spaceJoined, ignoreCase = true)
+                        ) {
+                            return ""
+                        }
+                    }
+                }
+
+                // Custom chat/search/AI fields frequently render gray prompt hints ("Type a message...", "Search…")
+                // without setting `isShowingHintText = true` while the real editable buffer is empty (`0..0`).
+                if ((rawTrimmed.endsWith("...") || rawTrimmed.endsWith("…")) && rawTrimmed.length <= 80) {
+                    return ""
+                }
+            } else if (!hintText.isNullOrBlank()) {
+                // Strip Material TextInputLayout ", <hint>" suffix appended after real user text when non-empty
+                val hintSuffix = ", ${hintText.trim()}"
+                if (rawText.endsWith(hintSuffix, ignoreCase = true)) {
+                    val strippedLen = rawText.length - hintSuffix.length
+                    if (strippedLen >= 0 && selectionStart <= strippedLen && selectionEnd <= strippedLen) {
+                        return rawText.substring(0, strippedLen)
+                    }
+                }
+            }
+
+            return rawText
+        }
+
+        internal fun isNoAutoSpaceInputType(inputType: Int, currentText: String): Boolean {
+            if (inputType == 0) return false
+            val cls = inputType and InputType.TYPE_MASK_CLASS
+            if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE || cls == InputType.TYPE_CLASS_DATETIME) {
+                return true
+            }
+            if (cls == InputType.TYPE_CLASS_TEXT) {
+                val variation = inputType and InputType.TYPE_MASK_VARIATION
+                if (variation == InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+                    variation == InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS ||
+                    variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                ) {
+                    return true
+                }
+                // Browser omniboxes use TYPE_TEXT_VARIATION_URI for both URLs ("https://...") and search queries.
+                // Suppress auto-spacing when the existing text looks like a spaceless URL/domain/path.
+                if (variation == InputType.TYPE_TEXT_VARIATION_URI &&
+                    currentText.isNotEmpty() &&
+                    !currentText.contains(' ') &&
+                    (currentText.contains("://") || currentText.contains('.') || currentText.contains('/'))
+                ) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        /**
+         * Formats [textToInsert] for widget-native `ACTION_PASTE` with smart leading/trailing word spacing
+         * strictly when a real non-zero cursor/selection (`selectionStart > 0 || selectionEnd > 0`) exists inside
+         * [sanitizedCurrentText]. Empty/placeholder fields (`0..0` or `-1..-1`) always receive [textToInsert]
+         * verbatim with zero added whitespace.
+         */
+        internal fun computeSmartPastePayload(
+            sanitizedCurrentText: String,
+            selectionStart: Int,
+            selectionEnd: Int,
+            textToInsert: String,
+            inputType: Int = InputType.TYPE_CLASS_TEXT
+        ): String {
+            if (textToInsert.isEmpty() || sanitizedCurrentText.isEmpty()) {
+                return textToInsert
+            }
+            if (selectionStart < 0 || selectionEnd < 0 || (selectionStart == 0 && selectionEnd == 0)) {
+                return textToInsert
+            }
+            if (selectionStart > sanitizedCurrentText.length || selectionEnd > sanitizedCurrentText.length) {
+                return textToInsert
+            }
+            if (isNoAutoSpaceInputType(inputType, sanitizedCurrentText)) {
+                return textToInsert
+            }
+
+            val realStart = minOf(selectionStart, selectionEnd)
+            val realEnd = maxOf(selectionStart, selectionEnd)
+            val before = sanitizedCurrentText.substring(0, realStart)
+            val after = sanitizedCurrentText.substring(realEnd)
+
+            val needLeadingSpace = before.isNotEmpty() &&
+                !before.last().isWhitespace() &&
+                before.last() !in NO_SPACE_AFTER_CHARS &&
+                !textToInsert.first().isWhitespace() &&
+                textToInsert.first() !in NO_SPACE_BEFORE_CHARS
+
+            val needTrailingSpace = after.isNotEmpty() &&
+                !after.first().isWhitespace() &&
+                after.first() !in NO_TRAILING_SPACE_BEFORE_CHARS &&
+                !textToInsert.last().isWhitespace()
+
+            val prefix = if (needLeadingSpace) " " else ""
+            val suffix = if (needTrailingSpace) " " else ""
+            return prefix + textToInsert + suffix
+        }
+
+        /**
+         * Verifies whether an Accessibility `ACTION_PASTE` or `ACTION_SET_TEXT` call actually modified
          * the target input node's text, placeholder-hint state, or selection range.
          *
          * Prevents false-positive `injected = true` results when custom wrappers, containers, or WebViews
@@ -148,11 +315,15 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             if (!afterShowingHint && rawAfterText != rawBeforeText) {
                 return true
             }
-            // 3. Caret advanced forward (covers masked password fields or custom span buffers)
+            // 3. Caret advanced forward (covers masked password fields, custom span buffers, or dictating text identical to a disguised placeholder)
             if (beforeSelStart >= 0 && afterSelStart > beforeSelStart) {
                 return true
             }
-            // 4. Non-empty text selection was replaced in-place and collapsed to a caret
+            // 4. Editor selection initialized from -1 to > 0 upon paste (e.g. WebView contenteditable / Flutter)
+            if (beforeSelStart < 0 && afterSelStart > 0 && !afterShowingHint) {
+                return true
+            }
+            // 5. Non-empty text selection was replaced in-place and collapsed to a caret
             val hadRangeSelection = beforeSelStart >= 0 && beforeSelEnd >= 0 && beforeSelStart != beforeSelEnd
             if (hadRangeSelection && afterSelStart >= 0 && afterSelStart == afterSelEnd && !afterShowingHint) {
                 return true
@@ -426,11 +597,26 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         ownPkg: String
     ): AccessibilityNodeInfo? {
         val count = (try { parent.childCount } catch (_: Throwable) { 0 }).coerceAtMost(8)
+        var inspected = 0
         for (i in 0 until count) {
             val child = try { parent.getChild(i) } catch (_: Throwable) { null } ?: continue
+            inspected++
             val focused = try { child.isFocused } catch (_: Throwable) { false }
             if (focused && isDirectEditableNode(child, ownPkg)) {
                 return child
+            }
+            // Material TextInputLayout wraps TextInputEditText inside an intermediate FrameLayout (depth 2)
+            if (inspected < 12) {
+                val subCount = (try { child.childCount } catch (_: Throwable) { 0 }).coerceAtMost(4)
+                for (j in 0 until subCount) {
+                    if (inspected >= 12) break
+                    val grandChild = try { child.getChild(j) } catch (_: Throwable) { null } ?: continue
+                    inspected++
+                    val gcFocused = try { grandChild.isFocused } catch (_: Throwable) { false }
+                    if (gcFocused && isDirectEditableNode(grandChild, ownPkg)) {
+                        return grandChild
+                    }
+                }
             }
         }
         return null
@@ -902,28 +1088,134 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Copies [textToInsert] to the system clipboard and injects it into the focused text field,
-     * returning `true` ONLY when insertion into the target node is positively verified.
-     *
-     * Never clears the clipboard afterward (`clearPrimaryClip` is never called), guaranteeing that
-     * even if a custom/canvas app swallows Accessibility actions, the user's dictated text is
-     * always intact on the clipboard.
+     * Extracts genuine user-typed text from [node], stripping password masks, `isShowingHintText`,
+     * and disguised gray placeholder/hint/label decoration strings exposed by Jetpack Compose
+     * `DecorationBox`, Material `TextInputLayout`, WebViews, and custom `AccessibilityDelegate`s.
      */
-    suspend fun injectTextSuspend(textToInsert: String): Boolean = withContext(Dispatchers.Main) {
-        if (textToInsert.isEmpty()) return@withContext false
+    fun extractSanitizedEditableText(node: AccessibilityNodeInfo): String {
+        val isPassword = try { isPasswordField(node) } catch (_: Throwable) { false }
+        if (isPassword) return ""
 
-        // Always copy plain text to the clipboard upfront (no IS_SENSITIVE flag and never cleared afterward)
-        // so both ACTION_PASTE and user manual/Gboard-chip paste work reliably across Android 8-15.
-        val clipboardReady = copyPlainTextToClipboard(textToInsert)
-        if (clipboardReady) {
-            delay(40L)
+        val showingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            (try { node.isShowingHintText } catch (_: Throwable) { false })
+        if (showingHint) return ""
+
+        val rawText = try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+        if (rawText.isEmpty()) return ""
+
+        val selStart = try { node.textSelectionStart } catch (_: Throwable) { -1 }
+        val selEnd = try { node.textSelectionEnd } catch (_: Throwable) { -1 }
+        if (selStart < 0 && selEnd < 0) return ""
+
+        val hintText = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try { node.hintText?.toString() } catch (_: Throwable) { null }
+        } else {
+            null
         }
+        val contentDesc = try { node.contentDescription?.toString() } catch (_: Throwable) { null }
+        val tooltip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try { node.tooltipText?.toString() } catch (_: Throwable) { null }
+        } else {
+            null
+        }
+        val paneTitle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try { node.paneTitle?.toString() } catch (_: Throwable) { null }
+        } else {
+            null
+        }
+
+        val childTexts = if (selStart <= 0 && selEnd <= 0) {
+            val collected = ArrayList<String>(6)
+            val childCount = (try { node.childCount } catch (_: Throwable) { 0 }).coerceAtMost(6)
+            for (i in 0 until childCount) {
+                val child = try { node.getChild(i) } catch (_: Throwable) { null } ?: continue
+                val childEditable = try { child.isEditable } catch (_: Throwable) { false }
+                if (!childEditable) {
+                    val ct = try { child.text?.toString() } catch (_: Throwable) { null }
+                    if (!ct.isNullOrBlank()) collected.add(ct)
+                    val cd = try { child.contentDescription?.toString() } catch (_: Throwable) { null }
+                    if (!cd.isNullOrBlank()) collected.add(cd)
+                }
+            }
+            collected
+        } else {
+            emptyList()
+        }
+
+        return sanitizeEditableNodeText(
+            rawText = rawText,
+            isShowingHintText = false,
+            isPassword = false,
+            selectionStart = selStart,
+            selectionEnd = selEnd,
+            hintText = hintText,
+            contentDescription = contentDesc,
+            tooltipText = tooltip,
+            paneTitle = paneTitle,
+            nonEditableChildTexts = childTexts
+        )
+    }
+
+    /**
+     * Copies the smart-spaced dictation payload to the system clipboard **strictly once** and injects it
+     * into the focused text field, returning [TextInjectionResult.INJECTED] ONLY when insertion into the
+     * target node is positively verified.
+     *
+     * Uses widget-native `ACTION_PASTE` first so gray placeholder / hint strings in `AccessibilityNodeInfo.getText()`
+     * are never typed out into the field and rich-text spans / Undo history are preserved, with a sanitized
+     * `ACTION_SET_TEXT` fallback when `ACTION_PASTE` is unsupported.
+     */
+    suspend fun injectTextSuspend(textToInsert: String): TextInjectionResult = withContext(Dispatchers.Main) {
+        if (textToInsert.isEmpty()) return@withContext TextInjectionResult.NOT_INJECTED_NO_CLIPBOARD
 
         val firstTarget = resolveBestTargetInputNode(
             ownPkg = packageName,
             allowPinnedFallback = true,
             allowTreeBfs = true
         )
+
+        val pastePayload = if (firstTarget != null) {
+            try {
+                firstTarget.refresh()
+            } catch (_: Throwable) {
+            }
+            val focusedNow = try { firstTarget.isFocused } catch (_: Throwable) { false }
+            if (!focusedNow) {
+                val focusedOk = try {
+                    firstTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (focusedOk) {
+                    delay(35L)
+                    try {
+                        firstTarget.refresh()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            val sanitizedCurrent = extractSanitizedEditableText(firstTarget)
+            val selStart = try { firstTarget.textSelectionStart } catch (_: Throwable) { -1 }
+            val selEnd = try { firstTarget.textSelectionEnd } catch (_: Throwable) { -1 }
+            val inputType = try { firstTarget.inputType } catch (_: Throwable) { InputType.TYPE_CLASS_TEXT }
+            computeSmartPastePayload(
+                sanitizedCurrentText = sanitizedCurrent,
+                selectionStart = selStart,
+                selectionEnd = selEnd,
+                textToInsert = textToInsert,
+                inputType = inputType
+            )
+        } else {
+            textToInsert
+        }
+
+        // Write to the system clipboard STRICTLY ONCE per dictation (prevents duplicate clipboard entries/toasts
+        // while ensuring Compose/TextView `hasPrimaryClip()` is true right before `ACTION_PASTE`).
+        val clipboardReady = copyPlainTextToClipboard(pastePayload)
+        if (clipboardReady) {
+            delay(35L)
+        }
+
         var opaqueNodeAlreadyPasted: AccessibilityNodeInfo? = null
         if (firstTarget != null) {
             val result = tryInjectIntoTargetNode(
@@ -934,7 +1226,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             )
             if (result == InjectionAttemptOutcome.CONFIRMED) {
                 pinnedDictationNode = null
-                return@withContext true
+                return@withContext TextInjectionResult.INJECTED
             }
             if (result == InjectionAttemptOutcome.OPAQUE_UNVERIFIED_PASTE_SENT) {
                 opaqueNodeAlreadyPasted = firstTarget
@@ -942,17 +1234,25 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
 
         // Transient focus/window transition retry: wait briefly, re-resolve target, explicitly restore
-        // input focus on the target node, and try once more before falling back to clipboard notification.
-        delay(80L)
+        // input focus on the target node, and try once more using the already-copied clipboard.
+        delay(75L)
         val retryTarget = resolveBestTargetInputNode(
             ownPkg = packageName,
             allowPinnedFallback = true,
             allowTreeBfs = true
-        ) ?: firstTarget ?: return@withContext false
+        ) ?: firstTarget ?: return@withContext if (clipboardReady) {
+            TextInjectionResult.COPIED_TO_CLIPBOARD_ONLY
+        } else {
+            TextInjectionResult.NOT_INJECTED_NO_CLIPBOARD
+        }
 
         if (opaqueNodeAlreadyPasted != null && retryTarget == opaqueNodeAlreadyPasted) {
             // Avoid sending a duplicate ACTION_PASTE to an opaque non-editable view that already accepted one
-            return@withContext false
+            return@withContext if (clipboardReady) {
+                TextInjectionResult.COPIED_TO_CLIPBOARD_ONLY
+            } else {
+                TextInjectionResult.NOT_INJECTED_NO_CLIPBOARD
+            }
         }
 
         val retryOutcome = tryInjectIntoTargetNode(
@@ -963,9 +1263,14 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         )
         if (retryOutcome == InjectionAttemptOutcome.CONFIRMED) {
             pinnedDictationNode = null
-            return@withContext true
+            return@withContext TextInjectionResult.INJECTED
         }
-        false
+
+        if (clipboardReady) {
+            TextInjectionResult.COPIED_TO_CLIPBOARD_ONLY
+        } else {
+            TextInjectionResult.NOT_INJECTED_NO_CLIPBOARD
+        }
     }
 
     private enum class InjectionAttemptOutcome {
@@ -1067,7 +1372,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 false
             }
             if (focusedOk) {
-                delay(40L)
+                delay(35L)
                 try {
                     node.refresh()
                 } catch (_: Throwable) {
@@ -1077,28 +1382,13 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
         val isPassword = isPasswordField(node)
         val before = captureNodeSnapshot(node)
-        val logicalBeforeText = if (before.showingHint || isPassword) "" else before.rawText
-        val hasKnownSelection = before.selStart in 0..logicalBeforeText.length &&
-            before.selEnd in 0..logicalBeforeText.length
-
         val directEditable = isDirectEditableNode(node, packageName)
         val canSetText = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && directEditable && !isPassword
-        val isWebNode = isWebViewClassName(node)
-        val preferSetTextFirst = canSetText && !isWebNode && (logicalBeforeText.isEmpty() || hasKnownSelection)
 
-        if (preferSetTextFirst) {
-            if (performVerifiedSetText(node, before, logicalBeforeText, textToInsert)) {
-                DebugLogManager.logInfo(TAG, "Confirmed text injection via ACTION_SET_TEXT (${textToInsert.length} chars)")
-                return InjectionAttemptOutcome.CONFIRMED
-            }
-            val latestBefore = captureNodeSnapshot(node)
-            if (clipboardReady && performVerifiedPaste(node, latestBefore) == InjectionAttemptOutcome.CONFIRMED) {
-                DebugLogManager.logInfo(TAG, "Confirmed text injection via fallback ACTION_PASTE (${textToInsert.length} chars)")
-                return InjectionAttemptOutcome.CONFIRMED
-            }
-            return InjectionAttemptOutcome.FAILED
-        }
-
+        // Primary strategy: Widget-native `ACTION_PASTE`.
+        // Executes directly against the target widget's real internal editable buffer (`EditText.Editable`,
+        // Compose `TextFieldValue`/`TextFieldState`, Chromium DOM), automatically dismissing gray placeholder
+        // hints without ever reading `AccessibilityNodeInfo.getText()` and preserving spans + Undo history.
         if (clipboardReady) {
             val pasteOutcome = performVerifiedPaste(node, before)
             if (pasteOutcome == InjectionAttemptOutcome.CONFIRMED) {
@@ -1107,9 +1397,9 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             }
             if (canSetText) {
                 val latestBefore = captureNodeSnapshot(node)
-                val latestLogical = if (latestBefore.showingHint || isPassword) "" else latestBefore.rawText
-                if (performVerifiedSetText(node, latestBefore, latestLogical, textToInsert)) {
-                    DebugLogManager.logInfo(TAG, "Confirmed text injection via fallback ACTION_SET_TEXT (${textToInsert.length} chars)")
+                val sanitizedBeforeText = extractSanitizedEditableText(node)
+                if (performVerifiedSetText(node, latestBefore, sanitizedBeforeText, textToInsert)) {
+                    DebugLogManager.logInfo(TAG, "Confirmed text injection via sanitized fallback ACTION_SET_TEXT (${textToInsert.length} chars)")
                     return InjectionAttemptOutcome.CONFIRMED
                 }
             }
@@ -1119,9 +1409,12 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             return InjectionAttemptOutcome.FAILED
         }
 
-        if (canSetText && performVerifiedSetText(node, before, logicalBeforeText, textToInsert)) {
-            DebugLogManager.logInfo(TAG, "Confirmed text injection via ACTION_SET_TEXT (${textToInsert.length} chars)")
-            return InjectionAttemptOutcome.CONFIRMED
+        if (canSetText) {
+            val sanitizedBeforeText = extractSanitizedEditableText(node)
+            if (performVerifiedSetText(node, before, sanitizedBeforeText, textToInsert)) {
+                DebugLogManager.logInfo(TAG, "Confirmed text injection via sanitized ACTION_SET_TEXT (${textToInsert.length} chars)")
+                return InjectionAttemptOutcome.CONFIRMED
+            }
         }
         return InjectionAttemptOutcome.FAILED
     }
@@ -1129,17 +1422,30 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     private suspend fun performVerifiedSetText(
         node: AccessibilityNodeInfo,
         before: NodeTextSnapshot,
-        logicalBeforeText: String,
+        sanitizedBeforeText: String,
         textToInsert: String
     ): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
         val setDispatched = try {
-            val spliced = spliceTextForSetText(
-                currentText = logicalBeforeText,
-                selectionStart = before.selStart,
-                selectionEnd = before.selEnd,
-                textToInsert = textToInsert
-            )
+            val inputType = try { node.inputType } catch (_: Throwable) { InputType.TYPE_CLASS_TEXT }
+            val spliced = if (sanitizedBeforeText.isNotEmpty() && isNoAutoSpaceInputType(inputType, sanitizedBeforeText)) {
+                if (before.selStart in 0..sanitizedBeforeText.length && before.selEnd in 0..sanitizedBeforeText.length) {
+                    val realStart = minOf(before.selStart, before.selEnd)
+                    val realEnd = maxOf(before.selStart, before.selEnd)
+                    val combined = sanitizedBeforeText.substring(0, realStart) + textToInsert + sanitizedBeforeText.substring(realEnd)
+                    SplicedTextResult(combined, realStart + textToInsert.length)
+                } else {
+                    val combined = sanitizedBeforeText + textToInsert
+                    SplicedTextResult(combined, combined.length)
+                }
+            } else {
+                spliceTextForSetText(
+                    currentText = sanitizedBeforeText,
+                    selectionStart = before.selStart,
+                    selectionEnd = before.selEnd,
+                    textToInsert = textToInsert
+                )
+            }
             val arguments = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,

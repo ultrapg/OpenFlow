@@ -1993,19 +1993,11 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 ) ?: return FlowFieldContext.NONE
 
                 val pkg = focusedNode.packageName?.toString()
-                val isPassword = focusedNode.isPassword || isPasswordInputType(focusedNode.inputType)
-                val isShowingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusedNode.isShowingHintText
-
-                val textBeforeCursor = if (!isPassword && !isShowingHint) {
-                    val nodeText = focusedNode.text?.toString().orEmpty()
-                    if (nodeText.isEmpty()) {
-                        ""
-                    } else {
-                        val selStart = focusedNode.textSelectionStart
-                        val cursorEnd = if (selStart in 0..nodeText.length) selStart else nodeText.length
-                        val sliceStart = (cursorEnd - MAX_CURSOR_CONTEXT_CHARS).coerceAtLeast(0)
-                        nodeText.substring(sliceStart, cursorEnd)
-                    }
+                val sanitizedNodeText = service.extractSanitizedEditableText(focusedNode)
+                val selStart = focusedNode.textSelectionStart
+                val textBeforeCursor = if (sanitizedNodeText.isNotEmpty() && selStart in 1..sanitizedNodeText.length) {
+                    val sliceStart = (selStart - MAX_CURSOR_CONTEXT_CHARS).coerceAtLeast(0)
+                    sanitizedNodeText.substring(sliceStart, selStart)
                 } else {
                     ""
                 }

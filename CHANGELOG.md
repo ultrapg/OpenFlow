@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.12.2] - 2026-10-28
+
+### Fixed & Improved
+- **Eliminated Gray Placeholder / Hint Text Typing Bug & Upgraded Text-Field Input System (`TextInjectionAccessibilityService`, `GemmaTextProcessor`):**
+  - **Widget-Native `ACTION_PASTE`-First Injection:** Switched primary text injection on focused inputs to verified widget-native `ACTION_PASTE` (ensuring target `ACTION_FOCUS` + refreshed `hasPrimaryClip()` state first for both AOSP `TextView` and Jetpack Compose `SemanticsActions.PasteText`), operating directly on the widget's real internal buffer (`EditText.Editable`, Compose `TextFieldValue`/`TextFieldState`, Chromium DOM) so screen-reader placeholder/hint strings in `AccessibilityNodeInfo.getText()` are never typed out into the text field, while preserving rich-text spans and Undo/Redo history.
+  - **Multi-Signal Disguised Placeholder Sanitizer (`sanitizeEditableNodeText` / `extractSanitizedEditableText`):** Strips unmarked gray placeholders, Material `TextInputLayout` `placeholderText` / `", <hint>"` suffixes, Jetpack Compose `DecorationBox` merged child `Text` placeholders, static `-1..-1` wrapper labels, and ellipsis prompts (`"..."` / `"…"`) both on sanitized `ACTION_SET_TEXT` fallback and in `GemmaTextProcessor.inspectActiveFieldContextStatic` (preventing placeholder text from falsely triggering mid-sentence lowercase continuation).
+  - **Smart Context-Aware Paste Spacing & Deeper Focus Resolution (`computeSmartPastePayload`):** Automatically inserts smart boundary spaces on back-to-back dictations and mid-sentence cursor insertions (`selectionStart > 0 || selectionEnd > 0`) while suppressing auto-spaces in empty/placeholder fields (`0..0`), email, phone/number, password, and spaceless URL inputs; expanded paste-time-only focus search bounds (`MAX_BFS_NODES = 320`, `MAX_DRILL_NODES = 192`) and depth-2 `TextInputLayout` event-source capture.
+- **Fixed Duplicate Clipboard Copies (`FloatingBubbleService`, `TextInjectionAccessibilityService`):**
+  - **Strict Single-Write Clipboard Contract (`TextInjectionResult`):** Removed redundant pre-injection and post-injection `ClipboardManager.setPrimaryClip` calls in `FloatingBubbleService.processAudio()` so dictated text is written to the system clipboard **strictly once per dictation**—eliminating duplicate keyboard clipboard-history entries and duplicate clipboard notifications.
+
 ## [2.12.1] - 2026-10-28
 
 ### Fixed
