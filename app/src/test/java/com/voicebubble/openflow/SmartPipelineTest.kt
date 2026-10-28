@@ -2469,4 +2469,65 @@ class SmartPipelineTest {
         val afterNewline = splice("Line 1\n", 7, 7, "Line 2")
         assertEquals("Line 1\nLine 2", afterNewline.newText)
     }
+
+    @Test
+    fun `Verified text injection detector catches silent Accessibility no-ops while confirming genuine insertions`() {
+        val check = com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService::hasConfirmedTextInjection
+
+        // 1. Empty field stays empty (silent no-op from container / wrapper) -> false
+        assertFalse(
+            check(
+                false, "", -1, -1,
+                false, "", -1, -1
+            )
+        )
+
+        // 2. Empty field receives dictated text -> true
+        assertTrue(
+            check(
+                false, "", 0, 0,
+                false, "Hello from OpenFlow.", 20, 20
+            )
+        )
+
+        // 3. Field showing placeholder hint ("Message") stays on placeholder hint (silent no-op) -> false
+        assertFalse(
+            check(
+                true, "Message", -1, -1,
+                true, "Message", -1, -1
+            )
+        )
+
+        // 4. Field showing placeholder hint ("Message") has hint replaced even if user dictated "Message" -> true
+        assertTrue(
+            check(
+                true, "Message", 0, 0,
+                false, "Message", 7, 7
+            )
+        )
+
+        // 5. Non-empty field unchanged with unmoved cursor (silent no-op) -> false
+        assertFalse(
+            check(
+                false, "Draft: ", 7, 7,
+                false, "Draft: ", 7, 7
+            )
+        )
+
+        // 6. Masked field where caret advances forward -> true
+        assertTrue(
+            check(
+                false, "", 0, 0,
+                false, "", 12, 12
+            )
+        )
+
+        // 7. Highlighted selection [4..10] replaced in-place -> true
+        assertTrue(
+            check(
+                false, "Buy apples", 4, 10,
+                false, "Buy apples", 10, 10
+            )
+        )
+    }
 }

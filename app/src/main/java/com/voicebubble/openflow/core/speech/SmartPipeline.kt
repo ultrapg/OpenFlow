@@ -254,7 +254,7 @@ class SmartPipeline(
         const val IDLE_TIMEOUT_MS: Long = 20 * 60_000L // 20 minutes warm retention for core audio
         const val LLM_IDLE_TIMEOUT_MS: Long = 5 * 60_000L // 5 minutes burst retention for on-demand LLM
         const val SCREEN_OFF_DEEP_SLEEP_UNLOAD_MS: Long = 45_000L // 45s fast unload when display is locked/off
-        const val DEFERRED_POST_PROC_OVERLAP_MS: Long = 2_000L // Defer multi-GB LLM load past quick <2s replies
+        const val DEFERRED_POST_PROC_OVERLAP_MS: Long = 4_500L // Defer heavy LLM init past normal <4.5s utterances
         private const val SILENCE_THRESHOLD: Float = 0.0035f
         private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
 
@@ -662,7 +662,13 @@ class SmartPipeline(
                                 closePunctLocked()
                             }
                             val memBeforeLlm = evaluateMemoryPressure()
+                            val safeLiveOverlapHeadroom = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) {
+                                memBeforeLlm.systemAvailMb >= 2_900L && memBeforeLlm.systemTotalMb >= 9_000L
+                            } else {
+                                true
+                            }
                             if (gemmaProcessor == null &&
+                                safeLiveOverlapHeadroom &&
                                 memBeforeLlm.canKeepVozAndLlmCoResident(
                                     llmChoice = selectedLlm,
                                     vozAlreadyLoaded = voz != null,
@@ -2155,7 +2161,7 @@ class SmartPipeline(
                     state = ModelLoadState.LOADING,
                     message = "Warming up Voz on $activeAcceleratorDescription..."
                 )
-                val warmupSilence = FloatArray(1_600) // Fast 100 ms silent frame to compile accelerator kernels
+                val warmupSilence = FloatArray(3_200) // 200 ms silent frame to compile accelerator kernels safely
                 currentVoz.transcribe(samples = warmupSilence, sampleRate = SAMPLE_RATE_HZ)
                 vozWarmedUp = true
                 DebugLogManager.logInfo(TAG, "Voz accelerator warm-up complete", includeMemory = true)

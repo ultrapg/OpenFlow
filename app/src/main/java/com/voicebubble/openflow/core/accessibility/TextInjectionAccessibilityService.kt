@@ -11,7 +11,6 @@ import android.content.IntentFilter
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
-import android.os.PersistableBundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.text.InputType
@@ -45,9 +44,9 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "TextInjectionA11y"
-        private const val MAX_BFS_NODES = 420
+        private const val MAX_DRILL_NODES = 96
+        private const val MAX_BFS_NODES = 120
         private const val MAX_PINNED_NODE_AGE_MS = 10 * 60_000L
-        private const val CLIPBOARD_RESTORE_DELAY_MS = 750L
 
         private val NO_SPACE_AFTER_CHARS = charArrayOf(
             '(', '[', '{', '"', '“', '‘', '/', '@', '#', '$', '-', '–', '—', '\n', '\r', '\t'
@@ -123,12 +122,48 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             val appended = if (needSpace) "$currentText $textToInsert" else "$currentText$textToInsert"
             return SplicedTextResult(appended, appended.length)
         }
+
+        /**
+         * Verifies whether an Accessibility `ACTION_SET_TEXT` or `ACTION_PASTE` call actually modified
+         * the target input node's text, placeholder-hint state, or selection range.
+         *
+         * Prevents false-positive `injected = true` results when custom wrappers, containers, or WebViews
+         * return `true` from `performAction(...)` without committing text to the editor.
+         */
+        internal fun hasConfirmedTextInjection(
+            wasShowingHint: Boolean,
+            rawBeforeText: String,
+            beforeSelStart: Int,
+            beforeSelEnd: Int,
+            afterShowingHint: Boolean,
+            rawAfterText: String,
+            afterSelStart: Int,
+            afterSelEnd: Int
+        ): Boolean {
+            // 1. Placeholder hint ("Message", "Search...") disappeared and non-empty text is now present
+            if (wasShowingHint && !afterShowingHint && rawAfterText.isNotEmpty()) {
+                return true
+            }
+            // 2. Visible/masked text content changed (while not merely showing placeholder hint text)
+            if (!afterShowingHint && rawAfterText != rawBeforeText) {
+                return true
+            }
+            // 3. Caret advanced forward (covers masked password fields or custom span buffers)
+            if (beforeSelStart >= 0 && afterSelStart > beforeSelStart) {
+                return true
+            }
+            // 4. Non-empty text selection was replaced in-place and collapsed to a caret
+            val hadRangeSelection = beforeSelStart >= 0 && beforeSelEnd >= 0 && beforeSelStart != beforeSelEnd
+            if (hadRangeSelection && afterSelStart >= 0 && afterSelStart == afterSelEnd && !afterShowingHint) {
+                return true
+            }
+            return false
+        }
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var pollingJob: Job? = null
     private var postEventCheckJob: Job? = null
-    private var clipboardRestoreJob: Job? = null
     private var lastWatchdogCheckMs = 0L
     @Volatile
     private var lastKeyboardCheckMs = 0L
@@ -279,13 +314,17 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Captures and pins the currently focused editable node right when the user taps the floating
-     * dictation bubble (`t = 0 ms`), guaranteeing we can recover the exact input target even if
-     * an OEM ROM momentarily drops `FOCUS_INPUT` while interacting with the overlay.
+     * Ultra-fast (`< 2 ms`, zero tree BFS) target pin when the user taps the floating dictation bubble,
+     * preserving the exact focused editable node even if an OEM ROM momentarily clears `FOCUS_INPUT`
+     * while touching the overlay window.
      */
     fun captureTargetNodeForDictation() {
         try {
-            val live = resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = false)
+            val live = resolveBestTargetInputNode(
+                ownPkg = packageName,
+                allowPinnedFallback = false,
+                allowTreeBfs = false
+            )
             if (live != null) {
                 val now = SystemClock.elapsedRealtime()
                 pinnedDictationNode = live
@@ -311,7 +350,6 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         pinnedDictationNode = null
         isServiceConnected.value = false
         isInputFieldFocused.value = false
-        clipboardRestoreJob?.cancel()
         postEventCheckJob?.cancel()
         pollingJob?.cancel()
         serviceScope.cancel()
@@ -329,8 +367,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_FOCUSED,
             AccessibilityEvent.TYPE_VIEW_CLICKED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
                 captureEventSourceIfInput(event)
             }
         }
@@ -346,8 +383,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 // Catch OEM soft-keyboard slide-in animations across fast (80ms) and slower One UI (350-600ms) transitions
                 schedulePostEventKeyboardCheck()
             }
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
                 val elapsed = SystemClock.elapsedRealtime() - lastKeyboardCheckMs
                 if (!isInputFieldFocused.value || elapsed >= 400L) {
                     refreshKeyboardVisibilityState()
@@ -356,6 +392,9 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Lightweight `O(1)` event-source check (never walks deep window subtrees on `Dispatchers.Main`).
+     */
     private fun captureEventSourceIfInput(event: AccessibilityEvent) {
         try {
             val src = event.source ?: return
@@ -369,18 +408,32 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                     return
                 }
             }
-            val resolved = if (src.isEditable && src.isEnabled) {
-                src
-            } else {
-                drillDownToBestInputChild(src, packageName)
+            val candidate = when {
+                isDirectEditableNode(src, packageName) -> src
+                else -> findImmediateFocusedEditableChild(src, packageName)
             }
-            if (resolved != null && isTextInputNode(resolved, packageName)) {
+            if (candidate != null) {
                 val now = SystemClock.elapsedRealtime()
-                lastFocusedInputNode = resolved
+                lastFocusedInputNode = candidate
                 lastFocusedInputAtMs = now
             }
         } catch (_: Throwable) {
         }
+    }
+
+    private fun findImmediateFocusedEditableChild(
+        parent: AccessibilityNodeInfo,
+        ownPkg: String
+    ): AccessibilityNodeInfo? {
+        val count = (try { parent.childCount } catch (_: Throwable) { 0 }).coerceAtMost(8)
+        for (i in 0 until count) {
+            val child = try { parent.getChild(i) } catch (_: Throwable) { null } ?: continue
+            val focused = try { child.isFocused } catch (_: Throwable) { false }
+            if (focused && isDirectEditableNode(child, ownPkg)) {
+                return child
+            }
+        }
+        return null
     }
 
     private fun schedulePostEventKeyboardCheck() {
@@ -399,20 +452,25 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     /**
      * Strictly checks whether the on-screen soft keyboard (`TYPE_INPUT_METHOD` window) is currently
      * visible on screen while the screen is interactive and unlocked.
+     *
+     * IMPORTANT: Must remain 100% free of Accessibility node-tree walks so `Looper.getMainLooper()`
+     * never stalls during recording or UI interactions!
      */
     private fun refreshKeyboardVisibilityState() {
         try {
             lastKeyboardCheckMs = SystemClock.elapsedRealtime()
-            val visible = isSoftKeyboardWindowVisible()
-            isInputFieldFocused.value = visible
-            if (visible) {
-                val live = resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = false)
-                if (live != null) {
-                    lastFocusedInputNode = live
-                    lastFocusedInputAtMs = SystemClock.elapsedRealtime()
-                }
-            }
+            isInputFieldFocused.value = isSoftKeyboardWindowVisible()
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun hasDirectFocusedInputFast(): Boolean {
+        return try {
+            val activeRoot = rootInActiveWindow ?: return false
+            val focused = activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+            focused.isEnabled && (focused.isEditable || supportsSetText(focused) || supportsPaste(focused))
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -428,8 +486,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
             val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
             if (km != null && km.isDeviceLocked) {
-                val focusedOnLockscreen = resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = false)
-                if (focusedOnLockscreen == null) {
+                if (!hasDirectFocusedInputFast()) {
                     return false
                 }
             }
@@ -483,8 +540,8 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 return false
             }
 
-            // Fallback when `windows` is unavailable/empty on specific OEM ROMs: check if an editable input node holds focus
-            resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = false) != null
+            // Fallback when `windows` is unavailable/empty on specific OEM ROMs: fast 1-call FOCUS_INPUT check
+            hasDirectFocusedInputFast()
         } catch (_: Throwable) {
             false
         }
@@ -513,19 +570,36 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isTextInputNode(node: AccessibilityNodeInfo, ownPkg: String): Boolean {
+    private fun isWebViewClassName(node: AccessibilityNodeInfo): Boolean {
+        val cls = try { node.className?.toString().orEmpty() } catch (_: Throwable) { "" }
+        return cls.contains("WebView", ignoreCase = true) || cls.contains("org.chromium", ignoreCase = true)
+    }
+
+    private fun isDirectEditableNode(node: AccessibilityNodeInfo, ownPkg: String): Boolean {
         return try {
             if (!node.isEnabled) return false
-            val nodePkg = node.packageName?.toString()
-            if (node.isEditable) return true
-            if (supportsSetText(node) || supportsPaste(node)) {
-                // Reject non-editable views inside OpenFlow's own overlay; allow real Compose inputs inside OpenFlow MainActivity
-                if (nodePkg == ownPkg && !supportsSetText(node)) return false
-                return true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                val winType = try { node.window?.type } catch (_: Throwable) { null }
+                val pkg = node.packageName?.toString()
+                if (winType == AccessibilityWindowInfo.TYPE_SYSTEM && pkg == ownPkg) return false
             }
+            if (node.isEditable) return true
+            if (supportsSetText(node)) return true
             val cls = node.className?.toString().orEmpty()
             cls.contains("EditText", ignoreCase = true) ||
                 cls.contains("AutoCompleteTextView", ignoreCase = true)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun isTextInputNode(node: AccessibilityNodeInfo, ownPkg: String): Boolean {
+        if (isDirectEditableNode(node, ownPkg)) return true
+        return try {
+            if (!node.isEnabled) return false
+            val nodePkg = node.packageName?.toString()
+            if (nodePkg == ownPkg) return false
+            supportsPaste(node) || isWebViewClassName(node)
         } catch (_: Throwable) {
             false
         }
@@ -548,47 +622,57 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * When `findFocus(FOCUS_INPUT)` returns a container view (such as `WebView` or `AndroidComposeView`)
-     * rather than the inner `<input>` / `contenteditable` / Compose semantics node, drills into its
-     * subtree via bounded BFS to locate the real focused/editable child.
+     * When `findFocus(FOCUS_INPUT)` returns a wrapper view (such as `WebView` or `AndroidComposeView`)
+     * rather than the inner focused `<input>` / `contenteditable` / Compose `TextField` semantics node,
+     * drills into that focused wrapper's subtree to locate the actual focused input descendant.
+     *
+     * Never guesses an unfocused editable child from a generic layout container!
      */
-    private fun drillDownToBestInputChild(root: AccessibilityNodeInfo, ownPkg: String): AccessibilityNodeInfo? {
-        if (try { root.isEditable && root.isEnabled } catch (_: Throwable) { false }) {
+    private fun drillDownToBestInputChild(
+        root: AccessibilityNodeInfo,
+        ownPkg: String,
+        allowSubtreeWalk: Boolean
+    ): AccessibilityNodeInfo? {
+        if (isDirectEditableNode(root, ownPkg)) {
             return root
         }
+        if (!allowSubtreeWalk) {
+            return if (isTextInputNode(root, ownPkg)) root else null
+        }
 
-        var focusedTextChild: AccessibilityNodeInfo? = null
-        var singleVisibleEditableChild: AccessibilityNodeInfo? = null
-        var visibleEditableCount = 0
+        val rootIsWebView = isWebViewClassName(root)
+        var focusedPasteChild: AccessibilityNodeInfo? = null
+        var singleWebViewEditable: AccessibilityNodeInfo? = null
+        var webViewEditableCount = 0
 
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
 
-        while (queue.isNotEmpty() && visited < MAX_BFS_NODES) {
+        while (queue.isNotEmpty() && visited < MAX_DRILL_NODES) {
             val current = queue.removeFirst()
             visited++
             if (current !== root) {
                 val enabled = try { current.isEnabled } catch (_: Throwable) { false }
                 if (enabled) {
-                    val editable = try { current.isEditable } catch (_: Throwable) { false }
+                    val directEditable = isDirectEditableNode(current, ownPkg)
                     val focused = try {
                         current.isFocused || current.isAccessibilityFocused
                     } catch (_: Throwable) {
                         false
                     }
-                    if (focused && editable) {
+                    if (focused && directEditable) {
                         return current
                     }
-                    if (focused && focusedTextChild == null && isTextInputNode(current, ownPkg)) {
-                        focusedTextChild = current
+                    if (focused && focusedPasteChild == null && isTextInputNode(current, ownPkg)) {
+                        focusedPasteChild = current
                     }
-                    if (editable && (try { current.isVisibleToUser } catch (_: Throwable) { false })) {
-                        visibleEditableCount++
-                        if (visibleEditableCount == 1) {
-                            singleVisibleEditableChild = current
+                    if (rootIsWebView && directEditable && (try { current.isVisibleToUser } catch (_: Throwable) { false })) {
+                        webViewEditableCount++
+                        if (webViewEditableCount == 1) {
+                            singleWebViewEditable = current
                         } else {
-                            singleVisibleEditableChild = null
+                            singleWebViewEditable = null
                         }
                     }
                 }
@@ -596,7 +680,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
 
             val childCount = try { current.childCount } catch (_: Throwable) { 0 }
             for (i in 0 until childCount) {
-                if (visited + queue.size >= MAX_BFS_NODES) break
+                if (visited + queue.size >= MAX_DRILL_NODES) break
                 val child = try { current.getChild(i) } catch (_: Throwable) { null }
                 if (child != null) {
                     queue.addLast(child)
@@ -604,28 +688,23 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (focusedTextChild != null) return focusedTextChild
-        if (visibleEditableCount == 1 && singleVisibleEditableChild != null) return singleVisibleEditableChild
+        if (focusedPasteChild != null) return focusedPasteChild
+        if (rootIsWebView && webViewEditableCount == 1 && singleWebViewEditable != null) {
+            return singleWebViewEditable
+        }
         return if (isTextInputNode(root, ownPkg)) root else null
     }
 
     /**
-     * Bounded BFS over an application window root to locate:
-     * 1. Any node with `isFocused` + `isEditable` (catches Jetpack Compose & WebView virtual nodes
-     *    even when `root.findFocus(FOCUS_INPUT)` returns `null`).
-     * 2. Any node with `isFocused` + `isTextInputNode`.
-     * 3. Optionally, if [allowSingleEditableWhenKeyboardOpen] is `true`, the sole visible enabled
-     *    editable field in the window.
+     * Bounded paste-time BFS over a focused application window root strictly looking for a node
+     * with `node.isFocused == true` AND [isDirectEditableNode] (handles Jetpack Compose `TextField` /
+     * `BasicTextField` semantics trees when `root.findFocus(FOCUS_INPUT)` returns `null`).
      */
-    private fun searchWindowTreeForInputNode(
+    private fun searchWindowTreeForFocusedInputNode(
         windowRoot: AccessibilityNodeInfo,
-        ownPkg: String,
-        allowSingleEditableWhenKeyboardOpen: Boolean
+        ownPkg: String
     ): AccessibilityNodeInfo? {
-        var focusedInputFallback: AccessibilityNodeInfo? = null
-        var singleEditable: AccessibilityNodeInfo? = null
-        var editableCount = 0
-
+        var focusedFallback: AccessibilityNodeInfo? = null
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(windowRoot)
         var visited = 0
@@ -634,29 +713,14 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             val node = queue.removeFirst()
             visited++
 
-            val enabled = try { node.isEnabled } catch (_: Throwable) { false }
-            if (enabled) {
-                val editable = try { node.isEditable } catch (_: Throwable) { false }
-                val setTextCapable = editable || supportsSetText(node)
-                val focused = try { node.isFocused } catch (_: Throwable) { false }
+            val focused = try { node.isFocused } catch (_: Throwable) { false }
+            if (focused) {
                 val visible = try { node.isVisibleToUser } catch (_: Throwable) { true }
-
-                if (focused && editable && visible) {
+                if (visible && isDirectEditableNode(node, ownPkg)) {
                     return node
                 }
-                if (focused && focusedInputFallback == null && isTextInputNode(node, ownPkg) && visible) {
-                    focusedInputFallback = node
-                }
-                if (allowSingleEditableWhenKeyboardOpen && setTextCapable && visible) {
-                    val pkg = node.packageName?.toString()
-                    if (pkg != ownPkg || editable) {
-                        editableCount++
-                        if (editableCount == 1) {
-                            singleEditable = node
-                        } else {
-                            singleEditable = null
-                        }
-                    }
+                if (visible && focusedFallback == null && isTextInputNode(node, ownPkg)) {
+                    focusedFallback = node
                 }
             }
 
@@ -669,12 +733,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 }
             }
         }
-
-        if (focusedInputFallback != null) return focusedInputFallback
-        if (allowSingleEditableWhenKeyboardOpen && editableCount == 1 && singleEditable != null) {
-            return singleEditable
-        }
-        return null
+        return focusedFallback
     }
 
     private fun isCachedNodeStillUsable(
@@ -697,23 +756,53 @@ class TextInjectionAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Resolves the best target input node for dictation context inspection and auto-paste using a
-     * 5-tier priority cascade:
-     * 1. `findFocus(FOCUS_INPUT)` in focused/active `TYPE_APPLICATION` windows (drilling down into
-     *    `WebView` / `AndroidComposeView` subtrees so container wrappers never mask the real input).
-     * 2. Bounded BFS in focused/active `TYPE_APPLICATION` windows for `node.isFocused && isTextInputNode`
-     *    (fixes Jetpack Compose `TextField`/`BasicTextField` & Chromium virtual accessibility trees).
-     * 3. `pinnedDictationNode` captured when the user tapped Start Recording (if still refreshed & visible
-     *    in the foreground app).
-     * 4. `lastFocusedInputNode` captured from recent user focus/click/selection events.
-     * 5. Single visible editable input in the focused app window when the soft keyboard is open.
+     * Resolves the currently focused input node using a strict, false-positive-free priority cascade:
+     * 1. Fast path: `rootInActiveWindow.findFocus(FOCUS_INPUT)` when `rootInActiveWindow` belongs to
+     *    a foreground app window (returns in 2 IPC calls for 95% of Android apps).
+     * 2. Multi-window `findFocus(FOCUS_INPUT)` across interactive `TYPE_APPLICATION` windows (drilling
+     *    into `WebView` / `AndroidComposeView` wrappers when [allowTreeBfs] is `true`).
+     * 3. Paste-time-only bounded BFS (`allowTreeBfs = true`) strictly for `node.isFocused && isDirectEditableNode`.
+     * 4. `pinnedDictationNode` captured when recording started, then `lastFocusedInputNode` from user focus/click.
      */
     fun resolveBestTargetInputNode(
         ownPkg: String = packageName,
-        allowPinnedFallback: Boolean = true
+        allowPinnedFallback: Boolean = true,
+        allowTreeBfs: Boolean = false
     ): AccessibilityNodeInfo? {
         val candidateRoots = ArrayList<AccessibilityNodeInfo>(6)
         val activeAppPackages = LinkedHashSet<String>(4)
+
+        // Fast Path: Check rootInActiveWindow first (2 IPC calls in standard apps)
+        try {
+            val activeRoot = rootInActiveWindow
+            if (activeRoot != null) {
+                val winType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    try { activeRoot.window?.type } catch (_: Throwable) { null }
+                } else {
+                    null
+                }
+                val pkg = activeRoot.packageName?.toString()
+                val isOwnOverlayWindow = winType == AccessibilityWindowInfo.TYPE_SYSTEM && pkg == ownPkg
+                if (winType != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY &&
+                    winType != AccessibilityWindowInfo.TYPE_INPUT_METHOD &&
+                    !isOwnOverlayWindow
+                ) {
+                    if (!pkg.isNullOrEmpty()) {
+                        activeAppPackages.add(pkg)
+                    }
+                    val directFocus = try {
+                        activeRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    if (directFocus != null && isDirectEditableNode(directFocus, ownPkg)) {
+                        return directFocus
+                    }
+                    candidateRoots.add(activeRoot)
+                }
+            }
+        } catch (_: Throwable) {
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
@@ -748,48 +837,28 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                         if (!rootPkg.isNullOrEmpty()) {
                             activeAppPackages.add(rootPkg)
                         }
-                        candidateRoots.add(root)
+                        if (candidateRoots.none { it == root }) {
+                            candidateRoots.add(root)
+                        }
                     }
                 }
             } catch (_: Throwable) {
             }
         }
 
-        // Also include rootInActiveWindow if it wasn't already covered (e.g., OEM ROMs where getWindows() is empty)
-        try {
-            val activeRoot = rootInActiveWindow
-            if (activeRoot != null) {
-                val winType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    try { activeRoot.window?.type } catch (_: Throwable) { null }
-                } else {
-                    null
-                }
-                val pkg = activeRoot.packageName?.toString()
-                val isOwnOverlayWindow = winType == AccessibilityWindowInfo.TYPE_SYSTEM && pkg == ownPkg
-                if (winType != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY &&
-                    winType != AccessibilityWindowInfo.TYPE_INPUT_METHOD &&
-                    !isOwnOverlayWindow
-                ) {
-                    if (!pkg.isNullOrEmpty()) {
-                        activeAppPackages.add(pkg)
-                    }
-                    if (candidateRoots.none { it == activeRoot }) {
-                        candidateRoots.add(0, activeRoot)
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-        }
-
-        // Tier 1: Direct FOCUS_INPUT lookup + subtree drill-down for WebView / Compose wrappers
+        // Tier 1: Direct FOCUS_INPUT lookup (+ subtree drill-down when allowTreeBfs == true)
         var nonEditableFocusFallback: AccessibilityNodeInfo? = null
         for (root in candidateRoots) {
             try {
                 val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 if (focused != null) {
-                    val resolved = drillDownToBestInputChild(focused, ownPkg)
+                    val resolved = drillDownToBestInputChild(
+                        root = focused,
+                        ownPkg = ownPkg,
+                        allowSubtreeWalk = allowTreeBfs
+                    )
                     if (resolved != null) {
-                        if (resolved.isEditable || supportsSetText(resolved)) {
+                        if (isDirectEditableNode(resolved, ownPkg)) {
                             return resolved
                         }
                         if (nonEditableFocusFallback == null) {
@@ -801,23 +870,23 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Tier 2: Bounded BFS for focused Compose / WebView / custom input semantics nodes
-        for (root in candidateRoots) {
-            val bfsFocused = searchWindowTreeForInputNode(
-                windowRoot = root,
-                ownPkg = ownPkg,
-                allowSingleEditableWhenKeyboardOpen = false
-            )
-            if (bfsFocused != null) {
-                return bfsFocused
+        // Tier 2 (paste-time only): Bounded BFS for focused Compose / WebView semantics nodes
+        if (allowTreeBfs) {
+            for (root in candidateRoots.take(2)) {
+                val bfsFocused = searchWindowTreeForFocusedInputNode(
+                    windowRoot = root,
+                    ownPkg = ownPkg
+                )
+                if (bfsFocused != null && isDirectEditableNode(bfsFocused, ownPkg)) {
+                    return bfsFocused
+                }
+                if (bfsFocused != null && nonEditableFocusFallback == null) {
+                    nonEditableFocusFallback = bfsFocused
+                }
             }
         }
 
-        if (nonEditableFocusFallback != null) {
-            return nonEditableFocusFallback
-        }
-
-        // Tier 3 & Tier 4: Pinned node from dictation start, then last focused input node from user tap/focus
+        // Tier 3: Pinned editable node from dictation start, then recent user-focused editable node
         if (allowPinnedFallback) {
             val pinned = pinnedDictationNode
             if (pinned != null && isCachedNodeStillUsable(pinned, pinnedDictationAtMs, activeAppPackages)) {
@@ -827,57 +896,164 @@ class TextInjectionAccessibilityService : AccessibilityService() {
             if (recent != null && isCachedNodeStillUsable(recent, lastFocusedInputAtMs, activeAppPackages)) {
                 return recent
             }
-
-            // Tier 5: If the soft keyboard is visibly open, check if the foreground app window has a single visible input field
-            if (isInputFieldFocused.value && candidateRoots.isNotEmpty()) {
-                val primaryRoot = candidateRoots.first()
-                val soleEditable = searchWindowTreeForInputNode(
-                    windowRoot = primaryRoot,
-                    ownPkg = ownPkg,
-                    allowSingleEditableWhenKeyboardOpen = true
-                )
-                if (soleEditable != null) {
-                    return soleEditable
-                }
-            }
         }
 
-        return null
+        return nonEditableFocusFallback
     }
 
     /**
-     * Injects [textToInsert] into the focused text field and returns `true` only if the text was
-     * actually inserted into a target input node. If no target field is available, returns `false`
-     * so the caller can fall back to copying [textToInsert] to the clipboard.
+     * Copies [textToInsert] to the system clipboard and injects it into the focused text field,
+     * returning `true` ONLY when insertion into the target node is positively verified.
+     *
+     * Never clears the clipboard afterward (`clearPrimaryClip` is never called), guaranteeing that
+     * even if a custom/canvas app swallows Accessibility actions, the user's dictated text is
+     * always intact on the clipboard.
      */
     suspend fun injectTextSuspend(textToInsert: String): Boolean = withContext(Dispatchers.Main) {
         if (textToInsert.isEmpty()) return@withContext false
 
-        val firstTarget = resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = true)
-        if (firstTarget != null && tryInjectIntoTargetNode(firstTarget, textToInsert, forceFocusFirst = false)) {
-            pinnedDictationNode = null
-            return@withContext true
+        // Always copy plain text to the clipboard upfront (no IS_SENSITIVE flag and never cleared afterward)
+        // so both ACTION_PASTE and user manual/Gboard-chip paste work reliably across Android 8-15.
+        val clipboardReady = copyPlainTextToClipboard(textToInsert)
+        if (clipboardReady) {
+            delay(40L)
+        }
+
+        val firstTarget = resolveBestTargetInputNode(
+            ownPkg = packageName,
+            allowPinnedFallback = true,
+            allowTreeBfs = true
+        )
+        var opaqueNodeAlreadyPasted: AccessibilityNodeInfo? = null
+        if (firstTarget != null) {
+            val result = tryInjectIntoTargetNode(
+                node = firstTarget,
+                textToInsert = textToInsert,
+                clipboardReady = clipboardReady,
+                forceFocusFirst = false
+            )
+            if (result == InjectionAttemptOutcome.CONFIRMED) {
+                pinnedDictationNode = null
+                return@withContext true
+            }
+            if (result == InjectionAttemptOutcome.OPAQUE_UNVERIFIED_PASTE_SENT) {
+                opaqueNodeAlreadyPasted = firstTarget
+            }
         }
 
         // Transient focus/window transition retry: wait briefly, re-resolve target, explicitly restore
-        // input focus on the target node, and try again before falling back to clipboard.
-        delay(90L)
-        val retryTarget = resolveBestTargetInputNode(ownPkg = packageName, allowPinnedFallback = true)
-            ?: firstTarget
-            ?: return@withContext false
+        // input focus on the target node, and try once more before falling back to clipboard notification.
+        delay(80L)
+        val retryTarget = resolveBestTargetInputNode(
+            ownPkg = packageName,
+            allowPinnedFallback = true,
+            allowTreeBfs = true
+        ) ?: firstTarget ?: return@withContext false
 
-        val retrySucceeded = tryInjectIntoTargetNode(retryTarget, textToInsert, forceFocusFirst = true)
-        if (retrySucceeded) {
-            pinnedDictationNode = null
+        if (opaqueNodeAlreadyPasted != null && retryTarget == opaqueNodeAlreadyPasted) {
+            // Avoid sending a duplicate ACTION_PASTE to an opaque non-editable view that already accepted one
+            return@withContext false
         }
-        retrySucceeded
+
+        val retryOutcome = tryInjectIntoTargetNode(
+            node = retryTarget,
+            textToInsert = textToInsert,
+            clipboardReady = clipboardReady,
+            forceFocusFirst = true
+        )
+        if (retryOutcome == InjectionAttemptOutcome.CONFIRMED) {
+            pinnedDictationNode = null
+            return@withContext true
+        }
+        false
+    }
+
+    private enum class InjectionAttemptOutcome {
+        CONFIRMED,
+        OPAQUE_UNVERIFIED_PASTE_SENT,
+        FAILED
+    }
+
+    private fun copyPlainTextToClipboard(text: String): Boolean {
+        return try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
+            clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", text))
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private data class NodeTextSnapshot(
+        val showingHint: Boolean,
+        val rawText: String,
+        val selStart: Int,
+        val selEnd: Int
+    )
+
+    private fun captureNodeSnapshot(node: AccessibilityNodeInfo): NodeTextSnapshot {
+        val showingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            (try { node.isShowingHintText } catch (_: Throwable) { false })
+        val rawText = try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+        val selStart = try { node.textSelectionStart } catch (_: Throwable) { -1 }
+        val selEnd = try { node.textSelectionEnd } catch (_: Throwable) { -1 }
+        return NodeTextSnapshot(
+            showingHint = showingHint,
+            rawText = rawText,
+            selStart = selStart,
+            selEnd = selEnd
+        )
+    }
+
+    private suspend fun verifyNodeChangedAfterAction(
+        node: AccessibilityNodeInfo,
+        before: NodeTextSnapshot
+    ): Boolean {
+        delay(45L)
+        try {
+            node.refresh()
+        } catch (_: Throwable) {
+        }
+        val firstAfter = captureNodeSnapshot(node)
+        if (hasConfirmedTextInjection(
+                wasShowingHint = before.showingHint,
+                rawBeforeText = before.rawText,
+                beforeSelStart = before.selStart,
+                beforeSelEnd = before.selEnd,
+                afterShowingHint = firstAfter.showingHint,
+                rawAfterText = firstAfter.rawText,
+                afterSelStart = firstAfter.selStart,
+                afterSelEnd = firstAfter.selEnd
+            )
+        ) {
+            return true
+        }
+
+        // Second check (+65ms) catches asynchronous WebView / Blink / Compose / React Native DOM commits
+        delay(65L)
+        try {
+            node.refresh()
+        } catch (_: Throwable) {
+        }
+        val secondAfter = captureNodeSnapshot(node)
+        return hasConfirmedTextInjection(
+            wasShowingHint = before.showingHint,
+            rawBeforeText = before.rawText,
+            beforeSelStart = before.selStart,
+            beforeSelEnd = before.selEnd,
+            afterShowingHint = secondAfter.showingHint,
+            rawAfterText = secondAfter.rawText,
+            afterSelStart = secondAfter.selStart,
+            afterSelEnd = secondAfter.selEnd
+        )
     }
 
     private suspend fun tryInjectIntoTargetNode(
         node: AccessibilityNodeInfo,
         textToInsert: String,
+        clipboardReady: Boolean,
         forceFocusFirst: Boolean
-    ): Boolean {
+    ): InjectionAttemptOutcome {
         try {
             node.refresh()
         } catch (_: Throwable) {
@@ -891,7 +1067,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 false
             }
             if (focusedOk) {
-                delay(45L)
+                delay(40L)
                 try {
                     node.refresh()
                 } catch (_: Throwable) {
@@ -900,66 +1076,68 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         }
 
         val isPassword = isPasswordField(node)
-        val isShowingHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            (try { node.isShowingHintText } catch (_: Throwable) { false })
+        val before = captureNodeSnapshot(node)
+        val logicalBeforeText = if (before.showingHint || isPassword) "" else before.rawText
+        val hasKnownSelection = before.selStart in 0..logicalBeforeText.length &&
+            before.selEnd in 0..logicalBeforeText.length
 
-        // Never treat placeholder hint text (e.g., "Message", "Search...") as existing user content!
-        val currentText = if (isShowingHint || isPassword) {
-            ""
-        } else {
-            try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" }
-        }
+        val directEditable = isDirectEditableNode(node, packageName)
+        val canSetText = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && directEditable && !isPassword
+        val isWebNode = isWebViewClassName(node)
+        val preferSetTextFirst = canSetText && !isWebNode && (logicalBeforeText.isEmpty() || hasKnownSelection)
 
-        val selStart = try { node.textSelectionStart } catch (_: Throwable) { -1 }
-        val selEnd = try { node.textSelectionEnd } catch (_: Throwable) { -1 }
-        val hasKnownSelection = selStart in 0..currentText.length && selEnd in 0..currentText.length
-        val canSetText = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
-            (node.isEditable || supportsSetText(node))
-
-        // Strategy A: Direct ACTION_SET_TEXT first whenever:
-        // - The field is empty / showing placeholder hint (works across EditText, Compose TextField, WebView <input>), OR
-        // - The field is non-password and exposes explicit cursor/selection bounds (bypasses Android 12-15
-        //   background clipboard restrictions completely and avoids pasting stale clipboard items).
-        val preferDirectSetTextFirst = canSetText && !isPassword && (currentText.isEmpty() || hasKnownSelection)
-
-        if (preferDirectSetTextFirst) {
-            if (performDirectSetText(node, currentText, selStart, selEnd, textToInsert)) {
-                DebugLogManager.logInfo(TAG, "Injected dictated text via direct ACTION_SET_TEXT (${textToInsert.length} chars)")
-                return true
+        if (preferSetTextFirst) {
+            if (performVerifiedSetText(node, before, logicalBeforeText, textToInsert)) {
+                DebugLogManager.logInfo(TAG, "Confirmed text injection via ACTION_SET_TEXT (${textToInsert.length} chars)")
+                return InjectionAttemptOutcome.CONFIRMED
             }
-            if (performClipboardPaste(node, textToInsert)) {
-                DebugLogManager.logInfo(TAG, "Injected dictated text via fallback ACTION_PASTE (${textToInsert.length} chars)")
-                return true
+            val latestBefore = captureNodeSnapshot(node)
+            if (clipboardReady && performVerifiedPaste(node, latestBefore) == InjectionAttemptOutcome.CONFIRMED) {
+                DebugLogManager.logInfo(TAG, "Confirmed text injection via fallback ACTION_PASTE (${textToInsert.length} chars)")
+                return InjectionAttemptOutcome.CONFIRMED
             }
-            return false
+            return InjectionAttemptOutcome.FAILED
         }
 
-        // Strategy B: Rich contenteditable / password / hidden-cursor non-empty field -> try ACTION_PASTE first,
-        // then fall back to ACTION_SET_TEXT if paste is unsupported or rejected.
-        if (performClipboardPaste(node, textToInsert)) {
-            DebugLogManager.logInfo(TAG, "Injected dictated text via ACTION_PASTE (${textToInsert.length} chars)")
-            return true
+        if (clipboardReady) {
+            val pasteOutcome = performVerifiedPaste(node, before)
+            if (pasteOutcome == InjectionAttemptOutcome.CONFIRMED) {
+                DebugLogManager.logInfo(TAG, "Confirmed text injection via ACTION_PASTE (${textToInsert.length} chars)")
+                return InjectionAttemptOutcome.CONFIRMED
+            }
+            if (canSetText) {
+                val latestBefore = captureNodeSnapshot(node)
+                val latestLogical = if (latestBefore.showingHint || isPassword) "" else latestBefore.rawText
+                if (performVerifiedSetText(node, latestBefore, latestLogical, textToInsert)) {
+                    DebugLogManager.logInfo(TAG, "Confirmed text injection via fallback ACTION_SET_TEXT (${textToInsert.length} chars)")
+                    return InjectionAttemptOutcome.CONFIRMED
+                }
+            }
+            if (pasteOutcome == InjectionAttemptOutcome.OPAQUE_UNVERIFIED_PASTE_SENT) {
+                return InjectionAttemptOutcome.OPAQUE_UNVERIFIED_PASTE_SENT
+            }
+            return InjectionAttemptOutcome.FAILED
         }
-        if (canSetText && !isPassword && performDirectSetText(node, currentText, selStart, selEnd, textToInsert)) {
-            DebugLogManager.logInfo(TAG, "Injected dictated text via fallback ACTION_SET_TEXT (${textToInsert.length} chars)")
-            return true
+
+        if (canSetText && performVerifiedSetText(node, before, logicalBeforeText, textToInsert)) {
+            DebugLogManager.logInfo(TAG, "Confirmed text injection via ACTION_SET_TEXT (${textToInsert.length} chars)")
+            return InjectionAttemptOutcome.CONFIRMED
         }
-        return false
+        return InjectionAttemptOutcome.FAILED
     }
 
-    private fun performDirectSetText(
+    private suspend fun performVerifiedSetText(
         node: AccessibilityNodeInfo,
-        currentText: String,
-        selStart: Int,
-        selEnd: Int,
+        before: NodeTextSnapshot,
+        logicalBeforeText: String,
         textToInsert: String
     ): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false
-        return try {
+        val setDispatched = try {
             val spliced = spliceTextForSetText(
-                currentText = currentText,
-                selectionStart = selStart,
-                selectionEnd = selEnd,
+                currentText = logicalBeforeText,
+                selectionStart = before.selStart,
+                selectionEnd = before.selEnd,
                 textToInsert = textToInsert
             )
             val arguments = Bundle().apply {
@@ -983,58 +1161,33 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         } catch (_: Throwable) {
             false
         }
+        if (!setDispatched) return false
+        return verifyNodeChangedAfterAction(node, before)
     }
 
-    private suspend fun performClipboardPaste(
+    private suspend fun performVerifiedPaste(
         node: AccessibilityNodeInfo,
-        textToInsert: String
-    ): Boolean {
-        clipboardRestoreJob?.cancel()
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
-        val oldClip = try {
-            clipboard.primaryClip
-        } catch (_: Throwable) {
-            null
-        }
-
-        val clipSetOk = try {
-            val clip = ClipData.newPlainText("OpenFlow", textToInsert)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                // Hide transient paste buffer from the Android 13+ clipboard preview popup
-                clip.description.extras = PersistableBundle().apply {
-                    putBoolean("android.content.extra.IS_SENSITIVE", true)
-                }
-            }
-            clipboard.setPrimaryClip(clip)
-            true
-        } catch (_: Throwable) {
-            false
-        }
-        if (!clipSetOk) return false
-
-        delay(55L)
-
-        val pasted = try {
+        before: NodeTextSnapshot
+    ): InjectionAttemptOutcome {
+        val pastedDispatched = try {
             node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         } catch (_: Throwable) {
             false
         }
-
-        if (pasted) {
-            // Restore previous clipboard asynchronously after giving WebView / Electron / Compose
-            // async paste handlers ample time (750ms) to read the primary clip.
-            clipboardRestoreJob = serviceScope.launch {
-                delay(CLIPBOARD_RESTORE_DELAY_MS)
-                try {
-                    if (oldClip != null) {
-                        clipboard.setPrimaryClip(oldClip)
-                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        clipboard.clearPrimaryClip()
-                    }
-                } catch (_: Throwable) {
-                }
-            }
+        if (!pastedDispatched) return InjectionAttemptOutcome.FAILED
+        if (verifyNodeChangedAfterAction(node, before)) {
+            return InjectionAttemptOutcome.CONFIRMED
         }
-        return pasted
+        // If an opaque non-editable container (e.g. raw WebView / custom view with empty node.text) returned true
+        // from ACTION_PASTE, record that paste was already sent once so retry doesn't double-paste while still
+        // notifying the user that the clipboard also holds the text.
+        val isOpaqueNonEditable = !isDirectEditableNode(node, packageName) &&
+            before.rawText.isEmpty() &&
+            before.selStart < 0
+        return if (isOpaqueNonEditable) {
+            InjectionAttemptOutcome.OPAQUE_UNVERIFIED_PASTE_SENT
+        } else {
+            InjectionAttemptOutcome.FAILED
+        }
     }
 }

@@ -1988,7 +1988,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 val service = TextInjectionAccessibilityService.getSharedInstance() ?: return FlowFieldContext.NONE
                 val focusedNode = service.resolveBestTargetInputNode(
                     ownPkg = context.packageName,
-                    allowPinnedFallback = true
+                    allowPinnedFallback = true,
+                    allowTreeBfs = false
                 ) ?: return FlowFieldContext.NONE
 
                 val pkg = focusedNode.packageName?.toString()

@@ -84,6 +84,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 enum class OverlayBubbleState {
@@ -300,6 +301,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     /** Active "transcribe while recording" session, or `null` when live transcription is off / not recording. */
     private var streamingSession: StreamingDictationSession? = null
+    private val recordingCycleId = AtomicLong(0L)
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
@@ -551,7 +553,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         isBubbleVisibleFlow.value = false
 
         if (bubbleState.value == OverlayBubbleState.RECORDING) {
+            recordingCycleId.incrementAndGet()
             bubbleState.value = OverlayBubbleState.IDLE
+            processingProgress.value = ""
             smartPipeline.onRecordingStopped()
             releaseDictationWakeLock()
             streamingSession?.cancel()
@@ -967,6 +971,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             }
                         },
                         onStartRecording = {
+                            if (bubbleState.value == OverlayBubbleState.RECORDING ||
+                                bubbleState.value == OverlayBubbleState.PROCESSING
+                            ) {
+                                return@BubbleOverlayComponent
+                            }
                             if (ContextCompat.checkSelfPermission(
                                     this@FloatingBubbleService,
                                     Manifest.permission.RECORD_AUDIO
@@ -979,19 +988,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 ).show()
                                 return@BubbleOverlayComponent
                             }
-                            // Pin the currently focused editable field at t=0ms before overlay/recording state changes
-                            TextInjectionAccessibilityService.getSharedInstance()?.captureTargetNodeForDictation()
 
-                            // Ensure MICROPHONE foreground service type is active on user tap (if started on boot as SPECIAL_USE)
-                            startCustomForeground(smartPipeline.pipelineStatus.value)
-                            acquireDictationWakeLock()
+                            val cycleId = recordingCycleId.incrementAndGet()
                             processingProgress.value = ""
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
+                            acquireDictationWakeLock()
                             syncScreenKeepAwakeState(forceRefreshWakeLock = true)
 
-                            // Start loading Ear + Voz at t=0ms in parallel with AudioRecord hardware init!
-                            smartPipeline.onRecordingStartedAsync()
+                            // Ensure MICROPHONE foreground service type is active on user tap (if started on boot as SPECIAL_USE)
+                            startCustomForeground(smartPipeline.pipelineStatus.value)
+
+                            // Fast (<2ms, zero-BFS) pin of the currently focused editable field
+                            TextInjectionAccessibilityService.getSharedInstance()?.captureTargetNodeForDictation()
 
                             // "Transcribe while recording": create the session now, start it before the mic so a very
                             // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
@@ -1013,15 +1022,17 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 null
                             }
                             serviceScope.launch {
-                                val started = audioController.startRecording(this)
+                                val started = audioController.startRecording(serviceScope)
                                 if (!started) {
-                                    smartPipeline.onRecordingStopped()
-                                    session?.cancel()
-                                    if (streamingSession === session) streamingSession = null
-                                    bubbleState.value = OverlayBubbleState.IDLE
-                                    releaseDictationWakeLock()
-                                    syncBubbleVisibility()
-                                    syncScreenKeepAwakeState()
+                                    if (recordingCycleId.get() == cycleId) {
+                                        smartPipeline.onRecordingStopped()
+                                        session?.cancel()
+                                        if (streamingSession === session) streamingSession = null
+                                        bubbleState.value = OverlayBubbleState.IDLE
+                                        releaseDictationWakeLock()
+                                        syncBubbleVisibility()
+                                        syncScreenKeepAwakeState()
+                                    }
                                     withContext(Dispatchers.Main) {
                                         android.widget.Toast.makeText(
                                             this@FloatingBubbleService,
@@ -1029,18 +1040,25 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                             android.widget.Toast.LENGTH_SHORT
                                         ).show()
                                     }
+                                } else if (recordingCycleId.get() == cycleId &&
+                                    bubbleState.value == OverlayBubbleState.RECORDING
+                                ) {
+                                    // Load Ear + Voz immediately once AudioRecord is actively capturing
+                                    smartPipeline.onRecordingStartedAsync()
                                 }
                             }
                         },
                         onStopRecording = {
+                            if (bubbleState.value != OverlayBubbleState.RECORDING) {
+                                return@BubbleOverlayComponent
+                            }
+                            val cycleId = recordingCycleId.incrementAndGet()
                             smartPipeline.onRecordingStopped()
                             acquireDictationWakeLock()
-                            if (processingProgress.value.isEmpty()) {
-                                processingProgress.value = if (smartPipeline.pipelineStatus.value.isReady) {
-                                    "Transcribing..."
-                                } else {
-                                    "Loading Voz..."
-                                }
+                            processingProgress.value = if (smartPipeline.isVozReady) {
+                                "Transcribing..."
+                            } else {
+                                "Loading Voz..."
                             }
                             bubbleState.value = OverlayBubbleState.PROCESSING
                             // Keep the screen awake throughout Voz transcription and LLM post-processing!
@@ -1052,10 +1070,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                     // Stop looking for new pauses first so the tail below is the very last piece
                                     session.stopPolling()
                                     val tail = audioController.stopRecording()
-                                    processAudio(tail, session)
+                                    processAudio(tail, session, cycleId)
                                 } else {
                                     val samples = audioController.stopRecording()
-                                    processAudio(samples)
+                                    processAudio(samples, null, cycleId)
                                 }
                             }
                         }
@@ -1281,17 +1299,30 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         }
     }
 
+    private fun copyTextToClipboardSafely(text: String) {
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(ClipData.newPlainText("OpenFlow", text))
+        } catch (t: Throwable) {
+            DebugLogManager.logWarn("FloatingBubbleService", "Clipboard copy failed: ${t.message}")
+        }
+    }
+
     /**
      * Transcribes and injects the dictation. With a live [session] the earlier chunks were already transcribed
      * while recording, so [samples] is just the final tail and only that remains to process.
      */
-    private fun processAudio(samples: FloatArray, session: StreamingDictationSession? = null) {
+    private fun processAudio(
+        samples: FloatArray,
+        session: StreamingDictationSession? = null,
+        cycleId: Long = recordingCycleId.get()
+    ) {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         serviceScope.launch {
             try {
                 if (processingProgress.value.isEmpty()) {
-                    processingProgress.value = if (smartPipeline.pipelineStatus.value.isReady) {
+                    processingProgress.value = if (smartPipeline.isVozReady) {
                         "Transcribing..."
                     } else {
                         "Loading Voz..."
@@ -1340,59 +1371,84 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     normalizedBase.replace(WHITESPACE_RUN_REGEX, " ")
                 }
 
-                if (finalText.isNotBlank()) {
-                    val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
-                    val accessibilityService = TextInjectionAccessibilityService.getSharedInstance()
-                    val injected = if (autoPasteEnabled && accessibilityService != null) {
-                        accessibilityService.injectTextSuspend(finalText)
-                    } else {
-                        false
+                if (finalText.isBlank()) {
+                    DebugLogManager.logInfo(
+                        "FloatingBubbleService",
+                        "No speech detected in captured audio (samples=$totalSamples)"
+                    )
+                    if (recordingCycleId.get() == cycleId) {
+                        processingProgress.value = ""
+                        bubbleState.value = OverlayBubbleState.IDLE
                     }
-
-                    if (!injected) {
-                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("OpenFlow", finalText))
-                        withContext(Dispatchers.Main) {
-                            android.widget.Toast.makeText(
-                                this@FloatingBubbleService,
-                                "Copied to clipboard",
-                                android.widget.Toast.LENGTH_SHORT
-                            ).show()
-                        }
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(
+                            this@FloatingBubbleService,
+                            "No speech detected",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
                     }
+                    return@launch
+                }
 
-                    if (prefs.getBoolean("haptic_feedback", true)) vibrate(15, 120)
+                // Always guarantee the transcribed text is placed on the clipboard as a reliable safety net
+                copyTextToClipboardSafely(finalText)
 
-                    try {
-                        val modelId = buildString {
-                            append("desert-ant-voz-4.0.0")
-                            if (activeModelSettings.punctEnabled && !activeModelSettings.gemmaEnabled) append("+punct")
-                            if (activeModelSettings.gemmaEnabled) append("+${activeModelSettings.selectedLlmModel.id}")
-                        }
-                        val dao = AppDatabase.getDatabase(this@FloatingBubbleService).transcriptionDao()
-                        dao.insert(
-                            TranscriptionRecord(
-                                transcribedText = finalText,
-                                durationMs = totalSamples / 16L,
-                                audioSamplesCount = totalSamples.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                modelIdentifier = modelId,
-                                wasInjectedSuccessfully = injected
-                            )
-                        )
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                val autoPasteEnabled = prefs.getBoolean("auto_paste", true)
+                val accessibilityService = TextInjectionAccessibilityService.getSharedInstance()
+                val injected = if (autoPasteEnabled && accessibilityService != null) {
+                    accessibilityService.injectTextSuspend(finalText)
+                } else {
+                    false
+                }
+
+                if (!injected) {
+                    copyTextToClipboardSafely(finalText)
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(
+                            this@FloatingBubbleService,
+                            "Copied to clipboard",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
                     }
                 }
 
-                bubbleState.value = OverlayBubbleState.SUCCESS
-                delay(1200)
-                processingProgress.value = ""
-                bubbleState.value = OverlayBubbleState.IDLE
+                if (prefs.getBoolean("haptic_feedback", true)) vibrate(15, 120)
+
+                try {
+                    val modelId = buildString {
+                        append("desert-ant-voz-4.0.0")
+                        if (activeModelSettings.punctEnabled && !activeModelSettings.gemmaEnabled) append("+punct")
+                        if (activeModelSettings.gemmaEnabled) append("+${activeModelSettings.selectedLlmModel.id}")
+                    }
+                    val dao = AppDatabase.getDatabase(this@FloatingBubbleService).transcriptionDao()
+                    dao.insert(
+                        TranscriptionRecord(
+                            transcribedText = finalText,
+                            durationMs = totalSamples / 16L,
+                            audioSamplesCount = totalSamples.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                            modelIdentifier = modelId,
+                            wasInjectedSuccessfully = injected
+                        )
+                    )
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                if (recordingCycleId.get() == cycleId) {
+                    bubbleState.value = OverlayBubbleState.SUCCESS
+                    delay(1200)
+                    if (recordingCycleId.get() == cycleId) {
+                        processingProgress.value = ""
+                        bubbleState.value = OverlayBubbleState.IDLE
+                    }
+                }
             } catch (t: Throwable) {
                 t.printStackTrace()
                 DebugLogManager.logError("FloatingBubbleService", "processAudio transcription error", t)
-                processingProgress.value = ""
-                bubbleState.value = OverlayBubbleState.IDLE
+                if (recordingCycleId.get() == cycleId) {
+                    processingProgress.value = ""
+                    bubbleState.value = OverlayBubbleState.IDLE
+                }
                 val errorDetail = if (t is LinkageError) {
                     "${t.javaClass.simpleName}: ${t.message ?: "initialization error"}"
                 } else {
@@ -1406,7 +1462,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     ).show()
                 }
             } finally {
-                releaseDictationWakeLock()
+                if (recordingCycleId.get() == cycleId) {
+                    releaseDictationWakeLock()
+                }
                 syncBubbleVisibility()
                 syncScreenKeepAwakeState()
             }

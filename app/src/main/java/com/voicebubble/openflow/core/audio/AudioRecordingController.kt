@@ -21,6 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlin.math.min
 import kotlin.math.sqrt
 
@@ -82,15 +83,20 @@ class AudioRecordingController {
     private val _rmsLevel = MutableStateFlow(0.0f)
     val rmsLevel: StateFlow<Float> = _rmsLevel.asStateFlow()
 
+    @Volatile
+    var isRecording: Boolean = false
+        private set
+
     private val controllerMutex = Mutex()
 
-    suspend fun release() {
+    suspend fun release() = withContext(Dispatchers.IO) {
         controllerMutex.withLock {
             releaseNow()
         }
     }
 
     fun releaseNow() {
+        isRecording = false
         recordingJob?.cancel()
         recordingJob = null
         try {
@@ -109,8 +115,9 @@ class AudioRecordingController {
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun startRecording(coroutineScope: CoroutineScope): Boolean {
-        return controllerMutex.withLock {
+    suspend fun startRecording(coroutineScope: CoroutineScope): Boolean = withContext(Dispatchers.IO) {
+        controllerMutex.withLock {
+            isRecording = false
             try {
                 if (audioRecord?.state == AudioRecord.STATE_INITIALIZED &&
                     audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
@@ -204,6 +211,7 @@ class AudioRecordingController {
                 return@withLock false
             }
 
+            isRecording = true
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
                 val shortBuffer = ShortArray(READ_CHUNK_SHORTS)
 
@@ -213,6 +221,7 @@ class AudioRecordingController {
                         // ERROR_DEAD_OBJECT / ERROR_INVALID_OPERATION / ERROR_BAD_VALUE: the record object is no
                         // longer usable (e.g. mic taken over by another app). Bail out instead of busy-spinning
                         // a CPU core on a permanently failing read().
+                        isRecording = false
                         DebugLogManager.logWarning(
                             "AudioRecordingController",
                             "AudioRecord.read() failed with code $readCount; ending capture loop"
@@ -350,8 +359,9 @@ class AudioRecordingController {
         }
     }
 
-    suspend fun stopRecording(): FloatArray {
-        return controllerMutex.withLock {
+    suspend fun stopRecording(): FloatArray = withContext(Dispatchers.IO) {
+        controllerMutex.withLock {
+            isRecording = false
             val activeRecord = audioRecord
             if (activeRecord?.state == AudioRecord.STATE_INITIALIZED &&
                 activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING

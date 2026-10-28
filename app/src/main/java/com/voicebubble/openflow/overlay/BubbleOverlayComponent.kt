@@ -57,6 +57,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -106,6 +107,9 @@ fun BubbleOverlayComponent(
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
     var isDragging by remember { mutableStateOf(false) }
+    val latestBubbleState by rememberUpdatedState(bubbleState)
+    val latestStartRecording by rememberUpdatedState(onStartRecording)
+    val latestStopRecording by rememberUpdatedState(onStopRecording)
 
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
@@ -257,10 +261,10 @@ fun BubbleOverlayComponent(
                     interactionSource = interactionSource,
                     indication = androidx.compose.material3.ripple()
                 ) {
-                    when (bubbleState) {
-                        OverlayBubbleState.IDLE -> onStartRecording()
-                        OverlayBubbleState.RECORDING -> onStopRecording()
-                        else -> {}
+                    when (latestBubbleState) {
+                        OverlayBubbleState.IDLE, OverlayBubbleState.SUCCESS -> latestStartRecording()
+                        OverlayBubbleState.RECORDING -> latestStopRecording()
+                        OverlayBubbleState.PROCESSING -> {}
                     }
                 },
             shape = bubbleShape,

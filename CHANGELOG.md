@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.12.1] - 2026-10-28
+
+### Fixed
+- **Fixed Floating Bubble Dictation Regression Producing No Text Field or Clipboard Output (`TextInjectionAccessibilityService`, `FloatingBubbleService`, `AudioRecordingController`, `BubbleOverlayComponent`, `SmartPipeline`, `GemmaTextProcessor`, `accessibility_service_config.xml`):**
+  - **Eliminated Main-Looper Accessibility IPC Freezes:** Removed multi-window Accessibility subtree BFS walks (`resolveBestTargetInputNode`) from periodic keyboard visibility checks (`refreshKeyboardVisibilityState()`), keystroke event listeners (`typeViewTextChanged`), `t = 0 ms` recording-start focus pinning (`captureTargetNodeForDictation`), and background context inspection (`GemmaTextProcessor.inspectActiveFieldContextStatic`). Keyboard detection now uses strictly `O(1)` `WindowMetrics` IME insets and `TYPE_INPUT_METHOD` window geometry checks with zero node-tree walks on `Looper.getMainLooper()`.
+  - **Off-Main-Thread `AudioRecord` Capture & Race-Free Recording Cycles:** Moved `AudioRecordingController.startRecording()` and `stopRecording()` onto `Dispatchers.IO`, guarded start/stop transitions with `recordingCycleId` + `rememberUpdatedState` in `BubbleOverlayComponent`, and deferred heavy `Gemma 4 E2B` live-recording overlap (`4.5s` + `2.9 GB` free-RAM guard) plus restored `200 ms` (`3,200`-sample) `Voz` warm-up buffers so speech capture and stop-tap transcription never stall or trigger low-memory kills.
+  - **Post-Action Verified Text Injection (`hasConfirmedTextInjection`) + Guaranteed Intact Clipboard:** Every non-blank transcription is now copied to the clipboard upfront as plain `ClipData` (`clearPrimaryClip()` and `EXTRA_IS_SENSITIVE` masking removed so dictated text is never wiped or hidden on Android 10–15). Both `ACTION_SET_TEXT` and `ACTION_PASTE` now verify via `AccessibilityNodeInfo.refresh()` (`+45 ms` / `+110 ms`) that the focused input's text, placeholder-hint state, or cursor actually changed—automatically falling back between `ACTION_SET_TEXT`, `ACTION_PASTE`, focus restoration, and `"Copied to clipboard"` notification whenever a wrapper or custom editor silently ignores an action, and removing unfocused single-editable guessing so text is never sent to an unrelated view.
+  - **Explicit No-Speech Feedback:** Blank/silent captures now return cleanly to `IDLE` with a `"No speech detected"` toast instead of displaying a misleading green completion checkmark with zero output.
+
 ## [2.12.0] - 2026-10-27
 
 ### Added, Improved & Fixed
