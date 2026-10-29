@@ -427,12 +427,12 @@ class StreamingDictationSession(
 
     companion object {
         private const val TAG = "StreamingDictation"
-        private const val ACTIVE_POLL_INTERVAL_MS = 110L
-        private const val COLD_LOAD_POLL_INTERVAL_MS = 180L
-        private const val MAX_IDLE_BUFFER_SLEEP_MS = 450L
+        private const val ACTIVE_POLL_INTERVAL_MS = 85L
+        private const val COLD_LOAD_POLL_INTERVAL_MS = 140L
+        private const val MAX_IDLE_BUFFER_SLEEP_MS = 380L
         private const val POLL_APPROACH_MARGIN_SAMPLES = 4_800 // 300ms before minLiveChunkSamples
-        private const val PRE_DETECT_FIRST_TRY_SAMPLES = 28_800 // ~1.8s of audio
-        private const val PRE_DETECT_SECOND_TRY_SAMPLES = 56_000 // ~3.5s of audio
+        private const val PRE_DETECT_FIRST_TRY_SAMPLES = 19_200 // ~1.2s of audio
+        private const val PRE_DETECT_SECOND_TRY_SAMPLES = 44_800 // ~2.8s of audio
         private const val PRE_DETECT_PEEK_MAX_SAMPLES = 56_000
         private const val MAX_IN_FLIGHT_LIVE_CHUNKS = 4
         private const val MAX_FAILED_RETRY_SAMPLES = 45L * DictationChunkSettings.SAMPLE_RATE

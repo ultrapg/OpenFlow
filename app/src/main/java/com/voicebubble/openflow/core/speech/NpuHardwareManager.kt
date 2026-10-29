@@ -440,10 +440,20 @@ object NpuHardwareManager {
                     Os.setenv("NNAPI_ALLOW_FP16", "1", true)
                     Os.setenv("ORT_NNAPI_ENABLE_FP16", "1", true)
 
-                    profile.dispatchLibraryDir?.let { dir ->
+                    val appNativeLibDir = context.applicationInfo?.nativeLibraryDir?.takeIf { it.isNotBlank() }
+                    val dispatchLibDir = appNativeLibDir ?: profile.dispatchLibraryDir
+                    dispatchLibDir?.let { dir ->
                         Os.setenv("LITERT_DISPATCH_LIBRARY_DIR", dir, true)
                         Os.setenv("LITERT_DISPATCH_LIB_PATH", dir, true)
-                        Os.setenv("QNN_LIBRARY_PATH", dir, true)
+                        Os.setenv("LITERT_COMPILER_PLUGIN_LIBRARY_DIR", dir, true)
+                        Os.setenv("LITERT_COMPILER_PLUGIN_PATH", dir, true)
+                    }
+                    val qnnSearchPath = listOfNotNull(appNativeLibDir, profile.dispatchLibraryDir)
+                        .distinct()
+                        .joinToString(":")
+                        .takeIf { it.isNotBlank() }
+                    if (qnnSearchPath != null) {
+                        Os.setenv("QNN_LIBRARY_PATH", qnnSearchPath, true)
                     }
 
                     // Qualcomm Hexagon HTP / CDSP FastRPC library paths & PDR (Process Domain Restart) recovery

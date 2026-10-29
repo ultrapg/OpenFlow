@@ -30,12 +30,40 @@ class AudioRecordingController {
         private const val SAMPLE_RATE = 16000
         // 40 ms read blocks (640 samples) keep pcmBuffer fresh without large blocking-read latency
         private const val READ_CHUNK_SHORTS = 640
-        // 180 ms post-tap grace window captures the final syllable still in flight through the air / AudioFlinger HAL
-        private const val POST_STOP_TAIL_GRACE_MS = 180L
+        // 75 ms post-tap grace window captures the final syllable still in flight when the user taps Stop mid-word,
+        // and is skipped entirely (0 ms) when the trailing 80 ms of audio is already silent.
+        private const val POST_STOP_TAIL_GRACE_MS = 75L
+        private const val TRAILING_SILENCE_CHECK_SAMPLES = 1_280 // 80 ms @ 16 kHz
+        private const val TRAILING_SPEECH_RMS_THRESHOLD = 0.008f
         // Initial capacity: 15 seconds (240,000 floats = ~960 KB) — avoids repeated small allocations
         private const val INITIAL_CAPACITY_SAMPLES = SAMPLE_RATE * 15
         // Hard safety ceiling: 5 minutes at 16 kHz (4,800,000 floats = ~19.2 MB) to prevent unbounded RAM growth
         private const val MAX_RECORDING_SAMPLES = SAMPLE_RATE * 300
+
+        /**
+         * Returns `true` if the trailing [windowSamples] of [samples] (up to [size]) still contain
+         * active speech energy (`RMS >= threshold`), indicating we should wait [POST_STOP_TAIL_GRACE_MS]
+         * before stopping `AudioRecord`. Returns `false` if the user already paused before tapping Stop.
+         */
+        internal fun hasTrailingSpeechEnergy(
+            samples: FloatArray?,
+            size: Int,
+            windowSamples: Int = TRAILING_SILENCE_CHECK_SAMPLES,
+            threshold: Float = TRAILING_SPEECH_RMS_THRESHOLD
+        ): Boolean {
+            if (samples == null || size <= 0) return false
+            val validSize = min(size, samples.size)
+            val start = (validSize - windowSamples).coerceAtLeast(0)
+            val count = validSize - start
+            if (count <= 0) return false
+            var sumSq = 0.0
+            for (i in start until validSize) {
+                val v = samples[i].toDouble()
+                sumSq += v * v
+            }
+            val rms = sqrt(sumSq / count).toFloat()
+            return rms >= threshold
+        }
     }
 
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -366,9 +394,12 @@ class AudioRecordingController {
             if (activeRecord?.state == AudioRecord.STATE_INITIALIZED &&
                 activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING
             ) {
-                // Capture the final 180 ms after the user taps Stop so the last syllable/word still in flight
-                // through the air and Android's AudioFlinger HAL is never cut off by the tap.
-                delay(POST_STOP_TAIL_GRACE_MS)
+                val stillSpeakingAtStop = synchronized(bufferLock) {
+                    hasTrailingSpeechEnergy(pcmBuffer, pcmSize)
+                }
+                if (stillSpeakingAtStop) {
+                    delay(POST_STOP_TAIL_GRACE_MS)
+                }
                 try {
                     activeRecord.stop()
                 } catch (e: IllegalStateException) {

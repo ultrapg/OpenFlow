@@ -254,7 +254,8 @@ class SmartPipeline(
         const val IDLE_TIMEOUT_MS: Long = 20 * 60_000L // 20 minutes warm retention for core audio
         const val LLM_IDLE_TIMEOUT_MS: Long = 5 * 60_000L // 5 minutes burst retention for on-demand LLM
         const val SCREEN_OFF_DEEP_SLEEP_UNLOAD_MS: Long = 45_000L // 45s fast unload when display is locked/off
-        const val DEFERRED_POST_PROC_OVERLAP_MS: Long = 4_500L // Defer heavy LLM init past normal <4.5s utterances
+        const val FAST_POST_PROC_OVERLAP_MS: Long = 1_200L // Overlap light LLM / Punct init at 1.2s during recording
+        const val DEFERRED_POST_PROC_OVERLAP_MS: Long = 2_000L // Overlap heavy LLM init at 2.0s during recording
         private const val SILENCE_THRESHOLD: Float = 0.0035f
         private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
 
@@ -541,6 +542,7 @@ class SmartPipeline(
         recordingWarmupJob?.cancel()
         recordingWarmupJob = idleScope.launch {
             var shouldPreparePostProcessor = false
+            var targetPostProcOverlapMs = DEFERRED_POST_PROC_OVERLAP_MS
             // Phase 1: Load speech recognition models (`Ear` + `Voz`) immediately at t = 0 ms while the user speaks,
             // then release pipelineMutex right away so live streaming chunks or a quick Stop-tap never wait.
             pipelineMutex.withLock {
@@ -619,6 +621,16 @@ class SmartPipeline(
                 val needsPunct = !needsLlm &&
                     activeSnap.punctEnabled &&
                     DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
+                val postProcAlreadyLoaded = (needsLlm && gemmaProcessor != null && loadedLlmChoice == activeSnap.selectedLlmModel) ||
+                    (needsPunct && punctRestorer != null)
+                val isCompactPostProc = needsPunct ||
+                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B_LITE ||
+                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B
+                targetPostProcOverlapMs = when {
+                    postProcAlreadyLoaded -> 0L // Prewarm system-prompt KV cache immediately while user starts speaking!
+                    isCompactPostProc -> FAST_POST_PROC_OVERLAP_MS
+                    else -> DEFERRED_POST_PROC_OVERLAP_MS
+                }
                 shouldPreparePostProcessor = isRecordingActive &&
                     !hasPendingOrActiveInference &&
                     (needsLlm || needsPunct)
@@ -626,7 +638,7 @@ class SmartPipeline(
 
             if (shouldPreparePostProcessor && isRecordingActive && !hasPendingOrActiveInference) {
                 val elapsedRecordingMs = (SystemClock.elapsedRealtime() - recordingStartedAtMs).coerceAtLeast(0L)
-                val remainingDeferMs = (DEFERRED_POST_PROC_OVERLAP_MS - elapsedRecordingMs).coerceAtLeast(0L)
+                val remainingDeferMs = (targetPostProcOverlapMs - elapsedRecordingMs).coerceAtLeast(0L)
                 preparePostProcessorWhileRecordingAsync(initialDelayMs = remainingDeferMs)
             }
         }
@@ -779,8 +791,8 @@ class SmartPipeline(
         if (!activeSnap.earEnabled || !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
             return@withContext fallbackLanguage
         }
-        val trimmed = trimLeadingAndTrailingSilence(previewSamples, threshold = 0.0020f, padSamples = 3_200)
-        if (trimmed.size < 20_800) return@withContext null // Need >= 1.3s of voiced context for confident early ID
+        val trimmed = trimLeadingAndTrailingSilence(previewSamples, threshold = 0.0020f, padSamples = 2_400)
+        if (trimmed.size < 14_400) return@withContext null // Need >= 0.9s of voiced context for confident early ID
 
         if (!pipelineMutex.tryLock()) return@withContext null
         try {
@@ -801,10 +813,11 @@ class SmartPipeline(
                 trimmed
             }
             val conditioned = conditionAudioWhenClearDisabled(slice)
+            val earWindows = if (conditioned.size <= 40_000) 1 else 2
             val detection = earInstance.identify(
                 samples = conditioned,
                 sampleRate = SAMPLE_RATE_HZ,
-                options = ai.desertant.ear.Options(windows = 2)
+                options = ai.desertant.ear.Options(windows = earWindows)
             )
             earWarmedUp = true
             val detectedLang = detection.language?.lowercase(Locale.ROOT)
@@ -888,7 +901,7 @@ class SmartPipeline(
         if (!snap.gemmaEnabled || snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return
         promptPrewarmJob?.cancel()
         promptPrewarmJob = idleScope.launch {
-            delay(400L)
+            delay(40L)
             if (isTranscribing || !pipelineMutex.tryLock()) return@launch
             try {
                 if (isTranscribing) return@launch
@@ -898,7 +911,7 @@ class SmartPipeline(
                 if (!activeSnap.gemmaEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
                 val selectedLlm = activeSnap.selectedLlmModel
                 val mem = evaluateMemoryPressure()
-                val minPostDictationAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 1_600L else 1_100L
+                val minPostDictationAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 1_350L else 950L
                 if (mem.canPrewarmLlmPromptCache(selectedLlm) && mem.systemAvailMb >= minPostDictationAvailMb) {
                     gemma.prewarmSystemPrompt(
                         preset = activeSnap.gemmaPromptPreset,
@@ -1187,9 +1200,9 @@ class SmartPipeline(
                     val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
                     val preparedChunk = prepareChunkForInference(
                         samples = rawChunk,
-                        minLeadSilencePadSamples = 5_120,
-                        minTailSilencePadSamples = 10_240,
-                        minTotalSamples = 25_600,
+                        minLeadSilencePadSamples = 2_560,
+                        minTailSilencePadSamples = 5_120,
+                        minTotalSamples = 16_000,
                         edgeFadeSamples = 160,
                         silenceThreshold = 0.0020f
                     )
@@ -2005,10 +2018,11 @@ class SmartPipeline(
                 samples
             }
             val earInput = conditionAudioWhenClearDisabled(rawEarInput)
+            val earWindows = if (earInput.size <= 40_000) 1 else 2
             val detection = earInstance.identify(
                 samples = earInput,
                 sampleRate = SAMPLE_RATE_HZ,
-                options = ai.desertant.ear.Options(windows = 2)
+                options = ai.desertant.ear.Options(windows = earWindows)
             )
             earWarmedUp = true
             val detectedLang = detection.language?.lowercase(Locale.ROOT)

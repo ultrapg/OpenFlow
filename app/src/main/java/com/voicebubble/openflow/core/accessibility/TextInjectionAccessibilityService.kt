@@ -1187,7 +1187,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                     false
                 }
                 if (focusedOk) {
-                    delay(35L)
+                    delay(15L)
                     try {
                         firstTarget.refresh()
                     } catch (_: Throwable) {
@@ -1213,7 +1213,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         // while ensuring Compose/TextView `hasPrimaryClip()` is true right before `ACTION_PASTE`).
         val clipboardReady = copyPlainTextToClipboard(pastePayload)
         if (clipboardReady) {
-            delay(35L)
+            delay(8L)
         }
 
         var opaqueNodeAlreadyPasted: AccessibilityNodeInfo? = null
@@ -1314,43 +1314,29 @@ class TextInjectionAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         before: NodeTextSnapshot
     ): Boolean {
-        delay(45L)
-        try {
-            node.refresh()
-        } catch (_: Throwable) {
+        val pollIntervalsMs = longArrayOf(12L, 28L, 55L)
+        for (waitMs in pollIntervalsMs) {
+            delay(waitMs)
+            try {
+                node.refresh()
+            } catch (_: Throwable) {
+            }
+            val after = captureNodeSnapshot(node)
+            if (hasConfirmedTextInjection(
+                    wasShowingHint = before.showingHint,
+                    rawBeforeText = before.rawText,
+                    beforeSelStart = before.selStart,
+                    beforeSelEnd = before.selEnd,
+                    afterShowingHint = after.showingHint,
+                    rawAfterText = after.rawText,
+                    afterSelStart = after.selStart,
+                    afterSelEnd = after.selEnd
+                )
+            ) {
+                return true
+            }
         }
-        val firstAfter = captureNodeSnapshot(node)
-        if (hasConfirmedTextInjection(
-                wasShowingHint = before.showingHint,
-                rawBeforeText = before.rawText,
-                beforeSelStart = before.selStart,
-                beforeSelEnd = before.selEnd,
-                afterShowingHint = firstAfter.showingHint,
-                rawAfterText = firstAfter.rawText,
-                afterSelStart = firstAfter.selStart,
-                afterSelEnd = firstAfter.selEnd
-            )
-        ) {
-            return true
-        }
-
-        // Second check (+65ms) catches asynchronous WebView / Blink / Compose / React Native DOM commits
-        delay(65L)
-        try {
-            node.refresh()
-        } catch (_: Throwable) {
-        }
-        val secondAfter = captureNodeSnapshot(node)
-        return hasConfirmedTextInjection(
-            wasShowingHint = before.showingHint,
-            rawBeforeText = before.rawText,
-            beforeSelStart = before.selStart,
-            beforeSelEnd = before.selEnd,
-            afterShowingHint = secondAfter.showingHint,
-            rawAfterText = secondAfter.rawText,
-            afterSelStart = secondAfter.selStart,
-            afterSelEnd = secondAfter.selEnd
-        )
+        return false
     }
 
     private suspend fun tryInjectIntoTargetNode(
@@ -1372,7 +1358,7 @@ class TextInjectionAccessibilityService : AccessibilityService() {
                 false
             }
             if (focusedOk) {
-                delay(35L)
+                delay(15L)
                 try {
                     node.refresh()
                 } catch (_: Throwable) {

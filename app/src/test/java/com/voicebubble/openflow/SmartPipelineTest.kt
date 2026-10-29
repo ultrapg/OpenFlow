@@ -2647,4 +2647,87 @@ class SmartPipelineTest {
         // 6. Browser omnibox multi-word search query (URI inputType containing spaces) still spaces words naturally
         assertEquals(" recipe", payload("best sourdough", 14, 14, "recipe", uriType))
     }
+
+    @Test
+    fun `NPU support enabled across all LlmModelChoice models and resolveBestModelFile prefers NPU bundle when present`() {
+        for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+            assertTrue("${choice.id} must allow NPU backend probing", choice.supportsNpuBackend)
+        }
+
+        val tempDir = kotlin.io.path.createTempDirectory("npu_model_test").toFile()
+        try {
+            val stdFile = java.io.File(tempDir, com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B.modelFileName).apply {
+                writeBytes(byteArrayOf(1, 2, 3))
+            }
+            assertEquals(
+                stdFile,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveBestModelFile(
+                    modelDir = tempDir,
+                    llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                    wantNpu = true
+                )
+            )
+
+            val npuUncompiled = java.io.File(tempDir, "gemma-4-E2B-it_NPU_Uncompiled.litertlm").apply {
+                writeBytes(byteArrayOf(4, 5, 6, 7))
+            }
+            assertEquals(
+                npuUncompiled,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveBestModelFile(
+                    modelDir = tempDir,
+                    llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                    wantNpu = true
+                )
+            )
+            assertEquals(
+                stdFile,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveBestModelFile(
+                    modelDir = tempDir,
+                    llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                    wantNpu = false
+                )
+            )
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `AudioRecordingController hasTrailingSpeechEnergy skips stop grace delay when trailing buffer is silent`() {
+        val silentTail = FloatArray(16_000) { idx ->
+            if (idx < 12_000) 0.15f else 0.001f // User paused for last 250ms before tapping Stop
+        }
+        assertFalse(
+            com.voicebubble.openflow.core.audio.AudioRecordingController.hasTrailingSpeechEnergy(
+                samples = silentTail,
+                size = silentTail.size
+            )
+        )
+
+        val activeSpeechAtStop = FloatArray(16_000) { 0.08f }
+        assertTrue(
+            com.voicebubble.openflow.core.audio.AudioRecordingController.hasTrailingSpeechEnergy(
+                samples = activeSpeechAtStop,
+                size = activeSpeechAtStop.size
+            )
+        )
+
+        assertFalse(
+            com.voicebubble.openflow.core.audio.AudioRecordingController.hasTrailingSpeechEnergy(
+                samples = null,
+                size = 0
+            )
+        )
+    }
+
+    @Test
+    fun `Expanded zero-LLM fast path handles up to 28-word clean sentences`() {
+        val twentyTwoWordsClean = "We finished testing the new hardware acceleration pipeline on the phone this afternoon, and the transcription latency feels noticeably faster now."
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.canBypassLlmFastPath(
+                text = twentyTwoWordsClean,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
 }

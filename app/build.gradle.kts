@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 45
-        versionName = "2.12.2"
+        versionCode = 46
+        versionName = "2.13.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -166,11 +166,11 @@ dependencies {
     // ONNX Runtime Android with NNAPI / QNN NPU & XNNPACK Execution Providers for Punctuation & Casing Restoration
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
-    // Google AI Edge LiteRT-LM & NPU Compiler/Dispatch Runtimes (Experimental Gemma 4 E2B on NPU / GPU / CPU)
+    // Google AI Edge LiteRT-LM & NPU Compiler/Dispatch Runtimes (Experimental Gemma 4 E2B & Qwen on NPU / GPU / CPU)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.1")
-    implementation("com.google.ai.edge.litert:litert-npu-runtime-qualcomm:2.3.0")
-    implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.0")
-    implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.0")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-qualcomm:2.3.2")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.2")
+    implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.2")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")

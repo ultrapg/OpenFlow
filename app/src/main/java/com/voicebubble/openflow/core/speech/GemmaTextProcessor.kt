@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.text.InputType
 import android.util.Log
+import com.google.ai.edge.litertlm.ActivationDataType
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.BackendType
 import com.google.ai.edge.litertlm.Contents
@@ -1485,11 +1486,11 @@ class GemmaTextProcessor(
                 return false
             }
             val trimmed = text.trim()
-            if (trimmed.isEmpty() || trimmed.length > 140 || trimmed.contains('\n')) {
+            if (trimmed.isEmpty() || trimmed.length > 220 || trimmed.contains('\n')) {
                 return false
             }
             val wordCount = countWordsFast(trimmed)
-            if (wordCount !in 1..18) return false
+            if (wordCount !in 1..28) return false
 
             if (preset == GemmaPromptPreset.CLEAN_AND_POLISH &&
                 fieldContext.appCategory == AppContextCategory.EMAIL &&
@@ -1907,9 +1908,25 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         /**
-         * Pillar 6 — Drop-In Task LoRA Detection: Resolves an optional fine-tuned `.lora` adapter file
-         * in [modelDir] (`<modelId>.lora` or `adapter.lora`) for ultra-compact zero-example prefill.
+         * Resolves the best `.litertlm` model file in [modelDir] for [llmChoice], preferring an
+         * NPU-optimized or JIT-uncompiled `.litertlm` variant when [wantNpu] is true and present on disk,
+         * and falling back seamlessly to the standard [LlmModelChoice.modelFileName].
          */
+        fun resolveBestModelFile(
+            modelDir: File,
+            llmChoice: LlmModelChoice,
+            wantNpu: Boolean = false
+        ): File {
+            val primary = File(modelDir, llmChoice.modelFileName)
+            if (!wantNpu || !modelDir.isDirectory) return primary
+            val stem = llmChoice.modelFileName.removeSuffix(".litertlm")
+            val npuCandidates = listOf(
+                File(modelDir, "${stem}_npu.litertlm"),
+                File(modelDir, "${stem}_NPU_Uncompiled.litertlm"),
+                File(modelDir, "${llmChoice.id}_npu.litertlm")
+            )
+            return npuCandidates.firstOrNull { it.isFile && it.length() > 0L } ?: primary
+        }
         fun resolveOptionalLoraFile(modelDir: File, llmChoice: LlmModelChoice): File? {
             val specific = File(modelDir, "${llmChoice.id}.lora")
             if (specific.isFile && specific.length() > 0L) return specific
@@ -2102,7 +2119,11 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
     private val appContext: Context = context.applicationContext
     private val engineLock = Any()
-    private val modelFile: File = File(modelDir, llmChoice.modelFileName)
+    private val modelFile: File = resolveBestModelFile(
+        modelDir = modelDir,
+        llmChoice = llmChoice,
+        wantNpu = accelerator == HardwareAccelerator.NPU || accelerator == HardwareAccelerator.AUTO
+    )
     private val optionalLoraFile: File? = resolveOptionalLoraFile(modelDir, llmChoice)
     private val cacheDirectory: File = File(appContext.cacheDir, "litert_llm_cache/${llmChoice.id}").apply { mkdirs() }
 
@@ -2158,28 +2179,49 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     val initStartMs = SystemClock.elapsedRealtime()
                     var createdEngine: Engine? = null
                     try {
-                        val config = EngineConfig(
+                        val preferredActivationType = if (candidate.backend is Backend.CPU) {
+                            null
+                        } else {
+                            ActivationDataType.FLOAT16
+                        }
+                        val primaryConfig = EngineConfig(
                             modelPath = modelFile.absolutePath,
                             backend = candidate.backend,
                             visionBackend = null,
                             audioBackend = null,
                             maxNumTokens = maxTokens,
-                            cacheDir = cacheDirectory.absolutePath
+                            cacheDir = cacheDirectory.absolutePath,
+                            activationDataType = preferredActivationType
                         )
-                        ExperimentalFlags.enableBenchmark = true
+                        // Keep ExperimentalFlags.enableBenchmark = false in production so liblitertlm_jni.so
+                        // does not insert synchronous per-token profiling barriers during normal dictation.
+                        ExperimentalFlags.enableBenchmark = false
                         ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
                         ExperimentalFlags.filterChannelContentFromKvCache = true
                         try {
-                            createdEngine = Engine(config)
+                            createdEngine = Engine(primaryConfig)
                             createdEngine.initialize()
-                        } catch (benchInitErr: Throwable) {
+                        } catch (fp16InitErr: Throwable) {
                             createdEngine?.let { runCatching { it.close() } }
                             createdEngine = null
-                            ExperimentalFlags.enableBenchmark = false
-                            ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
-                            ExperimentalFlags.filterChannelContentFromKvCache = true
-                            createdEngine = Engine(config)
-                            createdEngine.initialize()
+                            if (preferredActivationType != null) {
+                                val fallbackConfig = EngineConfig(
+                                    modelPath = modelFile.absolutePath,
+                                    backend = candidate.backend,
+                                    visionBackend = null,
+                                    audioBackend = null,
+                                    maxNumTokens = maxTokens,
+                                    cacheDir = cacheDirectory.absolutePath,
+                                    activationDataType = null
+                                )
+                                ExperimentalFlags.enableBenchmark = false
+                                ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
+                                ExperimentalFlags.filterChannelContentFromKvCache = true
+                                createdEngine = Engine(fallbackConfig)
+                                createdEngine.initialize()
+                            } else {
+                                throw fp16InitErr
+                            }
                         } finally {
                             ExperimentalFlags.enableSpeculativeDecoding = false
                             ExperimentalFlags.enableBenchmark = false
@@ -2238,18 +2280,13 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         val wantNpu = accelerator == HardwareAccelerator.NPU ||
             (accelerator == HardwareAccelerator.AUTO && profile.hasHardwareNpu)
-        val modelAllowsNpu = llmChoice.supportsNpuBackend &&
-            (metadata.declaredTextBackends.isEmpty() || BackendType.NPU in metadata.declaredTextBackends)
+        // Always probe Backend.NPU(nativeLibraryDir) when wantNpu is true and the model supports NPU
+        // so LiteRT 2.3.2's bundled libLiteRtCompilerPlugin_{Qualcomm,MediaTek,google_tensor}.so and
+        // libLiteRtDispatch_*.so can compile/dispatch subgraphs onto Hexagon HTP / NeuroPilot / Tensor TPU
+        // even if static .litertlm metadata only listed CPU/GPU, falling back cleanly to GPU -> CPU if rejected.
+        val modelAllowsNpu = llmChoice.supportsNpuBackend
 
         if (wantNpu && modelAllowsNpu) {
-            list.add(
-                BackendCandidate(
-                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir),
-                    label = "${profile.vendor.displayName} (LiteRT NPU)",
-                    isNpu = true,
-                    enableMtp = false
-                )
-            )
             if (profile.vendor == NpuVendor.GOOGLE_TENSOR) {
                 list.add(
                     BackendCandidate(
@@ -2260,6 +2297,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     )
                 )
             }
+            list.add(
+                BackendCandidate(
+                    backend = Backend.NPU(nativeLibraryDir = nativeLibDir),
+                    label = "${profile.vendor.displayName} (LiteRT NPU)",
+                    isNpu = true,
+                    enableMtp = false
+                )
+            )
         }
 
         val modelAllowsGpu = metadata.declaredTextBackends.isEmpty() || BackendType.GPU in metadata.declaredTextBackends
