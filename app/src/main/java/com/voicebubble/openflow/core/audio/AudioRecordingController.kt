@@ -30,11 +30,15 @@ class AudioRecordingController {
         private const val SAMPLE_RATE = 16000
         // 40 ms read blocks (640 samples) keep pcmBuffer fresh without large blocking-read latency
         private const val READ_CHUNK_SHORTS = 640
-        // 75 ms post-tap grace window captures the final syllable still in flight when the user taps Stop mid-word,
-        // and is skipped entirely (0 ms) when the trailing 80 ms of audio is already silent.
-        private const val POST_STOP_TAIL_GRACE_MS = 75L
-        private const val TRAILING_SILENCE_CHECK_SAMPLES = 1_280 // 80 ms @ 16 kHz
-        private const val TRAILING_SPEECH_RMS_THRESHOLD = 0.008f
+        // 165 ms post-tap grace window captures both Android AudioFlinger/HAL mic latency (~90–130 ms) and any
+        // final syllable still in flight when the user taps Stop mid-word; 95 ms flushes HAL buffers when speech
+        // ended within the last 450 ms; 0 ms when the user already paused >= 450 ms before tapping Stop.
+        private const val POST_STOP_TAIL_GRACE_MS = 165L
+        private const val POST_STOP_HAL_FLUSH_MS = 95L
+        private const val TRAILING_SILENCE_CHECK_SAMPLES = 2_560 // 160 ms @ 16 kHz
+        private const val TRAILING_SPEECH_RMS_THRESHOLD = 0.0035f
+        private const val RECENT_SPEECH_WINDOW_SAMPLES = 7_200 // 450 ms @ 16 kHz
+        private const val RECENT_SPEECH_RMS_THRESHOLD = 0.0030f
         // Initial capacity: 15 seconds (240,000 floats = ~960 KB) — avoids repeated small allocations
         private const val INITIAL_CAPACITY_SAMPLES = SAMPLE_RATE * 15
         // Hard safety ceiling: 5 minutes at 16 kHz (4,800,000 floats = ~19.2 MB) to prevent unbounded RAM growth
@@ -63,6 +67,33 @@ class AudioRecordingController {
             }
             val rms = sqrt(sumSq / count).toFloat()
             return rms >= threshold
+        }
+
+        /**
+         * Computes the post-tap flush delay in milliseconds before calling `AudioRecord.stop()`:
+         * - `165 ms` when the trailing `160 ms` still contains active speech energy (mid-word Stop tap).
+         * - `95 ms` when speech occurred within the last `450 ms` (or clip `< 450 ms`) so final syllables
+         *   still traversing Android's AudioFlinger/DSP HAL pipeline reach `AudioRecord.read()` even if the
+         *   last `160 ms` sat inside a stop-consonant closure (`/p/`, `/t/`, `/k/`).
+         * - `0 ms` when the trailing `450 ms` is already completely silent.
+         */
+        internal fun computeStopFlushGraceMs(samples: FloatArray?, size: Int): Long {
+            if (samples == null || size <= 0) return 0L
+            if (hasTrailingSpeechEnergy(samples, size)) {
+                return POST_STOP_TAIL_GRACE_MS
+            }
+            val validSize = min(size, samples.size)
+            if (validSize < RECENT_SPEECH_WINDOW_SAMPLES ||
+                hasTrailingSpeechEnergy(
+                    samples = samples,
+                    size = validSize,
+                    windowSamples = RECENT_SPEECH_WINDOW_SAMPLES,
+                    threshold = RECENT_SPEECH_RMS_THRESHOLD
+                )
+            ) {
+                return POST_STOP_HAL_FLUSH_MS
+            }
+            return 0L
         }
     }
 
@@ -394,11 +425,11 @@ class AudioRecordingController {
             if (activeRecord?.state == AudioRecord.STATE_INITIALIZED &&
                 activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING
             ) {
-                val stillSpeakingAtStop = synchronized(bufferLock) {
-                    hasTrailingSpeechEnergy(pcmBuffer, pcmSize)
+                val graceMs = synchronized(bufferLock) {
+                    computeStopFlushGraceMs(pcmBuffer, pcmSize)
                 }
-                if (stillSpeakingAtStop) {
-                    delay(POST_STOP_TAIL_GRACE_MS)
+                if (graceMs > 0L) {
+                    delay(graceMs)
                 }
                 try {
                     activeRecord.stop()
@@ -415,7 +446,7 @@ class AudioRecordingController {
                 try {
                     val drainBuf = ShortArray(READ_CHUNK_SHORTS)
                     var drainLoops = 0
-                    while (drainLoops < 16) {
+                    while (drainLoops < 32) {
                         val drained = activeRecord.read(drainBuf, 0, drainBuf.size, AudioRecord.READ_NON_BLOCKING)
                         if (drained <= 0) break
                         appendSamplesToBuffer(drainBuf, drained)

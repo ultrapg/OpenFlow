@@ -56,6 +56,13 @@ internal const val LIVE_CUT_PAD_SAMPLES = 5_120
  */
 internal const val LIVE_CUT_LEAD_IN_SAMPLES = 3_200
 
+/**
+ * 150 ms acoustic micro-overlap retained only on forced non-pause live cuts (`usable >= maxChunk` when
+ * the speaker talked non-stop without a pause) so boundary syllables are never severed mid-phoneme;
+ * [stitchChunkTranscripts] automatically deduplicates any 1–2 word boundary overlap.
+ */
+internal const val FORCED_CUT_OVERLAP_SAMPLES = 2_400
+
 /** When a live buffer holds no speech at all, only this much trailing audio (1 s) is kept as lead-in context. */
 private const val LIVE_SILENCE_KEEP_SAMPLES = 16_000
 
@@ -253,9 +260,9 @@ internal fun hasUsableSpeech(
 /**
  * Sensitive speech check for the final post-cut `tail` when the user stops recording:
  * returns `true` if [samples] holds even a single short spoken syllable (`>= 4` frames / `80 ms` of
- * voiced energy above a sensitive floor), ensuring a soft final word at the end of a dictation
- * (`"now"`, `"off"`, `"it"`, `"ok"`) is never dropped while still skipping pure dead air or a
- * `<= 40 ms` finger-tap click (which can straddle at most 3 frames when unaligned).
+ * voiced energy above a sensitive floor), ensuring a fast 1-syllable final word at the end of a dictation
+ * (`"no"`, `"it"`, `"so"`, `"ja"`, `"ok"`) is never dropped while still skipping pure dead air or a
+ * brief `40 ms` finger-tap click straddling frame boundaries.
  */
 internal fun hasAnyTailSpeech(
     samples: FloatArray,
@@ -266,7 +273,7 @@ internal fun hasAnyTailSpeech(
     if (hasUsableSpeech(samples, silenceThreshold, minSpeechFrames = minFrames)) return true
     val rms = computeFrameRms(samples, 0, samples.size, CHUNK_FRAME_SAMPLES)
     if (rms.size < minFrames) return false
-    val floor = min(max(silenceThreshold * 0.30f, 0.0025f), 0.0045f)
+    val floor = min(max(silenceThreshold * 0.28f, 0.0020f), 0.0042f)
     var consecutive = 0
     for (r in rms) {
         if (r >= floor) {
@@ -503,7 +510,8 @@ internal fun findStreamingCut(
         val minPauseFrames = max(2, requiredPauseFrames(usable, config) / 2)
         val idx = findBestSplitPoint(samples, minChunk, usable, config.silenceThreshold, minPauseFrames, frame)
         val clamped = idx.coerceIn(minChunk, usable)
-        return StreamingCut(clamped, hasSpeech = true, resumeIndex = clamped)
+        val resumeAt = (clamped - FORCED_CUT_OVERLAP_SAMPLES).coerceIn(1, clamped)
+        return StreamingCut(clamped, hasSpeech = true, resumeIndex = resumeAt)
     }
     return null
 }

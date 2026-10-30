@@ -109,11 +109,15 @@ class SmartPipelineTest {
         assertTrue(defaultSettings.earEnabled)
         assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
         assertFalse("AI Post-Processing must be OFF by default", defaultSettings.gemmaEnabled)
-        assertFalse("Disable Model Thinking must be OFF by default", defaultSettings.gemmaDisableThinking)
+        assertTrue("Disable Model Thinking must be ON by default for LFM3 1.7B", defaultSettings.gemmaDisableThinking)
         assertEquals(
-            "Default selected LLM must be compact Qwen 3 0.6B",
-            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            "Default selected LLM must be Liquid AI LFM3 1.7B",
+            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
             defaultSettings.selectedLlmModel
+        )
+        assertFalse(
+            "High-end Gemma 4 E2B must keep thinking enabled by default",
+            ModelSettings(selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B).gemmaDisableThinking
         )
         assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
         assertEquals(
@@ -123,13 +127,13 @@ class SmartPipelineTest {
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
 
-        // Default LLM (Qwen 3 0.6B: 585 MB disk, +450 MB incremental RAM)
-        assertEquals(1900, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(1782, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
+        // Default LLM (Liquid AI LFM3 1.7B: 1,375 MB disk, +550 MB incremental RAM)
+        assertEquals(2000, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(2572, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
 
         // Punct is never loaded into RAM alongside an active LLM (zero double-loading)
-        assertEquals(1900, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(2064, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
+        assertEquals(2000, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(2854, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
 
         // Flagship Gemma 4 E2B (2,468 MB disk, +850 MB incremental RAM)
         val gemma4Settings = ModelSettings(
@@ -1536,13 +1540,13 @@ class SmartPipelineTest {
 
     @Test
     fun `LlmModelChoice catalog aligns with downloadable artifacts and optimizes prompts per model tier`() {
-        assertEquals(5, com.voicebubble.openflow.settings.LlmModelChoice.entries.size)
+        assertEquals(6, com.voicebubble.openflow.settings.LlmModelChoice.entries.size)
         assertEquals(
-            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
             com.voicebubble.openflow.settings.LlmModelChoice.fromId("unknown_model")
         )
         assertEquals(
-            com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
             com.voicebubble.openflow.settings.LlmModelChoice.fromId(null)
         )
 
@@ -1744,7 +1748,8 @@ class SmartPipelineTest {
     @Test
     fun `Pillar 2 adaptive smart thinking skips reasoning on fillers and numbers but enables on repairs and lists`() {
         val defaults = ModelSettings()
-        assertFalse("gemmaDisableThinking must remain false by default", defaults.gemmaDisableThinking)
+        assertTrue("Default LFM3 model must disable thinking by default", defaults.gemmaDisableThinking)
+        assertFalse("High-end Gemma 4 E2B keeps Adaptive Smart Thinking enabled by default", com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B.defaultDisableThinking)
         assertTrue("gemmaAdaptiveThinking must be enabled by default", defaults.gemmaAdaptiveThinking)
 
         // Everyday fillers + spoken numbers/times -> skip <think> (0 thought tokens!)
@@ -2729,5 +2734,108 @@ class SmartPipelineTest {
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
             )
         )
+    }
+
+    @Test
+    fun `Liquid AI LFM3 1_7B default model has thinking disabled by default and prefill_256 compact prompt`() {
+        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
+        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+
+        assertEquals("DEFAULT", lfm.badgeLabel)
+        assertTrue(lfm.supportsThinking)
+        assertTrue(lfm.defaultDisableThinking)
+        assertEquals("HIGH-END", gemma.badgeLabel)
+        assertFalse(gemma.defaultDisableThinking)
+
+        for (category in com.voicebubble.openflow.core.speech.AppContextCategory.entries) {
+            val lfmPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                disableThinking = lfm.defaultDisableThinking,
+                fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(appCategory = category),
+                llmChoice = lfm
+            )
+            assertTrue(
+                "LFM3 prompt for $category must stay compact (< 960 chars) to hit prefill_256, got ${lfmPrompt.length}",
+                lfmPrompt.length in 450..960
+            )
+            assertFalse(
+                "LFM3 default prompt with thinking disabled must not append reasoning hints",
+                lfmPrompt.contains("internal reasoning")
+            )
+        }
+
+        // LFM3 orphan </think> prefix, <tool_call> blocks, and <|startoftext|> / <|pad|> tokens strip cleanly
+        assertEquals(
+            "Meet Wednesday at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<|startoftext|>\n\n</think>\n\n<tool_call>{\"name\":\"noop\"}</tool_call>Meet Wednesday at 3:30 PM.<|im_end|><|pad|>",
+                fallbackInput = "meet wednesday at three thirty pm",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
+
+    @Test
+    fun `Pipeline spoken-text retention guards prevent sentence drops decimal splits and audio tail cutoffs`() {
+        // 1. Decimal & version numbers ("2.8.0", "42.5") are never split mid-number by partitionSentenceSieve
+        val multiSentenceWithVersions =
+            "We shipped version 2.8.0 to production this morning. Everything passed at 99.5% reliability across devices. Um let us schedule the next sync for tuesday wait no thursday at three thirty pm."
+        val sieveSpans = com.voicebubble.openflow.core.speech.GemmaTextProcessor.partitionSentenceSieve(
+            text = multiSentenceWithVersions,
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+        )
+        assertTrue("Expected non-null sieve spans for clean+dirty mix with decimals", sieveSpans != null)
+        assertEquals(2, sieveSpans!!.size)
+        assertFalse(sieveSpans[0].needsLlm)
+        assertTrue(sieveSpans[0].text.contains("2.8.0"))
+        assertTrue(sieveSpans[0].text.contains("99.5%"))
+        assertTrue(sieveSpans[1].needsLlm)
+
+        // 2. Anti-truncation guard recovers full transcript if LLM prematurely drops trailing sentence(s)
+        val fullSpoken =
+            "Hey Sarah I just finished testing the updated speech recognition pipeline on my Android phone. Please review the pull request before we publish the release tonight."
+        val truncatedByLlm =
+            "Hey Sarah, I just finished testing the updated speech recognition pipeline on my Android phone."
+        assertEquals(
+            fullSpoken,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = truncatedByLlm,
+                fallbackInput = fullSpoken,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Valid dense number/currency/date conversion is NOT falsely flagged as truncated
+        val spokenInvoice = com.voicebubble.openflow.settings.LlmBenchmarkSample.EXAMPLE_2_NUMBERS_DATES.sampleText
+        val formattedInvoice = "The total invoice comes out to \$4,250.75, due on November 24, 2026, at 5:00 PM."
+        assertEquals(
+            formattedInvoice,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = formattedInvoice,
+                fallbackInput = spokenInvoice,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // 3. 3-tier stop flush grace: 165ms active speech, 95ms recent speech (<450ms) HAL flush, 0ms >=450ms silence
+        val midWordStop = FloatArray(16_000) { 0.06f }
+        assertEquals(165L, com.voicebubble.openflow.core.audio.AudioRecordingController.computeStopFlushGraceMs(midWordStop, midWordStop.size))
+        val recentSpeech250msPause = FloatArray(16_000) { idx -> if (idx < 12_000) 0.08f else 0.001f }
+        assertEquals(95L, com.voicebubble.openflow.core.audio.AudioRecordingController.computeStopFlushGraceMs(recentSpeech250msPause, recentSpeech250msPause.size))
+        val longPause600ms = FloatArray(16_000) { idx -> if (idx < 6_400) 0.08f else 0.001f }
+        assertEquals(0L, com.voicebubble.openflow.core.audio.AudioRecordingController.computeStopFlushGraceMs(longPause600ms, longPause600ms.size))
+
+        // 4. Forced non-pause live cut retains 150ms micro-overlap & quiet 4-frame (80ms) tail speech is preserved
+        val nonStopSpeech = FloatArray(16 * 16_000 + 3_200) { 0.05f }
+        val cfg = com.voicebubble.openflow.settings.DictationChunkSettings()
+        val forcedCut = com.voicebubble.openflow.core.speech.findStreamingCut(nonStopSpeech, nonStopSpeech.size, cfg)
+        assertTrue(forcedCut != null && forcedCut.hasSpeech)
+        assertEquals(
+            com.voicebubble.openflow.core.speech.FORCED_CUT_OVERLAP_SAMPLES,
+            forcedCut!!.index - forcedCut.resumeIndex
+        )
+
+        val quiet80msSyllableTail = FloatArray(1_920) { idx -> if (idx in 320 until 1_600) 0.0024f else 0.0004f }
+        assertTrue(com.voicebubble.openflow.core.speech.hasAnyTailSpeech(quiet80msSyllableTail))
     }
 }

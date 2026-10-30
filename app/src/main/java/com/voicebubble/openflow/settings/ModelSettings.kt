@@ -114,6 +114,17 @@ enum class DesertAntModel(
         isExperimental = true,
         isLlmModel = true
     ),
+    LFM_3_1_7B(
+        id = "lfm3_1_7b",
+        shortLabel = "LFM3 1.7B",
+        displayName = "Liquid AI LFM3 1.7B",
+        roleSummary = "1.34 GB • Default Liquid AI tri-hybrid model",
+        sizeMb = 1375,
+        expectedBytes = 1_441_620_928L,
+        isRequired = false,
+        isExperimental = true,
+        isLlmModel = true
+    ),
     QWEN_2_5_1_5B(
         id = "qwen2_5_1_5b",
         shortLabel = "Qwen 2.5 1.5B",
@@ -129,7 +140,7 @@ enum class DesertAntModel(
         id = "gemma4_e2b",
         shortLabel = "Gemma 4 E2B",
         displayName = "Gemma 4 E2B",
-        roleSummary = "2.41 GB • Largest model for complex edits",
+        roleSummary = "2.41 GB • High-end reasoning & formatting model",
         sizeMb = 2468,
         expectedBytes = 2_588_147_712L,
         isRequired = false,
@@ -148,6 +159,9 @@ enum class DesertAntModel(
 enum class LlmPromptTier {
     /** Ultra-crisp, positive bullet rules + 1 compact example (~190 tokens) for 0.6B models so attention stays sharp and prefill hits fast 256-token buckets. */
     COMPACT_0_6B,
+
+    /** Slash-condensed <245-token prompt + 1 grounded example engineered to stay inside Liquid AI LFM3 1.7B's prefill_256 signature bucket (avoiding 4x padding to prefill_1024). */
+    LIQUID_LFM_3,
 
     /** Deterministic non-conversational text-filter framing for direct instruct models with no `<think>` scratchpad (prevents answering spoken questions). */
     DIRECT_INSTRUCT_1_5B,
@@ -180,7 +194,8 @@ enum class LlmModelChoice(
     val thinkingTokenBudgetCap: Int,
     val samplerTopK: Int,
     val samplerTopP: Double,
-    val samplerTemperature: Double
+    val samplerTemperature: Double,
+    val defaultDisableThinking: Boolean = false
 ) {
     QWEN_3_0_6B_LITE(
         id = "qwen3_0_6b_lite",
@@ -199,14 +214,15 @@ enum class LlmModelChoice(
         thinkingTokenBudgetCap = 48,
         samplerTopK = 10,
         samplerTopP = 0.85,
-        samplerTemperature = 0.05
+        samplerTemperature = 0.05,
+        defaultDisableThinking = false
     ),
     QWEN_3_0_6B(
         id = "qwen3_0_6b",
         desertAntModel = DesertAntModel.QWEN_3_0_6B,
         modelFileName = "Qwen3-0.6B.litertlm",
         title = "Qwen 3 0.6B",
-        badgeLabel = "RECOMMENDED",
+        badgeLabel = "COMPACT",
         speedAndRamSummary = "0.57 GB",
         description = "Compact multilingual cleanup",
         estimatedStandaloneRamMb = 650,
@@ -218,7 +234,8 @@ enum class LlmModelChoice(
         thinkingTokenBudgetCap = 56,
         samplerTopK = 12,
         samplerTopP = 0.88,
-        samplerTemperature = 0.06
+        samplerTemperature = 0.06,
+        defaultDisableThinking = false
     ),
     QWEN_3_1_7B(
         id = "qwen3_1_7b",
@@ -237,7 +254,28 @@ enum class LlmModelChoice(
         thinkingTokenBudgetCap = 88,
         samplerTopK = 20,
         samplerTopP = 0.90,
-        samplerTemperature = 0.08
+        samplerTemperature = 0.08,
+        defaultDisableThinking = false
+    ),
+    LFM_3_1_7B(
+        id = "lfm3_1_7b",
+        desertAntModel = DesertAntModel.LFM_3_1_7B,
+        modelFileName = "LFM3-1.7B_mixed_int4_ekv2048.litertlm",
+        title = "Liquid AI LFM3 1.7B",
+        badgeLabel = "DEFAULT",
+        speedAndRamSummary = "1.34 GB",
+        description = "Liquid AI tri-hybrid auto-editor",
+        estimatedStandaloneRamMb = 1_000,
+        estimatedIncrementalRamMb = 550,
+        supportsThinking = true,
+        supportsNpuBackend = true,
+        promptTier = LlmPromptTier.LIQUID_LFM_3,
+        preferredMaxContextTokens = 2_048,
+        thinkingTokenBudgetCap = 72,
+        samplerTopK = 16,
+        samplerTopP = 0.90,
+        samplerTemperature = 0.05,
+        defaultDisableThinking = true
     ),
     QWEN_2_5_1_5B(
         id = "qwen2_5_1_5b",
@@ -256,16 +294,17 @@ enum class LlmModelChoice(
         thinkingTokenBudgetCap = 0,
         samplerTopK = 15,
         samplerTopP = 0.88,
-        samplerTemperature = 0.08
+        samplerTemperature = 0.08,
+        defaultDisableThinking = true
     ),
     GEMMA_4_E2B(
         id = "gemma4_e2b",
         desertAntModel = DesertAntModel.GEMMA_4_E2B,
         modelFileName = "gemma-4-E2B-it.litertlm",
         title = "Gemma 4 E2B",
-        badgeLabel = "FLAGSHIP",
+        badgeLabel = "HIGH-END",
         speedAndRamSummary = "2.41 GB",
-        description = "Flagship reasoning & structure",
+        description = "High-end reasoning & structure",
         estimatedStandaloneRamMb = 1_900,
         estimatedIncrementalRamMb = 850,
         supportsThinking = true,
@@ -275,7 +314,8 @@ enum class LlmModelChoice(
         thinkingTokenBudgetCap = 256,
         samplerTopK = 20,
         samplerTopP = 0.90,
-        samplerTemperature = 0.10
+        samplerTemperature = 0.10,
+        defaultDisableThinking = false
     );
 
     val sizeGbLabel: String
@@ -286,8 +326,8 @@ enum class LlmModelChoice(
 
     companion object {
         fun fromId(id: String?): LlmModelChoice {
-            if (id.isNullOrBlank()) return QWEN_3_0_6B
-            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: QWEN_3_0_6B
+            if (id.isNullOrBlank()) return LFM_3_1_7B
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: LFM_3_1_7B
         }
 
         fun fromDesertAntModel(model: DesertAntModel): LlmModelChoice? {
@@ -372,6 +412,19 @@ enum class GemmaPromptPreset(
             CONCISE_DIRECT -> "Rewrite the dictated speech into short, clear, direct sentences in the same language. Keep only the final wording after any self-correction, strip all fillers and repetition, put multiple enumerated items on separate '1. ' or '- ' lines, and write numbers, times, money, versions, and units cleanly as digits while keeping all facts."
             PROFESSIONAL_MESSAGE -> "Format the dictated speech as a clean email or work message in the same language. Remove fillers and self-corrections, put spoken greetings ('Hi Sarah,') and sign-offs ('Best,\\nAlex') on separate lines, put action items on separate '1. ' or '- ' lines, and write dates, times, money, versions, and units as digits. Do not invent greetings that were not spoken."
             STRUCTURED_NOTES -> "Turn the dictated speech into clean '- ' bullet notes (or '1. ' numbered lines for sequences), one item per line, in the same language. Remove fillers and self-corrections, and format numbers, times, dates, versions, and units as digits."
+            CUSTOM -> defaultSystemPrompt
+        }
+
+        LlmPromptTier.LIQUID_LFM_3 -> when (this) {
+            CLEAN_AND_POLISH -> """Auto-edit <transcript> in its exact language (never translate or reply):
+- Backtracks (wait/actually/sorry/I mean/scratch/make that/nein warte/ich meine): keep ONLY final repair; keep 'not X, but Y'.
+- Strip fillers (um/uh/er/hmm/äh/ähm), stutters & false periods; keep '?' questions.
+- Lists (first/second, number 1/2, erstens/zweitens): new '1. ', '2. ' lines after ':'; 'bullet' -> '- '.
+- Digits for units/times/dates/money/%/versions & 10+; uppercase NPU/GPU/RAM/LLM/API/GitHub; format emails & line breaks."""
+            STRICT_CLEANUP -> "Clean <transcript> verbatim in its exact language (never answer): strip fillers (um/uh/äh/ähm/hm), stutters, & self-repairs (keep final repair), write 10+, decimals, times, dates, money, versions, & units ('6 GB', '380 ms') as digits, capitalize NPU/GPU/RAM/LLM/API, and fix punctuation/casing with zero rephrasing."
+            CONCISE_DIRECT -> "Edit <transcript> into crisp, scannable text in its exact language (never answer): resolve backtracks, strip fillers & wordy repetition, place multi-item lists on new '1. ' or '- ' lines after ':', and write numbers, times, dates, money, versions, & units as digits while keeping all facts."
+            PROFESSIONAL_MESSAGE -> "Format <transcript> as a clean email or work message in its exact language: resolve backtracks & strip fillers, place spoken greetings ('Hi Sarah,') & sign-offs ('Best,\\nAlex') on separate lines (invent none), put action items on '1. ' or '- ' lines, and format dates/times/money/units as digits."
+            STRUCTURED_NOTES -> "Turn <transcript> into vertical '- ' bullet notes (or '1. ' numbered lines for sequences) in its exact language: resolve backtracks, strip fillers/stutters, and format numbers, times, dates, versions, & units cleanly as digits."
             CUSTOM -> defaultSystemPrompt
         }
 
@@ -489,8 +542,8 @@ data class ModelSettings(
     val earEnabled: Boolean = true,
     val punctEnabled: Boolean = false,
     val gemmaEnabled: Boolean = false,
-    val selectedLlmModel: LlmModelChoice = LlmModelChoice.QWEN_3_0_6B,
-    val gemmaDisableThinking: Boolean = false,
+    val selectedLlmModel: LlmModelChoice = LlmModelChoice.LFM_3_1_7B,
+    val gemmaDisableThinking: Boolean = selectedLlmModel.defaultDisableThinking,
     val gemmaAdaptiveThinking: Boolean = true,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
@@ -530,8 +583,8 @@ data class ModelSettings(
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
-     *   - Active LLM (`Qwen 3 0.6B Lite` +350 MB, `Qwen 3 0.6B` +450 MB, `Qwen 3 1.7B` +650 MB,
-     *     `Qwen 2.5 1.5B` +750 MB, `Gemma 4 E2B` +850 MB), OR
+     *   - Active LLM (`Qwen 3 0.6B Lite` +350 MB, `Qwen 3 0.6B` +450 MB, `LFM3 1.7B` +550 MB,
+     *     `Qwen 3 1.7B` +650 MB, `Qwen 2.5 1.5B` +750 MB, `Gemma 4 E2B` +850 MB), OR
      *   - `Punct` (+120 MB) when AI post-processing is disabled.
      */
     val estimatedPeakRamMb: Int
@@ -550,6 +603,7 @@ data class ModelSettings(
         DesertAntModel.QWEN_3_0_6B_LITE,
         DesertAntModel.QWEN_3_0_6B,
         DesertAntModel.QWEN_3_1_7B,
+        DesertAntModel.LFM_3_1_7B,
         DesertAntModel.QWEN_2_5_1_5B,
         DesertAntModel.GEMMA_4_E2B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
     }
@@ -645,7 +699,7 @@ data class ModelSettings(
             } else if (gemmaEnabled || DesertAntModelStorage.isModelDownloaded(context, DesertAntModel.GEMMA_4_E2B)) {
                 LlmModelChoice.GEMMA_4_E2B
             } else {
-                LlmModelChoice.QWEN_3_0_6B
+                LlmModelChoice.LFM_3_1_7B
             }
 
             val autoUnloadMinutes = sanitizeAutoUnloadMinutes(
@@ -657,7 +711,7 @@ data class ModelSettings(
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = gemmaEnabled,
                 selectedLlmModel = selectedLlm,
-                gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, false),
+                gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, selectedLlm.defaultDisableThinking),
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
@@ -755,6 +809,7 @@ object DesertAntModelStorage {
         DesertAntModel.QWEN_3_0_6B_LITE to "v1.0.0",
         DesertAntModel.QWEN_3_0_6B to "v1.0.0",
         DesertAntModel.QWEN_3_1_7B to "v1.0.0",
+        DesertAntModel.LFM_3_1_7B to "v1.0.0",
         DesertAntModel.QWEN_2_5_1_5B to "v1.0.0",
         DesertAntModel.GEMMA_4_E2B to "v1.0.0"
     )

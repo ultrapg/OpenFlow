@@ -172,20 +172,20 @@ sealed interface SpanPatchResult {
 
 /**
  * Wispr Flow–style on-device formatting & auto-editing engine powered by selectable **LiteRT-LM**
- * models (`Qwen 3 0.6B Lite`, `Qwen 3 0.6B`, `Qwen 3 1.7B`, `Qwen 2.5 1.5B Instruct`, and
- * `Gemma 4 E2B`).
+ * models (`Liquid AI LFM3 1.7B` [Default], `Qwen 3 0.6B Lite`, `Qwen 3 0.6B`, `Qwen 3 1.7B`,
+ * `Qwen 2.5 1.5B Instruct`, and `Gemma 4 E2B` [High-End]).
  *
  * Key architectural guarantees:
  * 1. **Capability-Aware NPU / GPU / CPU Cascade:** Inspects `.litertlm` capabilities via `ModelInfo`
  *    so NPU-capable models prioritize Qualcomm Hexagon QNN, MediaTek NeuroPilot, and Google Tensor
- *    TPU while GPU/CPU-exported models go straight to OpenCL/Vulkan GPU + XNNPACK CPU with zero
- *    wasted init probes.
+ *    TPU while GPU/CPU-exported tri-hybrid models (`LFM3 1.7B`) go straight to OpenCL/Vulkan GPU +
+ *    XNNPACK CPU in `AUTO` mode with zero wasted init probes.
  * 2. **Per-Model Prompt & Sampler Optimization:** Tailors prompt density, few-shot grounding,
- *    reasoning budgets, and `SamplerConfig` to each model's parameter scale (`COMPACT_0_6B`,
- *    `DIRECT_INSTRUCT_1_5B`, `BALANCED_1_7B`, `FLAGSHIP_GEMMA_4`).
+ *    reasoning budgets, and `SamplerConfig` to each model's parameter scale & prefill buckets
+ *    (`LIQUID_LFM_3`, `COMPACT_0_6B`, `DIRECT_INSTRUCT_1_5B`, `BALANCED_1_7B`, `FLAGSHIP_GEMMA_4`).
  * 3. **Model-Safe Reasoning Control:** Passes `ThinkingConfig` / `enable_thinking` only to models
- *    that support thinking channels (`Qwen 3` / `Gemma 4`), keeping direct instruct models
- *    (`Qwen 2.5 1.5B Instruct`) pure zero-thought for instant first-token generation.
+ *    that support thinking channels (`LFM3` [off by default], `Qwen 3`, `Gemma 4`), keeping direct
+ *    instruct models (`Qwen 2.5 1.5B Instruct`) pure zero-thought for instant first-token generation.
  * 4. **RAM-Aware System-Prompt KV-Cache Pre-Warming (`prefillPrefaceOnInit = true`):** Holds at most
  *    one pre-prefilled standby `Conversation` while the user is speaking so `sendMessage` skips
  *    system-prompt prefill latency, while evicting immediately under memory pressure.
@@ -233,9 +233,14 @@ class GemmaTextProcessor(
         private val UNCLOSED_CHANNEL_REGEX = Regex("<\\|channel>.*$", setOf(RegexOption.DOT_MATCHES_ALL))
         private val THOUGHT_TAG_REGEX = Regex("<\\|?thought\\|?>.*?</\\|?thought\\|?>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val THINK_TAG_REGEX = Regex("<think>.*?</think>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val ORPHAN_CLOSE_THINK_PREFIX_REGEX = Regex("^.*?</think>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val UNCLOSED_THINK_TAG_REGEX = Regex("<think>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val TOOL_CALL_BLOCK_REGEX = Regex(
+            "(?:<tool_call>.*?</tool_call>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>)",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+        )
         private val SPECIAL_TURN_TOKENS_REGEX = Regex(
-            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|endoftext\\|>)"
+            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|endoftext\\|>|<\\|startoftext\\|>|<\\|pad\\|>)"
         )
         private val TRANSCRIPT_WRAPPER_REGEX = Regex("<transcript(?:\\s+[^>]*)?>\\s*(.*?)\\s*</transcript>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val STRAY_TRANSCRIPT_TAG_REGEX = Regex("</?transcript(?:\\s+[^>]*)?>", RegexOption.IGNORE_CASE)
@@ -352,11 +357,11 @@ class GemmaTextProcessor(
                 "un|deux|trois|quatre|cinq|uno|dos|tres|cuatro|cinco|" +
                 "first|second|third|fourth|fifth|erstens|zweitens|drittens|viertens|" +
                 "percent|prozent|dollar|dollars|euro|euros|cents|point|punkt|komma|dot|slash|colon|semicolon|bullet|dash|hyphen|underscore|klammeraffe|uhr|" +
-                "gb|mb|kb|tb|ms|khz|mhz|ghz|hz|version)\\b|\\b\\d+\\s*(?:am|pm|a\\.m\\.|p\\.m\\.|percent|prozent|gb|mb|kb|ms|khz|hz)\\b",
+                "gb|mb|kb|tb|ms|khz|mhz|ghz|hz|version(?!\\s+\\d))\\b|\\b\\d+\\s*(?:am|pm|a\\.m\\.|p\\.m\\.|percent|prozent|gb|mb|kb|ms|khz|hz)\\b",
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val LOWERCASE_TECH_ACRONYM_REGEX = Regex(
-            pattern = "\\b(?:npu|gpu|cpu|ram|llm|llms|api|apis|json|sql|usb|sdk|apk|ios|ui|ux|http|https|url|cli|ssh|jwt|oauth|html|css|github|gitlab|openai|gemma|qwen)\\b"
+            pattern = "\\b(?:npu|gpu|cpu|ram|llm|llms|lfm|lfm3|api|apis|json|sql|usb|sdk|apk|ios|ui|ux|http|https|url|cli|ssh|jwt|oauth|html|css|github|gitlab|openai|gemma|qwen)\\b"
         )
         private val BROKEN_PAUSE_PERIOD_REGEX = Regex(
             pattern = "(?:\\.[ \\t]+(?:[a-zäöüß]|(?:and|but|or|so|because|und|oder|aber|denn|weil)\\b)|[,;:.!?]{2,}(?<!\\.\\.\\.))"
@@ -374,8 +379,32 @@ class GemmaTextProcessor(
                 "|\\b(?:bullet\\s+point|dash\\s+item|numbered\\s+list)\\b)",
             options = setOf(RegexOption.IGNORE_CASE)
         )
-        private val SENTENCE_TOKENIZE_REGEX = Regex("[^.!?…\\n]+(?:[.!?…]+|$)")
+        // Disjoint lookahead keeps decimals & version numbers (e.g. "42.5", "2.8.0", "2.10") intact inside their sentence
+        private val SENTENCE_TOKENIZE_REGEX = Regex("(?:[^.!?…\\n]|\\.(?=\\d))+(?:[.!?…]+|$)")
         private val PATCH_ARROW_SPLIT_REGEX = Regex("\\s*=>\\s*")
+        private val LEXICAL_ANCHOR_WORD_REGEX = Regex("\\p{L}{4,}")
+        private val OUTPUT_WORD_TOKEN_REGEX = Regex("\\p{L}{3,}")
+
+        private val TRUNCATION_IGNORED_WORDS = setOf(
+            "uhmm", "uhhh", "ummm", "ehrm", "ähmm", "öhmm",
+            "like", "literally", "basically", "actually", "honestly", "sozusagen", "quasi", "irgendwie",
+            "know", "sort", "kind", "guess", "mean",
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+            "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion",
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+            "twelfth", "twentieth", "thirtieth",
+            "null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun", "zehn",
+            "elf", "zwölf", "dreizehn", "vierzehn", "fünfzehn", "sechzehn", "siebzehn", "achtzehn", "neunzehn",
+            "zwanzig", "dreißig", "vierzig", "fünfzig", "sechzig", "siebzig", "achtzig", "neunzig", "hundert", "tausend", "millionen",
+            "erstens", "zweitens", "drittens", "viertens", "fünftens",
+            "number", "point", "item", "bullet", "dash", "colon", "semicolon", "comma", "period", "question", "exclamation",
+            "slash", "hyphen", "underscore", "paragraph", "line", "break", "next",
+            "absatz", "zeile", "zeilenumbruch", "neuer", "neue", "nächster", "punkt", "komma", "doppelpunkt", "gedankenstrich", "klammeraffe", "unterstrich", "bindestrich",
+            "percent", "prozent", "dollar", "dollars", "cent", "cents", "euro", "euros",
+            "megabyte", "megabytes", "gigabyte", "gigabytes", "kilobyte", "kilobytes", "terabyte", "terabytes",
+            "millisecond", "milliseconds", "seconds", "minute", "minutes", "hour", "hours", "token", "tokens", "version"
+        )
 
         private val NON_EMAIL_LOCAL_WORDS = setOf(
             "it", "this", "that", "them", "us", "me", "you", "him", "her", "we", "they", "i",
@@ -763,6 +792,78 @@ class GemmaTextProcessor(
 
             val normalizedLang = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
             val langName = normalizedLang?.let { LANGUAGE_NAMES_EN[it] }
+            val cleanedVocab = customVocabulary
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+                .take(40)
+            val cleanPrecedingTail = if (preset != GemmaPromptPreset.CUSTOM) {
+                precedingSegmentTail?.trim()?.takeIf { it.isNotEmpty() }
+            } else {
+                null
+            }
+
+            // Ultra-compact (<245 tokens including ChatML tags) prompt path engineered specifically for
+            // Liquid AI LFM3 1.7B's prefill_256 bucket (avoiding LFM3's missing-512 cliff to prefill_1024).
+            if (tier == LlmPromptTier.LIQUID_LFM_3 && preset != GemmaPromptPreset.CUSTOM) {
+                val lfmAppHint = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
+                    when (fieldContext.appCategory) {
+                        AppContextCategory.PERSONAL_MESSAGING -> "App: Chat (relaxed, no email greetings/sign-offs)."
+                        AppContextCategory.WORK_MESSAGING -> "App: Work chat (direct, keep @mentions/#channels)."
+                        AppContextCategory.EMAIL -> "App: Email (separate spoken greeting/sign-off lines; invent none)."
+                        AppContextCategory.CODE_AND_DEV -> "App: Code/CLI (keep --flags, files, v2.8.0, camelCase/snake_case)."
+                        AppContextCategory.NOTES_AND_DOCS -> "App: Notes/Docs (clean paragraphs & '1. '/' - ' lists)."
+                        AppContextCategory.GENERAL -> null
+                    }
+                } else {
+                    null
+                }
+                val lfmCursorHint = if (cleanPrecedingTail == null) {
+                    when {
+                        fieldContext.continuingNumberedListFrom != null ->
+                            "Cursor below list #${fieldContext.continuingNumberedListFrom}: continue at ${fieldContext.continuingNumberedListFrom + 1}."
+                        fieldContext.isContinuingBulletList ->
+                            "Cursor below '- ' bullet: continue with '- '."
+                        else -> null
+                    }
+                } else {
+                    null
+                }
+                return buildString {
+                    appendLine(resolvedTask)
+                    if (lfmAppHint != null) appendLine(lfmAppHint)
+                    if (lfmCursorHint != null) appendLine(lfmCursorHint)
+                    if (cleanPrecedingTail != null) {
+                        appendLine("PrevTail (context only, NEVER repeat): \"$cleanPrecedingTail\"")
+                    }
+                    if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
+                        if (normalizedLang == "de") {
+                            appendLine("Example: <transcript lang=\"de\" language=\"German\">ähm hallo lukas am dienstag nein warte mittwoch um fünfzehn uhr dreißig zwei punkte erstens npu unter fünfhundert ms testen zweitens sechs gb ram prüfen</transcript> ->")
+                            appendLine("Hallo Lukas, am Mittwoch um 15:30 Uhr zwei Punkte:")
+                            appendLine("1. NPU unter 500 ms testen")
+                            appendLine("2. 6 GB RAM prüfen")
+                        } else {
+                            appendLine("Example: <transcript>um hey alex meet tuesday wait no wednesday at three thirty pm for two things first test npu under five hundred ms second check six gb ram</transcript> ->")
+                            appendLine("Hey Alex, meet Wednesday at 3:30 PM for two things:")
+                            appendLine("1. Test NPU under 500 ms")
+                            appendLine("2. Check 6 GB RAM")
+                        }
+                    }
+                    append("Rule: Output ONLY edited text (no tags, quotes, fences, or chatter).")
+                    if (langName != null) {
+                        append(" Language: $langName [$normalizedLang].")
+                    } else if (normalizedLang != null) {
+                        append(" Language: $normalizedLang.")
+                    }
+                    if (cleanedVocab.isNotEmpty()) {
+                        append(" Vocab: ${cleanedVocab.joinToString(", ")}.")
+                    }
+                    if (!effectiveDisableThinking) {
+                        append(" Keep internal reasoning under 15 words.")
+                    }
+                }
+            }
+
             val langHint = when {
                 langName != null -> " (detected spoken language: $langName [$normalizedLang])"
                 normalizedLang != null -> " (detected spoken language code: $normalizedLang)"
@@ -776,12 +877,6 @@ class GemmaTextProcessor(
             } else {
                 "CRITICAL: Keep the exact same language as the input transcript$langHint. Reference examples illustrate formatting mechanics only — Never translate into another language."
             }
-
-            val cleanedVocab = customVocabulary
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-                .take(40)
 
             val appContextDirective = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                 if (tier == LlmPromptTier.COMPACT_0_6B) {
@@ -829,14 +924,8 @@ class GemmaTextProcessor(
                 null
             }
 
-            val cleanPrecedingTail = if (preset != GemmaPromptPreset.CUSTOM) {
-                precedingSegmentTail?.trim()?.takeIf { it.isNotEmpty() }
-            } else {
-                null
-            }
-
             val roleHeader = when (tier) {
-                LlmPromptTier.COMPACT_0_6B ->
+                LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 ->
                     "You are an on-device speech-to-text cleanup and formatting filter."
                 LlmPromptTier.DIRECT_INSTRUCT_1_5B ->
                     "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
@@ -865,7 +954,7 @@ class GemmaTextProcessor(
                 if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                     appendLine()
                     when (tier) {
-                        LlmPromptTier.COMPACT_0_6B -> {
+                        LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 -> {
                             // Single high-density example keeps total prompt <240 tokens for fast prefill_seq_256
                             appendLine("EXAMPLE:")
                             if (normalizedLang == "de") {
@@ -1038,7 +1127,7 @@ class GemmaTextProcessor(
             val maxBaseCap = when {
                 maxContextTokens >= 4_096 -> 1_280
                 maxContextTokens >= 2_048 -> 896
-                else -> 384
+                else -> 448
             }
             val baseTokens = (approxWords * multiplier + 96).coerceIn(96, maxBaseCap)
             if (effectiveDisableThinking) {
@@ -1050,7 +1139,7 @@ class GemmaTextProcessor(
                 else -> 192
             }
             val tierHeadroomCap = when (llmChoice.promptTier) {
-                LlmPromptTier.COMPACT_0_6B -> 192
+                LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 -> 192
                 LlmPromptTier.DIRECT_INSTRUCT_1_5B -> 0
                 LlmPromptTier.BALANCED_1_7B -> 320
                 LlmPromptTier.FLAGSHIP_GEMMA_4 -> 640
@@ -1084,12 +1173,14 @@ class GemmaTextProcessor(
                 .replace("\r\n", "\n")
                 .replace('\r', '\n')
 
-            // 1. Strip Gemma 4 thinking channels & Qwen 3 <think> blocks (closed or truncated)
+            // 1. Strip Gemma 4 thinking channels, Qwen 3 / LFM3 <think> blocks (closed, orphan-closed, or truncated) & tool calls
             text = text.replace(CHANNEL_BLOCK_REGEX, "")
             text = text.replace(UNCLOSED_CHANNEL_REGEX, "")
             text = text.replace(THOUGHT_TAG_REGEX, "")
             text = text.replace(THINK_TAG_REGEX, "")
+            text = text.replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
             text = text.replace(UNCLOSED_THINK_TAG_REGEX, "")
+            text = text.replace(TOOL_CALL_BLOCK_REGEX, "")
             text = text.replace(SPECIAL_TURN_TOKENS_REGEX, "")
             text = text.trim()
 
@@ -1143,7 +1234,7 @@ class GemmaTextProcessor(
                 return trimmedFallback
             }
 
-            // 8. Guard against unprompted AI assistant persona / capability-refusal hallucinations and runaway loops
+            // 8. Guard against unprompted AI assistant persona / capability-refusal hallucinations, runaway loops & premature truncation
             if (preset != GemmaPromptPreset.CUSTOM) {
                 if (looksLikeUnpromptedAssistantRefusal(text, trimmedFallback)) {
                     return trimmedFallback
@@ -1152,9 +1243,78 @@ class GemmaTextProcessor(
                 if (text.length > maxReasonableChars) {
                     return trimmedFallback
                 }
+                if (isSuspiciouslyTruncatedOutput(text, trimmedFallback, preset)) {
+                    return preNormalizeSpokenConstructs(trimmedFallback, preset).ifBlank { trimmedFallback }
+                }
             }
 
             return text
+        }
+
+        /**
+         * Detects when an on-device LLM prematurely emits `<|im_end|>` / `<|eos|>` mid-dictation or silently
+         * drops spoken sentences on non-summarizing presets ([GemmaPromptPreset.CLEAN_AND_POLISH] /
+         * [GemmaPromptPreset.STRICT_CLEANUP]) when the speaker did NOT utter any self-correction / backtrack cue.
+         */
+        internal fun isSuspiciouslyTruncatedOutput(
+            output: String,
+            fallbackInput: String,
+            preset: GemmaPromptPreset
+        ): Boolean {
+            if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
+                return false
+            }
+            val preNormalized = preNormalizeSpokenConstructs(fallbackInput, preset)
+            if (preNormalized.isEmpty()) return false
+            if (BACKTRACK_TRIGGER_REGEX.containsMatchIn(preNormalized)) {
+                return false
+            }
+
+            val anchors = ArrayList<String>()
+            var prevWord = ""
+            for (match in LEXICAL_ANCHOR_WORD_REGEX.findAll(preNormalized)) {
+                val lower = match.value.lowercase(Locale.ROOT)
+                if (lower == prevWord) continue
+                prevWord = lower
+                if (lower !in TRUNCATION_IGNORED_WORDS) {
+                    anchors.add(lower)
+                }
+            }
+            if (anchors.size < 10) return false
+
+            val outputLower = output.lowercase(Locale.ROOT)
+            val outputWords = HashSet<String>()
+            val outputStem4 = HashSet<String>()
+            for (match in OUTPUT_WORD_TOKEN_REGEX.findAll(outputLower)) {
+                val w = match.value
+                outputWords.add(w)
+                if (w.length >= 4) {
+                    outputStem4.add(w.substring(0, 4))
+                }
+            }
+
+            fun isAnchorPreserved(anchor: String): Boolean {
+                if (anchor in outputWords) return true
+                if (anchor.substring(0, 4) in outputStem4) return true
+                return outputLower.contains(anchor)
+            }
+
+            var preservedCount = 0
+            for (anchor in anchors) {
+                if (isAnchorPreserved(anchor)) {
+                    preservedCount++
+                }
+            }
+            if (preservedCount * 100 < anchors.size * 45) {
+                return true
+            }
+
+            val tailAnchors = anchors.takeLast(4)
+            if (tailAnchors.size == 4 && tailAnchors.none { isAnchorPreserved(it) }) {
+                return true
+            }
+
+            return false
         }
 
         private fun stripEchoedPrecedingContext(
@@ -1759,7 +1919,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 .replace(UNCLOSED_CHANNEL_REGEX, "")
                 .replace(THOUGHT_TAG_REGEX, "")
                 .replace(THINK_TAG_REGEX, "")
+                .replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
                 .replace(UNCLOSED_THINK_TAG_REGEX, "")
+                .replace(TOOL_CALL_BLOCK_REGEX, "")
                 .replace(SPECIAL_TURN_TOKENS_REGEX, "")
                 .trim()
 
@@ -2278,8 +2440,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         val list = mutableListOf<BackendCandidate>()
 
+        val hasCustomNpuModelFile = modelFile.name != llmChoice.modelFileName
+        val isCpuGpuOnlyTriHybridInAuto = accelerator == HardwareAccelerator.AUTO &&
+            llmChoice == LlmModelChoice.LFM_3_1_7B &&
+            !hasCustomNpuModelFile &&
+            metadata.declaredTextBackends.isNotEmpty() &&
+            BackendType.NPU !in metadata.declaredTextBackends
         val wantNpu = accelerator == HardwareAccelerator.NPU ||
-            (accelerator == HardwareAccelerator.AUTO && profile.hasHardwareNpu)
+            (accelerator == HardwareAccelerator.AUTO && profile.hasHardwareNpu && !isCpuGpuOnlyTriHybridInAuto)
         // Always probe Backend.NPU(nativeLibraryDir) when wantNpu is true and the model supports NPU
         // so LiteRT 2.3.2's bundled libLiteRtCompilerPlugin_{Qualcomm,MediaTek,google_tensor}.so and
         // libLiteRtDispatch_*.so can compile/dispatch subgraphs onto Hexagon HTP / NeuroPilot / Tensor TPU
@@ -4012,18 +4180,20 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             .replace(UNCLOSED_CHANNEL_REGEX, "")
             .replace(THOUGHT_TAG_REGEX, "")
             .replace(THINK_TAG_REGEX, "")
+            .replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
             .replace(UNCLOSED_THINK_TAG_REGEX, "")
+            .replace(TOOL_CALL_BLOCK_REGEX, "")
             .replace(SPECIAL_TURN_TOKENS_REGEX, "")
             .isBlank()
     }
 
     private fun inspectAppLabelForLog(systemInstructionText: String): String {
         return when {
-            systemInstructionText.contains("Email Composer") || systemInstructionText.contains("app=email") -> "email"
+            systemInstructionText.contains("Email Composer") || systemInstructionText.contains("App: Email") || systemInstructionText.contains("app=email") -> "email"
             systemInstructionText.contains("Work Chat") || systemInstructionText.contains("Work chat") || systemInstructionText.contains("app=work_messaging") -> "work_chat"
-            systemInstructionText.contains("Personal Messaging") || systemInstructionText.contains("Chat message") || systemInstructionText.contains("app=personal_messaging") -> "personal_chat"
-            systemInstructionText.contains("Code / Developer") || systemInstructionText.contains("app=code_and_dev") -> "code"
-            systemInstructionText.contains("Notes / Document") || systemInstructionText.contains("app=notes_and_docs") -> "notes"
+            systemInstructionText.contains("Personal Messaging") || systemInstructionText.contains("Chat message") || systemInstructionText.contains("App: Chat") || systemInstructionText.contains("app=personal_messaging") -> "personal_chat"
+            systemInstructionText.contains("Code / Developer") || systemInstructionText.contains("App: Code/CLI") || systemInstructionText.contains("app=code_and_dev") -> "code"
+            systemInstructionText.contains("Notes / Document") || systemInstructionText.contains("App: Notes/Docs") || systemInstructionText.contains("app=notes_and_docs") -> "notes"
             else -> "general"
         }
     }

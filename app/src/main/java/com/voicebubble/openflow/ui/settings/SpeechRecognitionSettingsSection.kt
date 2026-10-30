@@ -188,7 +188,18 @@ fun SpeechRecognitionSettingsSection(
                     if (model.isLlmModel) {
                         ModelDownloadManager.cancelAllLlmAutoEnables()
                         val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: settings.selectedLlmModel
-                        persistAndReload(settings.copy(gemmaEnabled = true, selectedLlmModel = llmChoice))
+                        val nextDisableThinking = if (llmChoice != settings.selectedLlmModel) {
+                            llmChoice.defaultDisableThinking
+                        } else {
+                            settings.gemmaDisableThinking
+                        }
+                        persistAndReload(
+                            settings.copy(
+                                gemmaEnabled = true,
+                                selectedLlmModel = llmChoice,
+                                gemmaDisableThinking = nextDisableThinking
+                            )
+                        )
                     } else {
                         val updated = when (model) {
                             DesertAntModel.EAR -> settings.copy(earEnabled = true)
@@ -200,9 +211,20 @@ fun SpeechRecognitionSettingsSection(
                 } else {
                     if (model.isLlmModel) {
                         val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: settings.selectedLlmModel
+                        val nextDisableThinking = if (llmChoice != settings.selectedLlmModel) {
+                            llmChoice.defaultDisableThinking
+                        } else {
+                            settings.gemmaDisableThinking
+                        }
                         ModelDownloadManager.cancelAllLlmAutoEnables(keepModel = model)
                         // Immediately unload any previously active LLM while downloading the newly chosen model
-                        persistAndReload(settings.copy(gemmaEnabled = false, selectedLlmModel = llmChoice))
+                        persistAndReload(
+                            settings.copy(
+                                gemmaEnabled = false,
+                                selectedLlmModel = llmChoice,
+                                gemmaDisableThinking = nextDisableThinking
+                            )
+                        )
                     }
                     // Settings Toggle-On Background Resumable Download Flow (supports queuing multiple models)
                     ModelDownloadManager.startQueue(
@@ -226,7 +248,12 @@ fun SpeechRecognitionSettingsSection(
             downloadState.pendingAutoEnableModels.any { it.isLlmModel }
         if (!anyLlmActiveOrPending) {
             if (settings.selectedLlmModel != choice) {
-                persistAndReload(settings.copy(selectedLlmModel = choice))
+                persistAndReload(
+                    settings.copy(
+                        selectedLlmModel = choice,
+                        gemmaDisableThinking = choice.defaultDisableThinking
+                    )
+                )
             }
         } else {
             // Switching models while AI Post-Processing is enabled (or downloading):
@@ -646,7 +673,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3b. AI Post-Processing & Reformatting (5 Selectable Local LLMs • Smart Single-Model RAM)
+        // 3b. AI Post-Processing & Reformatting (6 Selectable Local LLMs • Smart Single-Model RAM)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -785,10 +812,13 @@ fun SpeechRecognitionSettingsSection(
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            text = if (supportsThinking) {
-                                "Skips ${selectedLlm.title}'s reasoning step for direct output. Off by default."
-                            } else {
-                                "${selectedLlm.title} is a direct non-thinking model."
+                            text = when {
+                                !supportsThinking ->
+                                    "${selectedLlm.title} is a direct non-thinking model."
+                                selectedLlm.defaultDisableThinking ->
+                                    "Skips ${selectedLlm.title}'s reasoning step for fast direct output. On by default."
+                                else ->
+                                    "Skips ${selectedLlm.title}'s reasoning step for direct output. Off by default."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1324,20 +1354,20 @@ private fun LlmModelOptionCard(
                     Spacer(modifier = Modifier.width(6.dp))
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = if (choice == LlmModelChoice.QWEN_3_0_6B) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.secondaryContainer
+                        color = when (choice) {
+                            LlmModelChoice.LFM_3_1_7B -> MaterialTheme.colorScheme.primaryContainer
+                            LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.tertiaryContainer
+                            else -> MaterialTheme.colorScheme.secondaryContainer
                         }
                     ) {
                         Text(
                             text = choice.badgeLabel,
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
-                            color = if (choice == LlmModelChoice.QWEN_3_0_6B) {
-                                MaterialTheme.colorScheme.onPrimaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.onSecondaryContainer
+                            color = when (choice) {
+                                LlmModelChoice.LFM_3_1_7B -> MaterialTheme.colorScheme.onPrimaryContainer
+                                LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.onTertiaryContainer
+                                else -> MaterialTheme.colorScheme.onSecondaryContainer
                             },
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )

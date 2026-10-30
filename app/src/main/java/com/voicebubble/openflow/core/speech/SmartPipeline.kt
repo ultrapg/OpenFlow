@@ -625,7 +625,8 @@ class SmartPipeline(
                     (needsPunct && punctRestorer != null)
                 val isCompactPostProc = needsPunct ||
                     activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B_LITE ||
-                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B
+                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B ||
+                    activeSnap.selectedLlmModel == LlmModelChoice.LFM_3_1_7B
                 targetPostProcOverlapMs = when {
                     postProcAlreadyLoaded -> 0L // Prewarm system-prompt KV cache immediately while user starts speaking!
                     isCompactPostProc -> FAST_POST_PROC_OVERLAP_MS
@@ -1088,12 +1089,12 @@ class SmartPipeline(
     ): String = withContext(Dispatchers.Default) {
         if (samples.isEmpty()) return@withContext ""
 
-        // Fast silence trim before acquiring native sessions (uses a whisper-sensitive 0.0020f floor and 400 ms
+        // Fast silence trim before acquiring native sessions (uses a whisper-sensitive 0.0018f floor and 500 ms
         // margin so soft trailing fricatives/plosives at the end of a dictation are never clipped).
         var trimmedSamplesRef: FloatArray? = trimLeadingAndTrailingSilence(
             samples = samples,
-            threshold = 0.0020f,
-            padSamples = 6_400
+            threshold = 0.0018f,
+            padSamples = 8_000
         )
         val initialTrimmed = trimmedSamplesRef
         if (initialTrimmed == null || initialTrimmed.isEmpty()) return@withContext ""
@@ -1198,13 +1199,16 @@ class SmartPipeline(
                     }
 
                     val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
+                    // Full Parakeet TDT Conformer padding (320 ms lead + 640 ms tail + 1.60 s minimum) ensures
+                    // 8 frames of TDT right-context lookahead and full 31-frame depthwise conv support so final
+                    // words and short 1–2 word utterances are never withheld or truncated.
                     val preparedChunk = prepareChunkForInference(
                         samples = rawChunk,
-                        minLeadSilencePadSamples = 2_560,
-                        minTailSilencePadSamples = 5_120,
-                        minTotalSamples = 16_000,
+                        minLeadSilencePadSamples = 5_120,
+                        minTailSilencePadSamples = 10_240,
+                        minTotalSamples = 25_600,
                         edgeFadeSamples = 160,
-                        silenceThreshold = 0.0020f
+                        silenceThreshold = 0.0018f
                     )
                     val conditionedChunk = conditionAudioWhenClearDisabled(
                         samples = preparedChunk,

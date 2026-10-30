@@ -247,11 +247,11 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        // On-Device AI Post-Processing (Off by default; defaults to Qwen 3 0.6B 585 MB)
+                        // On-Device AI Post-Processing (Off by default; defaults to Liquid AI LFM3 1.7B)
                         val onboardingLlm = configuredSettings.selectedLlmModel
                         OnboardingModelRow(
                             title = "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)",
-                            subtitle = "${onboardingLlm.description} (5 AI models selectable in Settings)",
+                            subtitle = "${onboardingLlm.description} (6 AI models selectable in Settings)",
                             checked = gemmaSelected,
                             enabled = true,
                             isLocked = false,

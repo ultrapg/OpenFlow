@@ -1002,6 +1002,10 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             // Fast (<2ms, zero-BFS) pin of the currently focused editable field
                             TextInjectionAccessibilityService.getSharedInstance()?.captureTargetNodeForDictation()
 
+                            // Start overlapping Ear + Voz + LFM3/LLM preparation immediately at t = 0 ms in parallel
+                            // with AudioRecord Binder initialization on Dispatchers.IO
+                            smartPipeline.onRecordingStartedAsync()
+
                             // "Transcribe while recording": create the session now, start it before the mic so a very
                             // quick stop-tap can never race a not-yet-started session (poller just sees an empty buffer)
                             streamingSession?.cancel()
@@ -1040,11 +1044,6 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                             android.widget.Toast.LENGTH_SHORT
                                         ).show()
                                     }
-                                } else if (recordingCycleId.get() == cycleId &&
-                                    bubbleState.value == OverlayBubbleState.RECORDING
-                                ) {
-                                    // Load Ear + Voz immediately once AudioRecord is actively capturing
-                                    smartPipeline.onRecordingStartedAsync()
                                 }
                             }
                         },

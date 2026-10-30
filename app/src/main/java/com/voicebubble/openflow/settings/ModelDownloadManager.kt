@@ -278,6 +278,16 @@ object ModelDownloadManager {
                 )
             )
             ),
+        DesertAntModel.LFM_3_1_7B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "LFM3-1.7B_mixed_int4_ekv2048.litertlm",
+                    sizeBytes = 1_441_620_928L,
+                    sha256 = "0400d8ffdb00e4bbe1209120e2c7baf05322a8c900839b0a94cc28f599011196",
+                    downloadUrl = "https://huggingface.co/litert-community/LFM3-1.7B-LiteRT/resolve/main/LFM3-1.7B_mixed_int4_ekv2048.litertlm"
+                )
+            )
+            ),
         DesertAntModel.QWEN_2_5_1_5B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
@@ -375,9 +385,15 @@ object ModelDownloadManager {
                 model == DesertAntModel.PUNCT -> current.copy(punctEnabled = true)
                 model.isLlmModel -> {
                     val llmChoice = LlmModelChoice.fromDesertAntModel(model) ?: current.selectedLlmModel
+                    val nextDisableThinking = if (llmChoice != current.selectedLlmModel) {
+                        llmChoice.defaultDisableThinking
+                    } else {
+                        current.gemmaDisableThinking
+                    }
                     current.copy(
                         gemmaEnabled = true,
-                        selectedLlmModel = llmChoice
+                        selectedLlmModel = llmChoice,
+                        gemmaDisableThinking = nextDisableThinking
                     )
                 }
                 else -> current
