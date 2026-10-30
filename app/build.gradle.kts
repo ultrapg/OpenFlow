@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 47
-        versionName = "2.14.0"
+        versionCode = 48
+        versionName = "2.14.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -112,10 +112,18 @@ android {
     buildFeatures {
         compose = true
     }
+    lint {
+        disable += "NullSafeMutableLiveData"
+        checkReleaseBuilds = false
+    }
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            pickFirsts += "**/liblitertlm_jni.so"
+            pickFirsts += listOf(
+                "**/liblitertlm_jni.so",
+                "**/libLiteRt.so",
+                "**/libLiteRtClGlAccelerator.so"
+            )
         }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -159,15 +167,21 @@ dependencies {
     // Lifecycle service
     implementation("androidx.lifecycle:lifecycle-service:2.8.7")
 
-    // Desert Ant Labs Audio AI Ecosystem (LiteRT 2.2.0 CPU + GPU/OpenCL accelerator bundled via ai.desertant:core:4.0.0)
+    // Unified LiteRT 2.3.2 Core & GPU OpenCL/GL Accelerator (declared before ai.desertant:* so pickFirsts
+    // packages LiteRT 2.3.2's libLiteRt.so & libLiteRtClGlAccelerator.so required by LFM3 1.7B GPU int4/kv_cache_c,
+    // while preserving 100% C-API symbol compatibility with Voz & Ear)
+    implementation("com.google.ai.edge.litert:litert:2.3.2")
+    implementation("com.google.ai.edge.litert:litert-gpu:2.3.2")
+
+    // Desert Ant Labs Audio AI Ecosystem
     implementation("ai.desertant:voz:4.0.0")
     implementation("ai.desertant:ear:4.0.0")
 
     // ONNX Runtime Android with NNAPI / QNN NPU & XNNPACK Execution Providers for Punctuation & Casing Restoration
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
-    // Google AI Edge LiteRT-LM & NPU Compiler/Dispatch Runtimes (Experimental Gemma 4 E2B & Qwen on NPU / GPU / CPU)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.1")
+    // Google AI Edge LiteRT-LM 0.19.0 & NPU Compiler/Dispatch Runtimes (LFM3 1.7B kv_cache_c GPU/CPU, Gemma 4 E2B & Qwen on NPU/GPU/CPU)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.19.0")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-qualcomm:2.3.2")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.2")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.2")

@@ -16,6 +16,7 @@
 
 package com.voicebubble.openflow.core.speech
 
+import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
@@ -49,6 +50,7 @@ import com.voicebubble.openflow.settings.LlmPromptTier
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -219,6 +221,11 @@ class GemmaTextProcessor(
         private const val DEFAULT_MAX_CONTEXT_TOKENS = 4_096
         private const val FALLBACK_MAX_CONTEXT_TOKENS = 2_048
         private const val LOW_MEM_MAX_CONTEXT_TOKENS = 1_536
+        private const val LFM3_MIN_CPU_AVAIL_RAM_MB = 1_700L
+        private const val RUNTIME_CACHE_STAMP_VERSION = "litertlm_0.19.0_litert_2.3.2_v1"
+        private const val RUNTIME_CACHE_STAMP_FILE = "_openflow_runtime_stamp.txt"
+        private const val INFLIGHT_LOCK_PREFIX = "_openflow_init_inflight_"
+        private const val CRASH_COUNT_PREFIX = "_openflow_init_crash_count_"
         private const val MAX_CHARS_PER_PASS = 1_800
         private const val MAX_CHARS_PER_PASS_THINK_2K = 1_200
         private const val MAX_CHARS_PER_PASS_LOW_MEM = 900
@@ -2024,13 +2031,22 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         /**
          * Pillar 5 — Right-Sized KV Context Windows: Orders `maxNumTokens` candidates to match each
          * model's actual dictation footprint (`1,536` for 0.6B / 1.5B Direct, `2,048` for 1.7B / Gemma 4)
-         * while retaining larger windows in the cascade for static-shape NPU model signatures.
+         * while locking static-KV / short-convolution models (`Liquid AI LFM3 1.7B` `ekv2048` + `kv_cache_c_*`)
+         * to their exact baked-in context length across all memory modes (preventing native LiteRT buffer-size aborts).
          */
         fun selectTokenWindowCandidates(
             memoryMode: GemmaMemoryMode,
             llmChoice: LlmModelChoice,
-            fileMaxContextTokens: Int? = null
+            fileMaxContextTokens: Int? = null,
+            isDynamicContext: Boolean = llmChoice != LlmModelChoice.LFM_3_1_7B
         ): List<Int> {
+            if (llmChoice == LlmModelChoice.LFM_3_1_7B ||
+                (!isDynamicContext && fileMaxContextTokens != null && fileMaxContextTokens >= 512)
+            ) {
+                val lockedTokens = (fileMaxContextTokens?.takeIf { it >= 512 } ?: llmChoice.preferredMaxContextTokens)
+                    .coerceIn(512, DEFAULT_MAX_CONTEXT_TOKENS)
+                return listOf(lockedTokens)
+            }
             val preferred = llmChoice.preferredMaxContextTokens.coerceIn(LOW_MEM_MAX_CONTEXT_TOKENS, DEFAULT_MAX_CONTEXT_TOKENS)
             val baseList = when (memoryMode) {
                 GemmaMemoryMode.LOW_MEMORY -> listOf(LOW_MEM_MAX_CONTEXT_TOKENS)
@@ -2042,6 +2058,157 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             } else {
                 baseList
             }
+        }
+
+        /**
+         * Determines whether native `Backend.NPU` / `Backend.GOOGLE_TENSOR` JIT compilation may be probed.
+         * Standard `Liquid AI LFM3 1.7B` (`LFM3-1.7B_mixed_int4_ekv2048.litertlm`) is a CPU/GPU-only
+         * tri-hybrid graph with 13 custom `kv_cache_c_*` short-conv tensors and no NPU partitioning,
+         * so probing NPU JIT on it fatally crashes `LiteRtCompilerPluginCompile` in native C++.
+         */
+        internal fun shouldAllowNpuBackend(
+            llmChoice: LlmModelChoice,
+            accelerator: HardwareAccelerator,
+            hasHardwareNpu: Boolean,
+            hasCustomNpuModelFile: Boolean
+        ): Boolean {
+            val modelSupportsNpu = llmChoice.supportsNpuBackend || hasCustomNpuModelFile
+            if (!modelSupportsNpu) return false
+            return accelerator == HardwareAccelerator.NPU ||
+                (accelerator == HardwareAccelerator.AUTO && hasHardwareNpu)
+        }
+
+        /**
+         * Returns the preferred `EngineConfig.activationDataType` for [llmChoice].
+         * `LFM3 1.7B` omits `prefer_activation_type` in `LlmMetadata` and mixes FP16 OpenCL matmuls with
+         * native `kv_cache_c_*` short-conv state tensors, so `null` preserves native tensor activation types.
+         */
+        internal fun preferredActivationDataType(
+            llmChoice: LlmModelChoice,
+            isCpuBackend: Boolean
+        ): ActivationDataType? {
+            if (isCpuBackend || llmChoice == LlmModelChoice.LFM_3_1_7B) return null
+            return ActivationDataType.FLOAT16
+        }
+
+        /**
+         * Returns whether `ExperimentalFlags.filterChannelContentFromKvCache` is safe for [llmChoice].
+         * Position-based KV rewinding is designed for pure attention KV caches (`Gemma 4`, `Qwen 3`),
+         * not `LFM3`'s non-positional rolling short-convolution state (`kv_cache_c_*`).
+         */
+        internal fun shouldFilterChannelContentFromKvCache(llmChoice: LlmModelChoice): Boolean {
+            return llmChoice != LlmModelChoice.LFM_3_1_7B
+        }
+
+        internal data class BackendInitGuardPlan(
+            val skipBackend: Boolean,
+            val effectiveCacheDir: String,
+            val detectedPriorNativeCrash: Boolean,
+            val totalNativeCrashes: Int
+        )
+
+        private fun syncWriteText(file: File, text: String) {
+            runCatching {
+                file.parentFile?.mkdirs()
+                FileOutputStream(file, false).use { fos ->
+                    fos.write(text.toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    runCatching { fos.fd.sync() }
+                }
+            }
+        }
+
+        /**
+         * Ensures the model's disk shader/program cache directory matches the active LiteRT-LM / LiteRT
+         * runtime version and model file size, automatically purging stale or incompatible cache files
+         * left over from an earlier runtime release (e.g. LiteRT 2.2.0 / 0.18.1 -> 2.3.2 / 0.19.0).
+         */
+        internal fun ensureCacheRuntimeStamp(cacheDir: File, modelFileSize: Long): Boolean {
+            cacheDir.mkdirs()
+            val stampFile = File(cacheDir, RUNTIME_CACHE_STAMP_FILE)
+            val expectedStamp = "${RUNTIME_CACHE_STAMP_VERSION}_size=$modelFileSize"
+            val currentStamp = if (stampFile.isFile) {
+                runCatching { stampFile.readText().trim() }.getOrNull()
+            } else {
+                null
+            }
+            if (currentStamp == expectedStamp) return false
+
+            cacheDir.listFiles()?.forEach { child ->
+                runCatching { child.deleteRecursively() }
+            }
+            cacheDir.mkdirs()
+            syncWriteText(stampFile, expectedStamp)
+            return true
+        }
+
+        /**
+         * Crash-sentinel recovery around native `Engine.initialize()`:
+         * - Writes a synced `.lock` sentinel before entering native C++ initialization.
+         * - If a leftover `.lock` sentinel is present from a prior native `SIGSEGV` / `SIGABRT` / `SIGKILL`,
+         *   wipes all half-written shader cache files and retries once with `":nocache"`.
+         * - If a non-CPU accelerator (`GPU` / `NPU`) still crashes natively a second time even with
+         *   `":nocache"`, skips that backend automatically on subsequent loads to prevent crash loops.
+         */
+        internal fun prepareBackendInitAttempt(
+            cacheDir: File,
+            backendKey: String,
+            isCpuBackend: Boolean
+        ): BackendInitGuardPlan {
+            cacheDir.mkdirs()
+            val lockFile = File(cacheDir, "$INFLIGHT_LOCK_PREFIX$backendKey.lock")
+            val countFile = File(cacheDir, "$CRASH_COUNT_PREFIX$backendKey.txt")
+            var crashCount = if (countFile.isFile) {
+                runCatching { countFile.readText().trim().toInt() }.getOrDefault(0).coerceAtLeast(0)
+            } else {
+                0
+            }
+            var detectedPriorCrash = false
+            if (lockFile.exists()) {
+                detectedPriorCrash = true
+                crashCount += 1
+                runCatching { lockFile.delete() }
+                cacheDir.listFiles()?.forEach { child ->
+                    if (!child.name.startsWith("_openflow_")) {
+                        runCatching { child.deleteRecursively() }
+                    }
+                }
+                syncWriteText(countFile, crashCount.toString())
+            }
+
+            if (!isCpuBackend && crashCount >= 2) {
+                return BackendInitGuardPlan(
+                    skipBackend = true,
+                    effectiveCacheDir = ":nocache",
+                    detectedPriorNativeCrash = detectedPriorCrash,
+                    totalNativeCrashes = crashCount
+                )
+            }
+
+            val effectiveCache = if (crashCount >= 1) ":nocache" else cacheDir.absolutePath
+            syncWriteText(lockFile, System.currentTimeMillis().toString())
+            return BackendInitGuardPlan(
+                skipBackend = false,
+                effectiveCacheDir = effectiveCache,
+                detectedPriorNativeCrash = detectedPriorCrash,
+                totalNativeCrashes = crashCount
+            )
+        }
+
+        internal fun writeBackendInitInflightLock(cacheDir: File, backendKey: String) {
+            val lockFile = File(cacheDir, "$INFLIGHT_LOCK_PREFIX$backendKey.lock")
+            if (!lockFile.exists()) {
+                syncWriteText(lockFile, System.currentTimeMillis().toString())
+            }
+        }
+
+        internal fun markBackendInitSuccess(cacheDir: File, backendKey: String) {
+            runCatching { File(cacheDir, "$INFLIGHT_LOCK_PREFIX$backendKey.lock").delete() }
+            runCatching { File(cacheDir, "$CRASH_COUNT_PREFIX$backendKey.txt").delete() }
+        }
+
+        internal fun clearBackendInitInflightLock(cacheDir: File, backendKey: String) {
+            runCatching { File(cacheDir, "$INFLIGHT_LOCK_PREFIX$backendKey.lock").delete() }
         }
 
         /**
@@ -2265,7 +2432,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val supportsMtp: Boolean,
         val supportsThinking: Boolean,
         val declaredTextBackends: Set<BackendType>,
-        val fileMaxContextTokens: Int?
+        val fileMaxContextTokens: Int?,
+        val isDynamicContext: Boolean = true
     )
 
     private class ThinkingBudgetExhaustedException(message: String) : IllegalStateException(message)
@@ -2319,7 +2487,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private fun initializeWithHardwareCascade(startIndex: Int) {
         synchronized(engineLock) {
             closeEngineLocked()
-            supportsPrefacePrefill = true
+            supportsPrefacePrefill = llmChoice != LlmModelChoice.LFM_3_1_7B
+            ensureCacheRuntimeStamp(cacheDirectory, modelFile.length())
 
             val profile = NpuHardwareManager.detectHardwareProfile()
             val metadata = detectModelMetadata(modelFile)
@@ -2331,35 +2500,78 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             val tokenWindowCandidates = selectTokenWindowCandidates(
                 memoryMode = memoryMode,
                 llmChoice = llmChoice,
-                fileMaxContextTokens = metadata.fileMaxContextTokens
+                fileMaxContextTokens = metadata.fileMaxContextTokens,
+                isDynamicContext = metadata.isDynamicContext
             )
 
+            val filterKvChannels = shouldFilterChannelContentFromKvCache(llmChoice)
             var lastError: Throwable? = null
             for (idx in startIndex until candidates.size) {
                 val candidate = candidates[idx]
+                val isCpuCandidate = candidate.backend is Backend.CPU
+                val backendKey = when (candidate.backend) {
+                    is Backend.GOOGLE_TENSOR -> "google_tensor"
+                    is Backend.NPU -> "npu"
+                    is Backend.GPU -> "gpu"
+                    is Backend.CPU -> "cpu"
+                }
+
+                // LFM3 1.7B unpacks ~2.21 GB on CPU XNNPACK; verify RAM headroom before malloc so LMKD never SIGKILLs the app.
+                if (isCpuCandidate && llmChoice == LlmModelChoice.LFM_3_1_7B) {
+                    val availRamMb = queryAvailableSystemRamMb()
+                    if (availRamMb in 1L until LFM3_MIN_CPU_AVAIL_RAM_MB) {
+                        val oomGuardErr = IllegalStateException(
+                            "Insufficient free RAM (${availRamMb}MB < ${LFM3_MIN_CPU_AVAIL_RAM_MB}MB) for ${llmChoice.title} CPU fallback"
+                        )
+                        lastError = oomGuardErr
+                        DebugLogManager.logWarn(TAG, oomGuardErr.message ?: "Skipped LFM3 CPU fallback due to low RAM")
+                        continue
+                    }
+                }
+
+                val guardPlan = prepareBackendInitAttempt(
+                    cacheDir = cacheDirectory,
+                    backendKey = backendKey,
+                    isCpuBackend = isCpuCandidate
+                )
+                if (guardPlan.detectedPriorNativeCrash) {
+                    DebugLogManager.logWarn(
+                        TAG,
+                        "Detected prior native crash during ${llmChoice.title} '${candidate.label}' load (count=${guardPlan.totalNativeCrashes}); purged shader cache"
+                    )
+                }
+                if (guardPlan.skipBackend) {
+                    val skipErr = IllegalStateException(
+                        "Skipping '${candidate.label}' after ${guardPlan.totalNativeCrashes} prior native initialization crashes"
+                    )
+                    lastError = skipErr
+                    DebugLogManager.logWarn(TAG, skipErr.message ?: "Skipping unstable native backend")
+                    continue
+                }
+
                 for (maxTokens in tokenWindowCandidates) {
                     val initStartMs = SystemClock.elapsedRealtime()
                     var createdEngine: Engine? = null
+                    writeBackendInitInflightLock(cacheDirectory, backendKey)
                     try {
-                        val preferredActivationType = if (candidate.backend is Backend.CPU) {
-                            null
-                        } else {
-                            ActivationDataType.FLOAT16
-                        }
+                        val preferredActivationType = preferredActivationDataType(
+                            llmChoice = llmChoice,
+                            isCpuBackend = isCpuCandidate
+                        )
                         val primaryConfig = EngineConfig(
                             modelPath = modelFile.absolutePath,
                             backend = candidate.backend,
                             visionBackend = null,
                             audioBackend = null,
                             maxNumTokens = maxTokens,
-                            cacheDir = cacheDirectory.absolutePath,
+                            cacheDir = guardPlan.effectiveCacheDir,
                             activationDataType = preferredActivationType
                         )
                         // Keep ExperimentalFlags.enableBenchmark = false in production so liblitertlm_jni.so
                         // does not insert synchronous per-token profiling barriers during normal dictation.
                         ExperimentalFlags.enableBenchmark = false
                         ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
-                        ExperimentalFlags.filterChannelContentFromKvCache = true
+                        ExperimentalFlags.filterChannelContentFromKvCache = filterKvChannels
                         try {
                             createdEngine = Engine(primaryConfig)
                             createdEngine.initialize()
@@ -2373,12 +2585,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                                     visionBackend = null,
                                     audioBackend = null,
                                     maxNumTokens = maxTokens,
-                                    cacheDir = cacheDirectory.absolutePath,
+                                    cacheDir = guardPlan.effectiveCacheDir,
                                     activationDataType = null
                                 )
                                 ExperimentalFlags.enableBenchmark = false
                                 ExperimentalFlags.enableSpeculativeDecoding = candidate.enableMtp
-                                ExperimentalFlags.filterChannelContentFromKvCache = true
+                                ExperimentalFlags.filterChannelContentFromKvCache = filterKvChannels
                                 createdEngine = Engine(fallbackConfig)
                                 createdEngine.initialize()
                             } else {
@@ -2389,6 +2601,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                             ExperimentalFlags.enableBenchmark = false
                         }
 
+                        markBackendInitSuccess(cacheDirectory, backendKey)
                         val elapsedMs = SystemClock.elapsedRealtime() - initStartMs
                         engine = createdEngine
                         activeCandidateIndex = idx
@@ -2398,11 +2611,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                         DebugLogManager.logInfo(
                             TAG,
                             "Initialized ${llmChoice.title} on ${candidate.label} in ${elapsedMs}ms " +
-                                "(mtp=${candidate.enableMtp}, thinking=$effectiveSupportsThinking, maxTokens=$maxTokens, memMode=$memoryMode, lora=${optionalLoraFile?.name ?: "none"})",
+                                "(mtp=${candidate.enableMtp}, thinking=$effectiveSupportsThinking, maxTokens=$maxTokens, cache=${if (guardPlan.effectiveCacheDir == ":nocache") "nocache" else "disk"}, memMode=$memoryMode, lora=${optionalLoraFile?.name ?: "none"})",
                             includeMemory = true
                         )
                         return
                     } catch (t: Throwable) {
+                        clearBackendInitInflightLock(cacheDirectory, backendKey)
                         createdEngine?.let { runCatching { it.close() } }
                         lastError = t
                         Log.w(
@@ -2424,6 +2638,17 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
     }
 
+    private fun queryAvailableSystemRamMb(): Long {
+        return try {
+            val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return -1L
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            memInfo.availMem / (1024L * 1024L)
+        } catch (_: Throwable) {
+            -1L
+        }
+    }
+
     private fun buildBackendCandidates(
         profile: NpuHardwareProfile,
         metadata: DetectedModelMetadata
@@ -2441,20 +2666,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val list = mutableListOf<BackendCandidate>()
 
         val hasCustomNpuModelFile = modelFile.name != llmChoice.modelFileName
-        val isCpuGpuOnlyTriHybridInAuto = accelerator == HardwareAccelerator.AUTO &&
-            llmChoice == LlmModelChoice.LFM_3_1_7B &&
-            !hasCustomNpuModelFile &&
-            metadata.declaredTextBackends.isNotEmpty() &&
-            BackendType.NPU !in metadata.declaredTextBackends
-        val wantNpu = accelerator == HardwareAccelerator.NPU ||
-            (accelerator == HardwareAccelerator.AUTO && profile.hasHardwareNpu && !isCpuGpuOnlyTriHybridInAuto)
-        // Always probe Backend.NPU(nativeLibraryDir) when wantNpu is true and the model supports NPU
-        // so LiteRT 2.3.2's bundled libLiteRtCompilerPlugin_{Qualcomm,MediaTek,google_tensor}.so and
-        // libLiteRtDispatch_*.so can compile/dispatch subgraphs onto Hexagon HTP / NeuroPilot / Tensor TPU
-        // even if static .litertlm metadata only listed CPU/GPU, falling back cleanly to GPU -> CPU if rejected.
-        val modelAllowsNpu = llmChoice.supportsNpuBackend
+        val allowNpu = shouldAllowNpuBackend(
+            llmChoice = llmChoice,
+            accelerator = accelerator,
+            hasHardwareNpu = profile.hasHardwareNpu,
+            hasCustomNpuModelFile = hasCustomNpuModelFile
+        )
 
-        if (wantNpu && modelAllowsNpu) {
+        if (allowNpu) {
             if (profile.vendor == NpuVendor.GOOGLE_TENSOR) {
                 list.add(
                     BackendCandidate(
@@ -2507,11 +2726,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 val supportsThinking = llmChoice.supportsThinking && (llm?.supportsThinking() ?: true)
                 val declaredBackends = runCatching { info.supportedBackends(Modality.TEXT).toSet() }.getOrDefault(emptySet())
                 val maxCtx = runCatching { info.maxContextTokens().takeIf { it > 0 } }.getOrNull()
+                val isDynamicCtx = runCatching { info.isDynamicContext() }
+                    .getOrDefault(llmChoice != LlmModelChoice.LFM_3_1_7B)
                 DetectedModelMetadata(
                     supportsMtp = supportsMtp,
                     supportsThinking = supportsThinking,
                     declaredTextBackends = declaredBackends,
-                    fileMaxContextTokens = maxCtx
+                    fileMaxContextTokens = maxCtx,
+                    isDynamicContext = isDynamicCtx
                 )
             }
         } catch (_: Throwable) {
@@ -2519,7 +2741,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 supportsMtp = false,
                 supportsThinking = llmChoice.supportsThinking,
                 declaredTextBackends = emptySet(),
-                fileMaxContextTokens = null
+                fileMaxContextTokens = null,
+                isDynamicContext = llmChoice != LlmModelChoice.LFM_3_1_7B
             )
         }
     }
@@ -2622,7 +2845,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         adaptiveThinking: Boolean = false,
         fieldContext: FlowFieldContext = inspectActiveFieldContext()
     ): Boolean {
-        if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
+        if (memoryMode == GemmaMemoryMode.LOW_MEMORY || llmChoice == LlmModelChoice.LFM_3_1_7B) {
             evictCachedSystemPrompt()
             return false
         }
@@ -2691,7 +2914,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 )
             }
 
-            ExperimentalFlags.filterChannelContentFromKvCache = true
+            ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
             val config = ConversationConfig(
                 systemInstruction = Contents.of(systemInstruction),
                 samplerConfig = buildModelSamplerConfig(isNpu, preset),
@@ -2755,6 +2978,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         disableThinking: Boolean = false,
         adaptiveThinking: Boolean = false
     ) {
+        if (llmChoice == LlmModelChoice.LFM_3_1_7B) {
+            // Engine.initialize() already compiled & cached GPU OpenCL kernels; avoid dummy conversations
+            // so LFM3's kv_cache_c_* short-convolution state stays clean for the first dictation turn.
+            evictCachedSystemPrompt()
+            return
+        }
         if (memoryMode != GemmaMemoryMode.LOW_MEMORY &&
             prewarmSystemPrompt(
                 preset = preset,
@@ -3350,7 +3579,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         // Maintain single-Conversation KV-cache RAM invariant
         evictCachedSystemPromptLocked()
-        ExperimentalFlags.filterChannelContentFromKvCache = true
+        ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
 
         val conversation = activeEngine.createConversation(
             ConversationConfig(
@@ -3446,7 +3675,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val promptCacheLabel = if (cachedHit != null) "HIT" else "MISS"
 
         val startMs = SystemClock.elapsedRealtime()
-        ExperimentalFlags.filterChannelContentFromKvCache = true
+        ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
         val loraConfig = buildActiveLoraConfig(isNpu)
         val activeConversation = cachedHit ?: try {
             activeEngine.createConversation(
@@ -3884,7 +4113,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     max(segment.length * 2 + 180, 340)
                 }
 
-                ExperimentalFlags.filterChannelContentFromKvCache = true
+                ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
                 val startNs = SystemClock.elapsedRealtimeNanos()
                 val conv = activeEngine.createConversation(
                     ConversationConfig(
@@ -3976,6 +4205,21 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         // Pass 2: Warm / Cached System Prompt (KV Cache Prefilled)
+        if (llmChoice == LlmModelChoice.LFM_3_1_7B) {
+            return LlmBenchmarkResult(
+                modelTitle = llmChoice.title,
+                backendSummary = activeBackendSummary,
+                promptPresetTitle = preset.title,
+                thinkingModeSummary = thinkingSummary,
+                inputText = trimmedRaw,
+                cleanedOutput = uncachedCleaned,
+                uncached = uncachedMetrics,
+                cached = null,
+                cachePrewarmMs = 0L,
+                cachedSystemPromptTokens = 0,
+                cacheUnavailableReason = "LFM3 1.7B packs prompt + transcript into a single prefill_256 pass to keep kv_cache_c short-conv state clean."
+            )
+        }
         if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
             return LlmBenchmarkResult(
                 modelTitle = llmChoice.title,
@@ -4030,7 +4274,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 max(segment.length * 2 + 180, 340)
             }
 
-            ExperimentalFlags.filterChannelContentFromKvCache = true
+            ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
             val prewarmStartNs = SystemClock.elapsedRealtimeNanos()
             val warmConv = try {
                 activeEngine.createConversation(

@@ -127,12 +127,12 @@ class SmartPipelineTest {
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
 
-        // Default LLM (Liquid AI LFM3 1.7B: 1,375 MB disk, +550 MB incremental RAM)
-        assertEquals(2000, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
+        // Default LLM (Liquid AI LFM3 1.7B: 1,375 MB disk, +800 MB incremental RAM)
+        assertEquals(2250, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
         assertEquals(2572, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
 
         // Punct is never loaded into RAM alongside an active LLM (zero double-loading)
-        assertEquals(2000, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(2250, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
         assertEquals(2854, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
 
         // Flagship Gemma 4 E2B (2,468 MB disk, +850 MB incremental RAM)
@@ -2654,9 +2654,16 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `NPU support enabled across all LlmModelChoice models and resolveBestModelFile prefers NPU bundle when present`() {
+    fun `NPU support aligns with model export capabilities and resolveBestModelFile prefers NPU bundle when present`() {
         for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
-            assertTrue("${choice.id} must allow NPU backend probing", choice.supportsNpuBackend)
+            if (choice == com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B) {
+                assertFalse(
+                    "Standard CPU/GPU-only LFM3 1.7B must disable NPU JIT probing to prevent native compiler crashes",
+                    choice.supportsNpuBackend
+                )
+            } else {
+                assertTrue("${choice.id} must allow NPU backend probing", choice.supportsNpuBackend)
+            }
         }
 
         val tempDir = kotlin.io.path.createTempDirectory("npu_model_test").toFile()
@@ -2837,5 +2844,136 @@ class SmartPipelineTest {
 
         val quiet80msSyllableTail = FloatArray(1_920) { idx -> if (idx in 320 until 1_600) 0.0024f else 0.0004f }
         assertTrue(com.voicebubble.openflow.core.speech.hasAnyTailSpeech(quiet80msSyllableTail))
+    }
+
+    @Test
+    fun `LFM3 loading stability guards skip NPU JIT lock ekv2048 window preserve native activations and recover from crash sentinels`() {
+        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
+        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+
+        // 1. Standard LFM3 never probes NPU JIT (neither in AUTO nor in explicit NPU mode), avoiding native compiler crashes
+        for (accel in com.voicebubble.openflow.settings.HardwareAccelerator.entries) {
+            assertFalse(
+                "Standard LFM3 must skip NPU backend in $accel mode",
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
+                    llmChoice = lfm,
+                    accelerator = accel,
+                    hasHardwareNpu = true,
+                    hasCustomNpuModelFile = false
+                )
+            )
+        }
+        assertTrue(
+            "Custom side-loaded *_npu.litertlm LFM3 bundle may probe NPU",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
+                llmChoice = lfm,
+                accelerator = com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+                hasHardwareNpu = true,
+                hasCustomNpuModelFile = true
+            )
+        )
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
+                llmChoice = gemma,
+                accelerator = com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
+                hasHardwareNpu = true,
+                hasCustomNpuModelFile = false
+            )
+        )
+
+        // 2. Static ekv2048 KV window is strictly locked across ALL memory modes (including LOW_MEMORY)
+        for (memMode in com.voicebubble.openflow.core.speech.GemmaMemoryMode.entries) {
+            assertEquals(
+                "LFM3 must lock maxNumTokens=2048 in $memMode to match static ekv2048 & kv_cache_c buffers",
+                listOf(2_048),
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+                    memoryMode = memMode,
+                    llmChoice = lfm,
+                    fileMaxContextTokens = 2_048
+                )
+            )
+            assertEquals(
+                listOf(2_048),
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+                    memoryMode = memMode,
+                    llmChoice = lfm,
+                    fileMaxContextTokens = null
+                )
+            )
+        }
+
+        // 3. Native activation types & kv_cache_c channel filter safety
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(lfm, isCpuBackend = false)
+        )
+        assertEquals(
+            com.google.ai.edge.litertlm.ActivationDataType.FLOAT16,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(gemma, isCpuBackend = false)
+        )
+        assertFalse(com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldFilterChannelContentFromKvCache(lfm))
+        assertTrue(com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldFilterChannelContentFromKvCache(gemma))
+
+        // 4. Memory pressure swaps Voz out before loading 1.34 GB LFM3 on tighter mid-range RAM & skips split prewarming
+        val highRamPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
+            systemAvailMb = 3_200L,
+            systemTotalMb = 11_800L,
+            systemLowMemoryFlag = false,
+            jvmUsedMb = 64L,
+            jvmMaxMb = 512L,
+            jvmFreeHeadroomMb = 448L,
+            nativeAllocatedMb = 900L
+        )
+        assertFalse("LFM3 single-bucket prefill_256 skips split prewarming", highRamPhone.canPrewarmLlmPromptCache(lfm))
+        assertTrue(highRamPhone.canKeepVozAndLlmCoResident(lfm, vozAlreadyLoaded = true, llmAlreadyLoaded = false))
+
+        val tightMidPhone = highRamPhone.copy(systemAvailMb = 1_600L, systemTotalMb = 5_800L)
+        assertFalse(
+            "Tight 1.6 GB free RAM must release Voz before loading LFM3 to prevent LMKD OOM kills",
+            tightMidPhone.canKeepVozAndLlmCoResident(lfm, vozAlreadyLoaded = true, llmAlreadyLoaded = false)
+        )
+
+        // 5. Runtime cache stamp + crash-sentinel recovery
+        val cacheDir = kotlin.io.path.createTempDirectory("lfm3_cache_guard_test").toFile()
+        try {
+            val staleShader = java.io.File(cacheDir, "stale_v2_14_0.program").apply { writeText("corrupt") }
+            assertTrue(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 1_441_620_928L))
+            assertFalse("Stale shader from older runtime must be purged", staleShader.exists())
+            assertFalse(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 1_441_620_928L))
+
+            // Attempt 1: normal clean start uses disk cache; caught Kotlin error clears lock without counting as native crash
+            val plan1 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
+            assertFalse(plan1.skipBackend)
+            assertEquals(cacheDir.absolutePath, plan1.effectiveCacheDir)
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.clearBackendInitInflightLock(cacheDir, "gpu")
+
+            // Simulate native crash #1 (inflight lock left behind + half-written shader file)
+            val planBeforeCrash1 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
+            assertEquals(cacheDir.absolutePath, planBeforeCrash1.effectiveCacheDir)
+            val corruptShader = java.io.File(cacheDir, "half_compiled.clbin").apply { writeText("partial") }
+
+            // Attempt after native crash #1: purges corrupt shader & retries once with ":nocache"
+            val recoveryPlan = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
+            assertTrue(recoveryPlan.detectedPriorNativeCrash)
+            assertEquals(1, recoveryPlan.totalNativeCrashes)
+            assertFalse(recoveryPlan.skipBackend)
+            assertEquals(":nocache", recoveryPlan.effectiveCacheDir)
+            assertFalse("Half-compiled shader must be deleted after native crash", corruptShader.exists())
+
+            // Simulate native crash #2 even with ":nocache" -> subsequent attempt skips broken GPU driver cleanly
+            val skipPlan = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
+            assertTrue(skipPlan.detectedPriorNativeCrash)
+            assertEquals(2, skipPlan.totalNativeCrashes)
+            assertTrue("Backend must be skipped after 2 consecutive native init crashes", skipPlan.skipBackend)
+
+            // Successful init resets crash state back to clean disk cache
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.markBackendInitSuccess(cacheDir, "gpu")
+            val cleanAgain = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
+            assertFalse(cleanAgain.skipBackend)
+            assertEquals(0, cleanAgain.totalNativeCrashes)
+            assertEquals(cacheDir.absolutePath, cleanAgain.effectiveCacheDir)
+        } finally {
+            cacheDir.deleteRecursively()
+        }
     }
 }

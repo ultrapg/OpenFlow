@@ -2,6 +2,15 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.14.1] - 2026-10-30
+
+### Fixed & Improved
+- **Eliminated `Liquid AI LFM3 1.7B` Native Loading Crashes & Hardened Tri-Hybrid Runtime Stability (`build.gradle.kts`, `ModelSettings`, `GemmaTextProcessor`, `SmartPipeline`):**
+  - **Fixed Fatal Native `Backend.NPU` / `Backend.GOOGLE_TENSOR` JIT Compiler Crash on Load:** `LFM3-1.7B_mixed_int4_ekv2048.litertlm` omits `supported_backends` in its `LlmMetadata` header (`emptySet()`), which caused `v2.14.0`'s non-empty backend check to fall through and invoke `LiteRtCompilerPluginCompile` on `LFM3`'s `1.44 GB` unpartitioned tri-hybrid graph (`13` custom `kv_cache_c_*` short-conv tensors, `"No NPU file is part of this release"`), fatally crashing in native C++ inside `Engine.initialize()`. Set `LFM_3_1_7B.supportsNpuBackend = false` and gated NPU probing via `shouldAllowNpuBackend(...)` so standard `LFM3` goes directly to `Backend.GPU()` -> `Backend.CPU()` in both `AUTO` and `NPU` modes (unless a custom `*_npu.litertlm` bundle is side-loaded).
+  - **Upgraded `litertlm-android` to `0.19.0` & Unified `litert` / `litert-gpu` `2.3.2` Shared Libraries:** Upgraded `com.google.ai.edge.litertlm:litertlm-android` from `0.18.1` to **`0.19.0`** (adding native GPU subgraph cache binding for `LFM3`'s `kv_cache_c_*` ping-pong short-conv state buffers) and packaged LiteRT **`2.3.2`** `libLiteRt.so` & `libLiteRtClGlAccelerator.so` ahead of `core:4.0.0`'s older `2.2.0` copies (with verified 100% C-API symbol compatibility for `Voz` and `Ear`).
+  - **Locked Static `ekv2048` Context Window & Preserved Native Subgraph Activations:** Locked `selectTokenWindowCandidates` on `LFM_3_1_7B` (and non-dynamic `.litertlm` graphs) to `2,048` tokens across **all** memory modes including `LOW_MEMORY` (preventing `maxNumTokens = 1,536` / `4,096` native LiteRT buffer-size `ABSL_CHECK` aborts), kept `activationDataType = null` on `LFM3`, disabled positional `filterChannelContentFromKvCache` rewinding on non-positional `kv_cache_c_*` state, and packed `LFM3` prompt + transcript into a single unsplit `prefill_256` pass without dummy warm-up turns.
+  - **Crash-Sentinel Shader-Cache Recovery, Runtime Cache Stamp & OOM Guards:** Added automatic runtime-version cache purging (`ensureCacheRuntimeStamp`) to wipe any incompatible `v2.14.0` / `0.18.1` cache files on upgrade, synced `.lock` crash-sentinel recovery (`prepareBackendInitAttempt`) that purges half-written OpenCL shader caches and retries with `":nocache"` (or skips a repeatedly crashing GPU driver after 2 native crashes), a `1,700 MB` free-RAM guard before `LFM3`'s `2.21 GB` CPU `XNNPACK` fallback, and realistic `1,250 MB` / `2,400 MB` `SmartPipeline` RAM staging thresholds so `Voz` swaps out cleanly before loading `LFM3` on RAM-constrained phones.
+
 ## [2.14.0] - 2026-10-30
 
 ### Added, Improved & Fixed

@@ -144,8 +144,11 @@ data class MemoryPressureReport(
 
     /**
      * Scales system-prompt KV-cache pre-warming threshold to the active [llmChoice]'s KV footprint.
+     * Liquid AI LFM3 1.7B skips separate system-prompt prewarming because its <200-token LIQUID_LFM_3
+     * prompt + <transcript> pack into a single prefill_256 pass and keep kv_cache_c_* state clean.
      */
     fun canPrewarmLlmPromptCache(llmChoice: LlmModelChoice): Boolean {
+        if (llmChoice == LlmModelChoice.LFM_3_1_7B) return false
         if (llmChoice == LlmModelChoice.GEMMA_4_E2B) return canPrewarmGemmaPromptCache
         return !isAnyMemoryTight && systemAvailMb >= 900L && jvmFreeHeadroomMb >= 72L
     }
@@ -625,8 +628,7 @@ class SmartPipeline(
                     (needsPunct && punctRestorer != null)
                 val isCompactPostProc = needsPunct ||
                     activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B_LITE ||
-                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B ||
-                    activeSnap.selectedLlmModel == LlmModelChoice.LFM_3_1_7B
+                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B
                 targetPostProcOverlapMs = when {
                     postProcAlreadyLoaded -> 0L // Prewarm system-prompt KV cache immediately while user starts speaking!
                     isCompactPostProc -> FAST_POST_PROC_OVERLAP_MS
@@ -675,10 +677,12 @@ class SmartPipeline(
                                 closePunctLocked()
                             }
                             val memBeforeLlm = evaluateMemoryPressure()
-                            val safeLiveOverlapHeadroom = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) {
-                                memBeforeLlm.systemAvailMb >= 2_900L && memBeforeLlm.systemTotalMb >= 9_000L
-                            } else {
-                                true
+                            val safeLiveOverlapHeadroom = when (selectedLlm) {
+                                LlmModelChoice.GEMMA_4_E2B ->
+                                    memBeforeLlm.systemAvailMb >= 2_900L && memBeforeLlm.systemTotalMb >= 9_000L
+                                LlmModelChoice.LFM_3_1_7B ->
+                                    memBeforeLlm.systemAvailMb >= 2_400L && memBeforeLlm.systemTotalMb >= 7_200L
+                                else -> true
                             }
                             if (gemmaProcessor == null &&
                                 safeLiveOverlapHeadroom &&
