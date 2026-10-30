@@ -40,6 +40,7 @@ import com.google.ai.edge.litertlm.Modality
 import com.google.ai.edge.litertlm.ModelInfo
 import com.google.ai.edge.litertlm.NoRepeatNgramConfig
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.SuppressTokensConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
 import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
 import com.voicebubble.openflow.core.debug.DebugLogManager
@@ -222,6 +223,14 @@ class GemmaTextProcessor(
         private const val FALLBACK_MAX_CONTEXT_TOKENS = 2_048
         private const val LOW_MEM_MAX_CONTEXT_TOKENS = 1_536
         private const val LFM3_MIN_CPU_AVAIL_RAM_MB = 1_700L
+        internal const val LFM3_THINK_OPEN_TOKEN_ID = 124_901
+        internal const val LFM3_TOOL_LIST_START_TOKEN_ID = 124_903
+        internal const val LFM3_TOOL_CALL_START_TOKEN_ID = 124_905
+        private val LFM3_NON_THINKING_SUPPRESSED_TOKEN_IDS = listOf(
+            LFM3_THINK_OPEN_TOKEN_ID,
+            LFM3_TOOL_LIST_START_TOKEN_ID,
+            LFM3_TOOL_CALL_START_TOKEN_ID
+        )
         private const val RUNTIME_CACHE_STAMP_VERSION = "litertlm_0.19.0_litert_2.3.2_v1"
         private const val RUNTIME_CACHE_STAMP_FILE = "_openflow_runtime_stamp.txt"
         private const val INFLIGHT_LOCK_PREFIX = "_openflow_init_inflight_"
@@ -243,11 +252,11 @@ class GemmaTextProcessor(
         private val ORPHAN_CLOSE_THINK_PREFIX_REGEX = Regex("^.*?</think>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val UNCLOSED_THINK_TAG_REGEX = Regex("<think>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val TOOL_CALL_BLOCK_REGEX = Regex(
-            "(?:<tool_call>.*?</tool_call>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>)",
+            "(?:<tool_call>.*?</tool_call>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>|<\\|tool_list_start\\|>.*?<\\|tool_list_end\\|>)",
             setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
         )
         private val SPECIAL_TURN_TOKENS_REGEX = Regex(
-            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|endoftext\\|>|<\\|startoftext\\|>|<\\|pad\\|>)"
+            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|endoftext\\|>|<\\|startoftext\\|>|<\\|pad\\|>|<\\|tool_list_start\\|>|<\\|tool_list_end\\|>|<\\|tool_call_start\\|>|<\\|tool_call_end\\|>)"
         )
         private val TRANSCRIPT_WRAPPER_REGEX = Regex("<transcript(?:\\s+[^>]*)?>\\s*(.*?)\\s*</transcript>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val STRAY_TRANSCRIPT_TAG_REGEX = Regex("</?transcript(?:\\s+[^>]*)?>", RegexOption.IGNORE_CASE)
@@ -261,7 +270,7 @@ class GemmaTextProcessor(
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val LABEL_PREFIX_REGEX = Regex(
-            pattern = "^(?:cleaned\\s+transcript|cleaned\\s+text|reformatted\\s+text|formatted\\s+text|output|bereinigter\\s+text)\\s*:\\s*\\n*",
+            pattern = "^(?:cleaned\\s+transcript|cleaned\\s+text|reformatted\\s+text|formatted\\s+text|edited\\s+text|example\\s+output|output|bereinigter\\s+text)\\s*:\\s*\\n*",
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val AI_SELF_REFERENCE_REGEX = Regex(
@@ -845,18 +854,20 @@ class GemmaTextProcessor(
                     }
                     if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                         if (normalizedLang == "de") {
-                            appendLine("Example: <transcript lang=\"de\" language=\"German\">ähm hallo lukas am dienstag nein warte mittwoch um fünfzehn uhr dreißig zwei punkte erstens npu unter fünfhundert ms testen zweitens sechs gb ram prüfen</transcript> ->")
+                            appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas am dienstag nein warte mittwoch um fünfzehn uhr dreißig zwei punkte erstens npu unter fünfhundert ms testen zweitens sechs gigabyte ram prüfen</transcript>")
+                            appendLine("Output:")
                             appendLine("Hallo Lukas, am Mittwoch um 15:30 Uhr zwei Punkte:")
                             appendLine("1. NPU unter 500 ms testen")
                             appendLine("2. 6 GB RAM prüfen")
                         } else {
-                            appendLine("Example: <transcript>um hey alex meet tuesday wait no wednesday at three thirty pm for two things first test npu under five hundred ms second check six gb ram</transcript> ->")
+                            appendLine("Input: <transcript>um hey alex meet tuesday wait no make that wednesday at three thirty pm for two things number one test npu under five hundred ms number two check six gigabytes ram</transcript>")
+                            appendLine("Output:")
                             appendLine("Hey Alex, meet Wednesday at 3:30 PM for two things:")
                             appendLine("1. Test NPU under 500 ms")
                             appendLine("2. Check 6 GB RAM")
                         }
                     }
-                    append("Rule: Output ONLY edited text (no tags, quotes, fences, or chatter).")
+                    append("Rule: Output ONLY edited text (no tags, quotes, or chatter).")
                     if (langName != null) {
                         append(" Language: $langName [$normalizedLang].")
                     } else if (normalizedLang != null) {
@@ -1848,7 +1859,11 @@ class GemmaTextProcessor(
             hasCustomLora: Boolean = false
         ): Boolean {
             if (hasCustomLora) return false
-            if (llmChoice.promptTier == LlmPromptTier.COMPACT_0_6B) return false
+            if (llmChoice.promptTier == LlmPromptTier.COMPACT_0_6B ||
+                llmChoice.promptTier == LlmPromptTier.LIQUID_LFM_3
+            ) {
+                return false
+            }
             if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
                 return false
             }
@@ -2098,6 +2113,54 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
          */
         internal fun shouldFilterChannelContentFromKvCache(llmChoice: LlmModelChoice): Boolean {
             return llmChoice != LlmModelChoice.LFM_3_1_7B
+        }
+
+        /**
+         * Resolves whether the active model uses a thinking channel (`<think>...</think>` or `<|channel>thought`)
+         * whose Jinja template must receive explicit `enable_thinking` control (`ThinkingConfig` + `extraContext`).
+         *
+         * `LFM3-1.7B_mixed_int4_ekv2048.litertlm` omits `LlmMetadata.supports_thinking` in its protobuf header
+         * (`ModelInfo.Llm.supportsThinking() == false`), yet its baked-in Jinja chat template defaults
+         * `{% set enable_thinking = enable_thinking | default(true) %}` and opens `<|im_start|>assistant\n<think>`
+         * unless `enable_thinking = false` is explicitly passed! Treating [LlmModelChoice.supportsThinking] as
+         * authoritative ensures `enable_thinking = false` renders `<think></think>` so tokens stream into visible text.
+         */
+        internal fun resolveEffectiveSupportsThinking(
+            llmChoice: LlmModelChoice,
+            metadataSupportsThinking: Boolean?
+        ): Boolean {
+            return llmChoice.supportsThinking || (metadataSupportsThinking == true)
+        }
+
+        /**
+         * Builds the Jinja chat-template `extraContext` map controlling `enable_thinking` for models with
+         * reasoning channels (`LFM3`, `Qwen 3`, `Gemma 4`), while returning an empty map for direct instruct models.
+         */
+        internal fun buildTemplateExtraContext(
+            modelSupportsThinking: Boolean,
+            effectiveDisableThinking: Boolean
+        ): Map<String, Any> {
+            return if (!modelSupportsThinking) {
+                emptyMap()
+            } else {
+                mapOf("enable_thinking" to !effectiveDisableThinking)
+            }
+        }
+
+        /**
+         * Masks `<think>` (`124901`) and tool-call start tokens (`124903`, `124905`) at logit level on standard
+         * `Liquid AI LFM3 1.7B` non-NPU turns when thinking is disabled so `LFM3` can never re-open a `<think>`
+         * channel or emit stray tool-call blocks after `<|im_start|>assistant\n<think></think>`.
+         */
+        internal fun buildTurnSuppressTokensConfig(
+            llmChoice: LlmModelChoice,
+            isStandardModelFile: Boolean,
+            effectiveDisableThinking: Boolean,
+            isNpu: Boolean
+        ): SuppressTokensConfig? {
+            if (isNpu || !effectiveDisableThinking || !isStandardModelFile) return null
+            if (llmChoice != LlmModelChoice.LFM_3_1_7B) return null
+            return SuppressTokensConfig(LFM3_NON_THINKING_SUPPRESSED_TOKEN_IDS)
         }
 
         internal data class BackendInitGuardPlan(
@@ -2723,7 +2786,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             ModelInfo.from(file.absolutePath).use { info ->
                 val llm = info as? ModelInfo.Llm
                 val supportsMtp = llm?.hasSpeculativeDecodingSupport() == true
-                val supportsThinking = llmChoice.supportsThinking && (llm?.supportsThinking() ?: true)
+                val supportsThinking = resolveEffectiveSupportsThinking(
+                    llmChoice = llmChoice,
+                    metadataSupportsThinking = runCatching { llm?.supportsThinking() }.getOrNull()
+                )
                 val declaredBackends = runCatching { info.supportedBackends(Modality.TEXT).toSet() }.getOrDefault(emptySet())
                 val maxCtx = runCatching { info.maxContextTokens().takeIf { it > 0 } }.getOrNull()
                 val isDynamicCtx = runCatching { info.isDynamicContext() }
@@ -2887,11 +2953,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 effectiveDisableThinking = effectiveDisableThinking,
                 isNpu = isNpu
             )
-            val templateContext: Map<String, Any> = if (!modelSupportsThinking) {
-                emptyMap()
-            } else {
-                mapOf("enable_thinking" to !effectiveDisableThinking)
-            }
+            val templateContext = buildTemplateExtraContext(
+                modelSupportsThinking = modelSupportsThinking,
+                effectiveDisableThinking = effectiveDisableThinking
+            )
             val systemInstruction = if (loraConfig != null) {
                 buildCompactLoraSystemInstruction(
                     preset = preset,
@@ -3004,7 +3069,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 systemInstruction = Contents.of("Output OK."),
                 samplerConfig = buildModelSamplerConfig(isNpu, preset),
                 automaticToolCalling = false,
-                extraContext = if (modelSupportsThinking) mapOf("enable_thinking" to false) else emptyMap(),
+                extraContext = buildTemplateExtraContext(
+                    modelSupportsThinking = modelSupportsThinking,
+                    effectiveDisableThinking = true
+                ),
                 maxOutputToken = 8,
                 thinkingConfig = if (modelSupportsThinking) {
                     ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)
@@ -3571,11 +3639,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         } else {
             null
         }
-        val templateContext: Map<String, Any> = if (modelSupportsThinking) {
-            mapOf("enable_thinking" to false)
-        } else {
-            emptyMap()
-        }
+        val templateContext = buildTemplateExtraContext(
+            modelSupportsThinking = modelSupportsThinking,
+            effectiveDisableThinking = true
+        )
 
         // Maintain single-Conversation KV-cache RAM invariant
         evictCachedSystemPromptLocked()
@@ -3652,11 +3719,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             effectiveDisableThinking = effectiveDisableThinking,
             isNpu = isNpu
         )
-        val templateContext: Map<String, Any> = if (!modelSupportsThinking) {
-            emptyMap()
-        } else {
-            mapOf("enable_thinking" to !effectiveDisableThinking)
-        }
+        val templateContext = buildTemplateExtraContext(
+            modelSupportsThinking = modelSupportsThinking,
+            effectiveDisableThinking = effectiveDisableThinking
+        )
 
         val cachedHit: Conversation? = if (
             requestedCacheKey != null &&
@@ -3741,8 +3807,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 )
                 val elapsedMs = SystemClock.elapsedRealtime() - startMs
                 val rawResponseText = turnOut.visibleText
-                if (!effectiveDisableThinking && isVisibleContentEmptyAfterStrippingThought(rawResponseText)) {
-                    throw ThinkingBudgetExhaustedException("Thinking output produced no visible content within $maxOutTokens tokens")
+                if (isVisibleContentEmptyAfterStrippingThought(rawResponseText)) {
+                    if (!effectiveDisableThinking) {
+                        throw ThinkingBudgetExhaustedException("Thinking output produced no visible content within $maxOutTokens tokens")
+                    }
+                    DebugLogManager.logWarn(
+                        TAG,
+                        "${llmChoice.title} produced empty visible output (${turnOut.thoughtChars} thought chars) with thinking disabled; preserving fallback transcript"
+                    )
                 }
                 val thinkingLogLabel = when {
                     !modelSupportsThinking -> "direct"
@@ -3811,6 +3883,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             640
         }
         val noRepeatNgram = if (isNpu) null else NoRepeatNgramConfig(6, 64)
+        val suppressTokens = buildTurnSuppressTokensConfig(
+            llmChoice = llmChoice,
+            isStandardModelFile = modelFile.name == llmChoice.modelFileName,
+            effectiveDisableThinking = effectiveDisableThinking,
+            isNpu = isNpu
+        )
         val sendStartNs = SystemClock.elapsedRealtimeNanos()
 
         val callback = object : MessageCallback {
@@ -3835,7 +3913,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     }
 
                     if (!cancelRequested.get()) {
-                        val inlineOpenThinkChars = if (!effectiveDisableThinking && thoughtChars == 0) {
+                        val inlineOpenThinkChars = if (thoughtChars == 0) {
                             measureUnclosedInlineThoughtChars(visibleBuilder)
                         } else {
                             0
@@ -3846,8 +3924,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                         } else {
                             visibleBuilder.isNotEmpty()
                         }
+                        val activeThoughtCap = if (effectiveDisableThinking) 240 else maxThoughtChars
 
-                        if (!effectiveDisableThinking && !hasVisibleAnswerStarted && effectiveThoughtLen > maxThoughtChars) {
+                        if (!hasVisibleAnswerStarted && effectiveThoughtLen > activeThoughtCap) {
                             abortedForThoughtCap.set(true)
                             cancelRequested.set(true)
                             triggerCancel = true
@@ -3894,7 +3973,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 templateContext,
                 null,
                 noRepeatNgram,
-                null,
+                suppressTokens,
                 maxOutTokens,
                 thinkingConfig
             )
@@ -3905,7 +3984,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 templateContext,
                 null,
                 noRepeatNgram,
-                null,
+                suppressTokens,
                 maxOutTokens,
                 thinkingConfig
             )
@@ -3954,8 +4033,22 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         if (abortedForThoughtCap.get()) {
-            throw ThinkingBudgetExhaustedException(
-                "Streaming thought exceeded cap (${max(finalThoughtChars, finalVisible.length)}ch > ${maxThoughtChars}ch)"
+            if (!effectiveDisableThinking) {
+                throw ThinkingBudgetExhaustedException(
+                    "Streaming thought exceeded cap (${max(finalThoughtChars, finalVisible.length)}ch > ${maxThoughtChars}ch)"
+                )
+            }
+            DebugLogManager.logWarn(
+                TAG,
+                "${llmChoice.title} unexpectedly emitted >240 thought chars while thinking was disabled; aborting early and preserving safe fallback"
+            )
+            return StreamingTurnOutput(
+                visibleText = segmentFallback,
+                thoughtChars = finalThoughtChars,
+                earlyAborted = true,
+                ttftMs = resolvedTtftMs,
+                decodeDurationMs = resolvedDecodeMs,
+                streamedTokenChunks = finalStreamedChunks
             )
         }
         if (abortedForRunawayLength.get()) {
@@ -4102,11 +4195,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     effectiveDisableThinking = noThink,
                     isNpu = isNpu
                 )
-                val templateCtx: Map<String, Any> = if (!modelSupportsThinking) {
-                    emptyMap()
-                } else {
-                    mapOf("enable_thinking" to !noThink)
-                }
+                val templateCtx = buildTemplateExtraContext(
+                    modelSupportsThinking = modelSupportsThinking,
+                    effectiveDisableThinking = noThink
+                )
                 val maxVisChars = if (preset == GemmaPromptPreset.CUSTOM) {
                     max(segment.length * 4, 1_200)
                 } else {
@@ -4217,7 +4309,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 cached = null,
                 cachePrewarmMs = 0L,
                 cachedSystemPromptTokens = 0,
-                cacheUnavailableReason = "LFM3 1.7B packs prompt + transcript into a single prefill_256 pass to keep kv_cache_c short-conv state clean."
+                cacheUnavailableReason = "LFM3 1.7B runs each turn as a fresh single-pass prefill to keep kv_cache_c short-conv state clean across dictations."
             )
         }
         if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
@@ -4263,11 +4355,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 effectiveDisableThinking = noThink,
                 isNpu = isNpu
             )
-            val templateCtx: Map<String, Any> = if (!modelSupportsThinking) {
-                emptyMap()
-            } else {
-                mapOf("enable_thinking" to !noThink)
-            }
+            val templateCtx = buildTemplateExtraContext(
+                modelSupportsThinking = modelSupportsThinking,
+                effectiveDisableThinking = noThink
+            )
             val maxVisChars = if (preset == GemmaPromptPreset.CUSTOM) {
                 max(segment.length * 4, 1_200)
             } else {

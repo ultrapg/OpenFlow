@@ -2971,9 +2971,172 @@ class SmartPipelineTest {
             val cleanAgain = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
             assertFalse(cleanAgain.skipBackend)
             assertEquals(0, cleanAgain.totalNativeCrashes)
+            assertEquals(cacheDir.absolutePath, plan1.effectiveCacheDir)
             assertEquals(cacheDir.absolutePath, cleanAgain.effectiveCacheDir)
         } finally {
             cacheDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `LFM3 non-thinking template context token suppression and direct rewrite guards prevent hidden think exhaustion`() {
+        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
+        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        val qwen25 = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+
+        // 1. LFM3-1.7B_mixed_int4_ekv2048.litertlm omits LlmMetadata.supports_thinking (false),
+        //    yet its Jinja template defaults enable_thinking=true unless enable_thinking=false is passed!
+        assertTrue(
+            "LFM3 must preserve supportsThinking=true even when ModelInfo.Llm.supportsThinking() is false",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = lfm,
+                metadataSupportsThinking = false
+            )
+        )
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = lfm,
+                metadataSupportsThinking = null
+            )
+        )
+        assertFalse(
+            "Direct instruct Qwen 2.5 1.5B must stay non-thinking when metadata is false/null",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = qwen25,
+                metadataSupportsThinking = false
+            )
+        )
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = qwen25,
+                metadataSupportsThinking = null
+            )
+        )
+        assertTrue(
+            "Side-loaded thinking model in non-thinking slot respects positive metadata",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = qwen25,
+                metadataSupportsThinking = true
+            )
+        )
+
+        // 2. Template extraContext explicitly passes enable_thinking=false when thinking is disabled on LFM3
+        assertEquals(
+            mapOf<String, Any>("enable_thinking" to false),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = true,
+                effectiveDisableThinking = true
+            )
+        )
+        assertEquals(
+            mapOf<String, Any>("enable_thinking" to true),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = true,
+                effectiveDisableThinking = false
+            )
+        )
+        assertEquals(
+            emptyMap<String, Any>(),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = false,
+                effectiveDisableThinking = true
+            )
+        )
+
+        // 3. Logit-level token suppression masks <think> (124901) & tool start tokens (124903, 124905)
+        //    on standard LFM3 GPU/CPU turns when thinking is disabled, and stays null when thinking is enabled
+        val lfmSuppressed = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
+            llmChoice = lfm,
+            isStandardModelFile = true,
+            effectiveDisableThinking = true,
+            isNpu = false
+        )
+        assertTrue(lfmSuppressed != null)
+        assertEquals(
+            listOf(
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_THINK_OPEN_TOKEN_ID,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_TOOL_LIST_START_TOKEN_ID,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_TOOL_CALL_START_TOKEN_ID
+            ),
+            lfmSuppressed!!.suppressTokens.toList()
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
+                llmChoice = lfm,
+                isStandardModelFile = true,
+                effectiveDisableThinking = false,
+                isNpu = false
+            )
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
+                llmChoice = lfm,
+                isStandardModelFile = false,
+                effectiveDisableThinking = true,
+                isNpu = false
+            )
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
+                llmChoice = lfm,
+                isStandardModelFile = true,
+                effectiveDisableThinking = true,
+                isNpu = true
+            )
+        )
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
+                llmChoice = gemma,
+                isStandardModelFile = true,
+                effectiveDisableThinking = true,
+                isNpu = false
+            )
+        )
+
+        // 4. LFM3 bypasses SPAN_PATCH in favor of direct single-pass rewrite
+        val longProseSegment =
+            "um hey everyone i wanted to share a quick update on our mobile release schedule because we originally targeted tuesday morning wait no make that thursday afternoon at four thirty pm so the qa team has plenty of time to verify battery drain and memory usage across six different android phones before we roll out to production"
+        assertFalse(
+            "LFM3 must use direct single-pass rewrite instead of SPAN_PATCH",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
+                segment = longProseSegment,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = lfm
+            )
+        )
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
+                segment = longProseSegment,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                llmChoice = gemma
+            )
+        )
+
+        // 5. LFM3 prompt grounds 'wait no', 'make that', and 'number one/two' with clean Input:/Output: example
+        val lfmInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true,
+            llmChoice = lfm
+        )
+        assertTrue(lfmInstruction.contains("wait no"))
+        assertTrue(lfmInstruction.contains("make that"))
+        assertTrue(lfmInstruction.contains("number one/two"))
+        assertTrue(lfmInstruction.contains("Input: <transcript>"))
+        assertTrue(lfmInstruction.contains("Output:\n"))
+        assertFalse(lfmInstruction.contains("</transcript> ->"))
+
+        // 6. Sanitizer strips LFM3 <|tool_list_start|>...<|tool_list_end|> blocks and Example Output: labels
+        assertEquals(
+            "We tested three local models on 6 GB of RAM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<think></think><|tool_list_start|>[]<|tool_list_end|>Example Output:\nWe tested three local models on 6 GB of RAM.<|im_end|>",
+                fallbackInput = "um we tested three local models on eight gigabytes of ram wait no make that six gigabytes of ram",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
     }
 }

@@ -2,6 +2,14 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.14.2] - 2026-10-30
+
+### Fixed & Improved
+- **Fixed `Liquid AI LFM3 1.7B` Hidden `<think>` Channel Exhaustion & Unformatted Raw Fallback (`GemmaTextProcessor`, `ModelSettings`):**
+  - **Root-Cause Fix for Missing `LlmMetadata.supports_thinking` Header (`resolveEffectiveSupportsThinking`):** `LFM3-1.7B_mixed_int4_ekv2048.litertlm` omits `supports_thinking = true` in its protobuf `LlmMetadata` header (`ModelInfo.Llm.supportsThinking() == false`), which previously caused `GemmaTextProcessor` to classify `LFM3` as `"Direct (non-thinking model)"` and omit `extraContext["enable_thinking"] = false` and `ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0)`. Because `LFM3`'s baked-in Jinja chat template (`{% set enable_thinking = enable_thinking | default(true) %}`) defaults `enable_thinking` to `true` whenever omitted, every turn opened `<|im_start|>assistant\n<think>` and routed all `396` decoded tokens invisibly into `message.channels["thought"]` before falling back to the unedited input text. `resolveEffectiveSupportsThinking` now treats `LlmModelChoice.supportsThinking` as authoritative so `enable_thinking = false` renders `<|im_start|>assistant\n<think></think>` and streams directly into visible output (`Thinking Off`).
+  - **Token-Level `<think>` & Tool-Call Suppression (`buildTurnSuppressTokensConfig`):** Added `SuppressTokensConfig` masking `<think>` (`124901`), `<|tool_list_start|>` (`124903`), and `<|tool_call_start|>` (`124905`) on standard `LFM3 1.7B` non-NPU turns whenever thinking is disabled, mathematically guaranteeing `LFM3` cannot re-open a `<think>` channel or emit tool-call blocks even on complex multi-clause stress-test transcripts, while keeping manual `Thinking On` fully functional with `ThinkingBudgetConstraint` (`72` tokens).
+  - **Streaming Hidden-Thought Safety Net & Upgrade Migration Guard:** Enforced live `<= 240`-char hidden-thought cancellation even when `effectiveDisableThinking == true` (returning safe fallback cleanly without triggering false GPU-to-CPU hardware cascades), preserved `LFM3`'s `defaultDisableThinking = true` across upgrades when no explicit model preference was previously saved, bypassed `SPAN_PATCH` in favor of `LFM3`'s fast direct single-pass rewrite, and sharpened `LIQUID_LFM_3`'s `< 245`-token `Input:` / `Output:` prompt for `'wait no'`, `'make that'`, and `'number one/two'` vertical lists.
+
 ## [2.14.1] - 2026-10-30
 
 ### Fixed & Improved

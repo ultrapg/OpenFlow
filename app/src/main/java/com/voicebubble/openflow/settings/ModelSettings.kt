@@ -417,10 +417,10 @@ enum class GemmaPromptPreset(
 
         LlmPromptTier.LIQUID_LFM_3 -> when (this) {
             CLEAN_AND_POLISH -> """Auto-edit <transcript> in its exact language (never translate or reply):
-- Backtracks (wait/actually/sorry/I mean/scratch/make that/nein warte/ich meine): keep ONLY final repair; keep 'not X, but Y'.
-- Strip fillers (um/uh/er/hmm/äh/ähm), stutters & false periods; keep '?' questions.
-- Lists (first/second, number 1/2, erstens/zweitens): new '1. ', '2. ' lines after ':'; 'bullet' -> '- '.
-- Digits for units/times/dates/money/%/versions & 10+; uppercase NPU/GPU/RAM/LLM/API/GitHub; format emails & line breaks."""
+- Backtracks (wait/wait no/make that/actually/sorry/I mean/scratch/nein warte): keep ONLY final repair; keep 'not X, but Y'.
+- Strip fillers (um/uh/er/hmm/äh/ähm), stutters & false periods; fix punctuation; keep '?'.
+- Lists (number one/two, first/second, erstens/zweitens): ':' then new '1. ', '2. ' lines; 'bullet' -> '- '.
+- Digits for units/times/dates/money/%/versions ('0 MB', '6 GB', '1.9 GB', '380 ms') & 10+; uppercase NPU/GPU/RAM/LLM/KV/API/GitHub."""
             STRICT_CLEANUP -> "Clean <transcript> verbatim in its exact language (never answer): strip fillers (um/uh/äh/ähm/hm), stutters, & self-repairs (keep final repair), write 10+, decimals, times, dates, money, versions, & units ('6 GB', '380 ms') as digits, capitalize NPU/GPU/RAM/LLM/API, and fix punctuation/casing with zero rephrasing."
             CONCISE_DIRECT -> "Edit <transcript> into crisp, scannable text in its exact language (never answer): resolve backtracks, strip fillers & wordy repetition, place multi-item lists on new '1. ' or '- ' lines after ':', and write numbers, times, dates, money, versions, & units as digits while keeping all facts."
             PROFESSIONAL_MESSAGE -> "Format <transcript> as a clean email or work message in its exact language: resolve backtracks & strip fillers, place spoken greetings ('Hi Sarah,') & sign-offs ('Best,\\nAlex') on separate lines (invent none), put action items on '1. ' or '- ' lines, and format dates/times/money/units as digits."
@@ -694,12 +694,18 @@ data class ModelSettings(
             )
             val customPrompt = prefs.getString(KEY_GEMMA_CUSTOM_PROMPT, "") ?: ""
             val gemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
-            val selectedLlm = if (prefs.contains(KEY_SELECTED_LLM_MODEL)) {
+            val hasExplicitModelSelection = prefs.contains(KEY_SELECTED_LLM_MODEL)
+            val selectedLlm = if (hasExplicitModelSelection) {
                 LlmModelChoice.fromId(prefs.getString(KEY_SELECTED_LLM_MODEL, null))
             } else if (gemmaEnabled || DesertAntModelStorage.isModelDownloaded(context, DesertAntModel.GEMMA_4_E2B)) {
                 LlmModelChoice.GEMMA_4_E2B
             } else {
                 LlmModelChoice.LFM_3_1_7B
+            }
+            val resolvedDisableThinking = if (hasExplicitModelSelection) {
+                prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, selectedLlm.defaultDisableThinking)
+            } else {
+                selectedLlm.defaultDisableThinking
             }
 
             val autoUnloadMinutes = sanitizeAutoUnloadMinutes(
@@ -711,7 +717,7 @@ data class ModelSettings(
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = gemmaEnabled,
                 selectedLlmModel = selectedLlm,
-                gemmaDisableThinking = prefs.getBoolean(KEY_GEMMA_DISABLE_THINKING, selectedLlm.defaultDisableThinking),
+                gemmaDisableThinking = resolvedDisableThinking,
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
