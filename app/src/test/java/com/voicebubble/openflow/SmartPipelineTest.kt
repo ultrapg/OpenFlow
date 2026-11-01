@@ -109,15 +109,15 @@ class SmartPipelineTest {
         assertTrue(defaultSettings.earEnabled)
         assertFalse("Punct must be OFF by default", defaultSettings.punctEnabled)
         assertFalse("AI Post-Processing must be OFF by default", defaultSettings.gemmaEnabled)
-        assertTrue("Disable Model Thinking must be ON by default for LFM3 1.7B", defaultSettings.gemmaDisableThinking)
+        assertFalse("Default Gemma 4 E2B keeps Adaptive Smart Thinking enabled by default", defaultSettings.gemmaDisableThinking)
         assertEquals(
-            "Default selected LLM must be Liquid AI LFM3 1.7B",
-            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
+            "Default selected LLM must be Gemma 4 E2B",
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
             defaultSettings.selectedLlmModel
         )
-        assertFalse(
-            "High-end Gemma 4 E2B must keep thinking enabled by default",
-            ModelSettings(selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B).gemmaDisableThinking
+        assertTrue(
+            "Compact MiniCPM 5 2B disables thinking by default for fast single-pass latency",
+            ModelSettings(selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B).gemmaDisableThinking
         )
         assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
         assertEquals(
@@ -127,33 +127,33 @@ class SmartPipelineTest {
         assertEquals(1450, defaultSettings.estimatedPeakRamMb)
         assertEquals(1197, defaultSettings.activeDiskFootprintMb)
 
-        // Default LLM (Liquid AI LFM3 1.7B: 1,375 MB disk, +800 MB incremental RAM)
-        assertEquals(2250, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(2572, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
+        // Default LLM (Gemma 4 E2B: 2,468 MB disk, +850 MB incremental RAM)
+        assertEquals(2300, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(3665, ModelSettings(earEnabled = true, punctEnabled = false, gemmaEnabled = true).activeDiskFootprintMb)
 
         // Punct is never loaded into RAM alongside an active LLM (zero double-loading)
-        assertEquals(2250, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
-        assertEquals(2854, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
+        assertEquals(2300, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
+        assertEquals(3947, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
 
-        // Flagship Gemma 4 E2B (2,468 MB disk, +850 MB incremental RAM)
-        val gemma4Settings = ModelSettings(
+        // Compact MiniCPM 5 2B (1,482 MB disk, +700 MB incremental RAM)
+        val miniCpmSettings = ModelSettings(
             earEnabled = true,
             punctEnabled = false,
             gemmaEnabled = true,
-            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
         )
-        assertEquals(2300, gemma4Settings.estimatedPeakRamMb)
-        assertEquals(3665, gemma4Settings.activeDiskFootprintMb)
+        assertEquals(2150, miniCpmSettings.estimatedPeakRamMb)
+        assertEquals(2679, miniCpmSettings.activeDiskFootprintMb)
 
-        // Ultra-compact Qwen 3 0.6B Lite (329 MB disk, +350 MB incremental RAM)
-        val qwenLiteSettings = ModelSettings(
+        // Pro 4B Gemma 4 E4B (3,490 MB disk, +1,150 MB incremental RAM)
+        val gemma4E4bSettings = ModelSettings(
             earEnabled = true,
             punctEnabled = false,
             gemmaEnabled = true,
-            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B_LITE
+            selectedLlmModel = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B
         )
-        assertEquals(1800, qwenLiteSettings.estimatedPeakRamMb)
-        assertEquals(1526, qwenLiteSettings.activeDiskFootprintMb)
+        assertEquals(2600, gemma4E4bSettings.estimatedPeakRamMb)
+        assertEquals(4687, gemma4E4bSettings.activeDiskFootprintMb)
 
         // Strict single-LLM exclusivity in enabledModels() and isModelEnabled()
         for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
@@ -1542,13 +1542,20 @@ class SmartPipelineTest {
     fun `LlmModelChoice catalog aligns with downloadable artifacts and optimizes prompts per model tier`() {
         assertEquals(6, com.voicebubble.openflow.settings.LlmModelChoice.entries.size)
         assertEquals(
-            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
             com.voicebubble.openflow.settings.LlmModelChoice.fromId("unknown_model")
         )
         assertEquals(
-            com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B,
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+            com.voicebubble.openflow.settings.LlmModelChoice.fromId("lfm3_1_7b")
+        )
+        assertEquals(
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
             com.voicebubble.openflow.settings.LlmModelChoice.fromId(null)
         )
+        assertFalse(com.voicebubble.openflow.settings.LlmModelChoice.isSupportedId("lfm3_1_7b"))
+        assertFalse(com.voicebubble.openflow.settings.LlmModelChoice.isSupportedId("qwen3_0_6b"))
+        assertTrue(com.voicebubble.openflow.settings.LlmModelChoice.isSupportedId("gemma4_e2b"))
 
         for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
             assertEquals(choice, com.voicebubble.openflow.settings.LlmModelChoice.fromId(choice.id))
@@ -1561,52 +1568,59 @@ class SmartPipelineTest {
             assertEquals(1, artifacts.size)
             assertEquals(choice.modelFileName, artifacts.single().relativePath)
             assertTrue(choice.modelFileName.endsWith(".litertlm"))
+            assertEquals(choice.desertAntModel.expectedBytes, artifacts.single().sizeBytes)
+            assertEquals(64, artifacts.single().sha256.length)
         }
 
         // Per-model default CLEAN_AND_POLISH optimization checks
         val compactPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
             disableThinking = false,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
         )
         assertTrue(compactPrompt.contains("under 15 words"))
         assertTrue(compactPrompt.contains("Hey Alex, can we meet Wednesday at 3:30 PM for two things:"))
-        assertFalse("Compact 0.6B prompt should stay concise without heavy 2-example wall", compactPrompt.contains("Example 2 Input:"))
+        assertFalse("Compact 2B prompt should stay concise inside prefill_256 without heavy 2-example wall", compactPrompt.contains("Example 2 Input:"))
 
         val directInstructPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
             disableThinking = false,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GRANITE_4_MICRO
         )
         assertTrue(directInstructPrompt.contains("NOT a conversational chatbot"))
-        assertFalse("Non-thinking Qwen 2.5 must never receive internal reasoning hints", directInstructPrompt.contains("internal reasoning"))
+        assertFalse("Non-thinking Granite 4.0 Micro must never receive internal reasoning hints", directInstructPrompt.contains("internal reasoning"))
 
-        // Qwen 2.5 1.5B must allocate zero thinking token headroom even when disableThinking=false
-        val sample = "um let's ship version two point eight point zero today"
-        val qwen25DefaultTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
-            inputText = sample,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = false,
-            maxContextTokens = 4_096,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
-        )
-        val qwen25NoThinkTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
-            inputText = sample,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = true,
-            maxContextTokens = 4_096,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
-        )
-        assertEquals("Non-thinking Qwen 2.5 must use tight direct token budget", qwen25NoThinkTokens, qwen25DefaultTokens)
+        // Direct non-thinking models (Granite 4.0 Micro & Ministral 3 3B) must allocate zero thinking token headroom
+        val sample = "um let's ship version two point fifteen point zero today"
+        for (directModel in listOf(
+            com.voicebubble.openflow.settings.LlmModelChoice.GRANITE_4_MICRO,
+            com.voicebubble.openflow.settings.LlmModelChoice.MINISTRAL_3_3B
+        )) {
+            val defaultTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+                inputText = sample,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                disableThinking = false,
+                maxContextTokens = 4_096,
+                llmChoice = directModel
+            )
+            val noThinkTokens = com.voicebubble.openflow.core.speech.GemmaTextProcessor.computeMaxOutputTokens(
+                inputText = sample,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+                disableThinking = true,
+                maxContextTokens = 4_096,
+                llmChoice = directModel
+            )
+            assertEquals("Non-thinking ${directModel.id} must use tight direct token budget", noThinkTokens, defaultTokens)
+        }
 
         // Switching LLM model must invalidate cached system prompt keys
-        val keyQwen06 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
+        val keyMiniCpm = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
             customPrompt = "",
             customVocabulary = emptyList(),
             fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(),
             disableThinking = false,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
         )
         val keyGemma4 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemPromptCacheKey(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
@@ -1616,18 +1630,28 @@ class SmartPipelineTest {
             disableThinking = false,
             llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
         )
-        org.junit.Assert.assertNotEquals(keyQwen06, keyGemma4)
+        org.junit.Assert.assertNotEquals(keyMiniCpm, keyGemma4)
     }
 
     @Test
-    fun `sanitizeGemmaOutput strips Qwen think blocks unclosed think tags and ChatML special tokens`() {
+    fun `sanitizeGemmaOutput strips think blocks unclosed think tags and ChatML Granite Mistral special tokens`() {
         val rawFallback = "um call lukas at three thirty pm"
 
-        // Closed Qwen 3 <think>...</think> + <|im_end|>
+        // Closed <think>...</think> + <|im_end|>
         assertEquals(
             "Call Lukas at 3:30 PM.",
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
                 rawOutput = "<think>\nRemove um and format time.\n</think>\n\nCall Lukas at 3:30 PM.<|im_end|>",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Granite <|start_of_role|>assistant<|end_of_role|>...<|end_of_text|> and Ministral <s>...</s>
+        assertEquals(
+            "Call Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<|start_of_role|>assistant<|end_of_role|>Call Lukas at 3:30 PM.<|end_of_text|></s>",
                 fallbackInput = rawFallback,
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
             )
@@ -1645,12 +1669,12 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `MemoryPressureReport allows compact Qwen co-residency on mid-range phones while staging Gemma 4 safely`() {
-        // 6 GB phone with 1,350 MB free while Voz is already loaded:
-        // Qwen 3 0.6B Lite (450 MB) and Qwen 3 0.6B (650 MB) fit comfortably alongside Voz,
-        // whereas 2.5 GB Gemma 4 E2B must stage sequentially.
+    fun `MemoryPressureReport scales co-residency across Compact 2B Default Gemma 4 E2B and Pro Gemma 4 E4B`() {
+        // 6 GB phone with 1,700 MB free while Voz is already loaded:
+        // Compact MiniCPM 5 2B (1,150 MB standalone, needs >= 1,650 MB free) fits alongside Voz,
+        // whereas Gemma 4 E2B and Gemma 4 E4B stage sequentially.
         val midPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
-            systemAvailMb = 1_350L,
+            systemAvailMb = 1_700L,
             systemTotalMb = 5_800L,
             systemLowMemoryFlag = false,
             jvmUsedMb = 60L,
@@ -1660,14 +1684,7 @@ class SmartPipelineTest {
         )
         assertTrue(
             midPhone.canKeepVozAndLlmCoResident(
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B_LITE,
-                vozAlreadyLoaded = true,
-                llmAlreadyLoaded = false
-            )
-        )
-        assertTrue(
-            midPhone.canKeepVozAndLlmCoResident(
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B,
                 vozAlreadyLoaded = true,
                 llmAlreadyLoaded = false
             )
@@ -1675,6 +1692,40 @@ class SmartPipelineTest {
         assertFalse(
             midPhone.canKeepVozAndLlmCoResident(
                 llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+        assertFalse(
+            midPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+
+        // 8 GB phone with 2,300 MB free keeps Gemma 4 E2B co-resident, while staging 3.41 GB Gemma 4 E4B
+        val eightGbPhone = midPhone.copy(systemAvailMb = 2_300L, systemTotalMb = 7_800L)
+        assertTrue(
+            eightGbPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+        assertFalse(
+            eightGbPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B,
+                vozAlreadyLoaded = true,
+                llmAlreadyLoaded = false
+            )
+        )
+
+        // 12 GB flagship phone with 3,200 MB free keeps Pro Gemma 4 E4B co-resident alongside Voz
+        val twelveGbPhone = midPhone.copy(systemAvailMb = 3_200L, systemTotalMb = 11_600L)
+        assertTrue(
+            twelveGbPhone.canKeepVozAndLlmCoResident(
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B,
                 vozAlreadyLoaded = true,
                 llmAlreadyLoaded = false
             )
@@ -1748,8 +1799,10 @@ class SmartPipelineTest {
     @Test
     fun `Pillar 2 adaptive smart thinking skips reasoning on fillers and numbers but enables on repairs and lists`() {
         val defaults = ModelSettings()
-        assertTrue("Default LFM3 model must disable thinking by default", defaults.gemmaDisableThinking)
-        assertFalse("High-end Gemma 4 E2B keeps Adaptive Smart Thinking enabled by default", com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B.defaultDisableThinking)
+        assertFalse("Default Gemma 4 E2B keeps Adaptive Smart Thinking enabled by default", defaults.gemmaDisableThinking)
+        assertTrue("Compact MiniCPM 5 2B disables thinking by default", com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B.defaultDisableThinking)
+        assertTrue("SmolLM3 3B disables thinking by default", com.voicebubble.openflow.settings.LlmModelChoice.SMOLLM_3_3B.defaultDisableThinking)
+        assertFalse("Gemma 4 E4B keeps Adaptive Smart Thinking enabled by default", com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B.defaultDisableThinking)
         assertTrue("gemmaAdaptiveThinking must be enabled by default", defaults.gemmaAdaptiveThinking)
 
         // Everyday fillers + spoken numbers/times -> skip <think> (0 thought tokens!)
@@ -1757,7 +1810,7 @@ class SmartPipelineTest {
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
                 segment = "um hey Lukas let's meet tomorrow at three thirty pm and bring twenty euros",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
             )
         )
 
@@ -1766,7 +1819,7 @@ class SmartPipelineTest {
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
                 segment = "send the invite to Thomas, wait no scratch that, send it to Hannah instead",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
             )
         )
 
@@ -1779,19 +1832,26 @@ class SmartPipelineTest {
             )
         )
 
-        // Structural presets enable thinking on thinking models, but stay false on direct Qwen 2.5
+        // Structural presets enable thinking on thinking models, but stay false on direct Granite 4.0 & Ministral 3
         assertTrue(
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
                 segment = "Quick note about tomorrow.",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_1_7B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.SMOLLM_3_3B
             )
         )
         assertFalse(
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
                 segment = "send it to Thomas, wait no scratch that, Hannah",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GRANITE_4_MICRO
+            )
+        )
+        assertFalse(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldEnableThinkingForSegment(
+                segment = "send it to Thomas, wait no scratch that, Hannah",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.STRUCTURED_NOTES,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINISTRAL_3_3B
             )
         )
     }
@@ -1858,16 +1918,16 @@ class SmartPipelineTest {
                 segment = longProse,
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
                 fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext.NONE,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_1_7B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.SMOLLM_3_3B
             )
         )
         assertFalse(
-            "0.6B models should stay on direct rewrite rather than span-patch anchor formatting",
+            "Compact 2B models stay on direct rewrite rather than span-patch anchor formatting",
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
                 segment = longProse,
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
                 fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext.NONE,
-                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
             )
         )
 
@@ -1903,17 +1963,23 @@ class SmartPipelineTest {
 
     @Test
     fun `Pillar 5 right-sized KV windows and streaming runaway repetition detector work accurately`() {
-        val qwen06Windows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+        val static4kWindows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
             memoryMode = com.voicebubble.openflow.core.speech.GemmaMemoryMode.HIGH_HEADROOM,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.MINISTRAL_3_3B
         )
-        assertEquals(listOf(1_536, 2_048, 4_096), qwen06Windows)
+        assertEquals(listOf(4_096), static4kWindows)
 
         val gemma4Windows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
             memoryMode = com.voicebubble.openflow.core.speech.GemmaMemoryMode.HIGH_HEADROOM,
             llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
         )
         assertEquals(listOf(2_048, 4_096), gemma4Windows)
+
+        val gemma4E4bLowMemWindows = com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+            memoryMode = com.voicebubble.openflow.core.speech.GemmaMemoryMode.LOW_MEMORY,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B
+        )
+        assertEquals(listOf(1_536), gemma4E4bLowMemWindows)
 
         assertFalse(
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.hasRunawayTailRepetition(
@@ -1972,15 +2038,15 @@ class SmartPipelineTest {
                 null,
                 com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveOptionalLoraFile(
                     tempDir,
-                    com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                    com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
                 )
             )
-            val loraFile = java.io.File(tempDir, "qwen3_0_6b.lora").apply { writeBytes(byteArrayOf(1, 2, 3, 4)) }
+            val loraFile = java.io.File(tempDir, "minicpm5_2b.lora").apply { writeBytes(byteArrayOf(1, 2, 3, 4)) }
             assertEquals(
                 loraFile,
                 com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveOptionalLoraFile(
                     tempDir,
-                    com.voicebubble.openflow.settings.LlmModelChoice.QWEN_3_0_6B
+                    com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
                 )
             )
             val compactLoraPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildCompactLoraSystemInstruction(
@@ -2655,14 +2721,20 @@ class SmartPipelineTest {
 
     @Test
     fun `NPU support aligns with model export capabilities and resolveBestModelFile prefers NPU bundle when present`() {
+        val npuModels = setOf(
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+            com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B
+        )
         for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
-            if (choice == com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B) {
+            if (choice in npuModels) {
+                assertTrue("${choice.id} must allow NPU backend probing", choice.supportsNpuBackend)
+                assertTrue(choice.hasDynamicKvCache)
+            } else {
                 assertFalse(
-                    "Standard CPU/GPU-only LFM3 1.7B must disable NPU JIT probing to prevent native compiler crashes",
+                    "Standard CPU/GPU ${choice.id} bundle must disable NPU JIT probing unless a custom *_npu.litertlm file is side-loaded",
                     choice.supportsNpuBackend
                 )
-            } else {
-                assertTrue("${choice.id} must allow NPU backend probing", choice.supportsNpuBackend)
+                assertFalse(choice.hasDynamicKvCache)
             }
         }
 
@@ -2744,38 +2816,97 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `Liquid AI LFM3 1_7B default model has thinking disabled by default and prefill_256 compact prompt`() {
-        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
-        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+    fun `Gemma 4 default model SmolLM3 reasoning header MiniCPM prefill_256 prompt and legacy storage cleanup work cleanly`() {
+        val miniCpm = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
+        val smolLm3 = com.voicebubble.openflow.settings.LlmModelChoice.SMOLLM_3_3B
+        val granite = com.voicebubble.openflow.settings.LlmModelChoice.GRANITE_4_MICRO
+        val ministral = com.voicebubble.openflow.settings.LlmModelChoice.MINISTRAL_3_3B
+        val gemma2b = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        val gemma4b = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B
 
-        assertEquals("DEFAULT", lfm.badgeLabel)
-        assertTrue(lfm.supportsThinking)
-        assertTrue(lfm.defaultDisableThinking)
-        assertEquals("HIGH-END", gemma.badgeLabel)
-        assertFalse(gemma.defaultDisableThinking)
+        assertEquals("COMPACT", miniCpm.badgeLabel)
+        assertEquals("BALANCED", smolLm3.badgeLabel)
+        assertEquals("DIRECT", granite.badgeLabel)
+        assertEquals("MULTILINGUAL", ministral.badgeLabel)
+        assertEquals("DEFAULT", gemma2b.badgeLabel)
+        assertEquals("PRO 4B", gemma4b.badgeLabel)
+        assertFalse(gemma2b.defaultDisableThinking)
+        assertFalse(gemma4b.defaultDisableThinking)
 
+        // 1. MiniCPM 5 2B stays inside its prefill_256 bucket (< 960 chars) across all app categories
         for (category in com.voicebubble.openflow.core.speech.AppContextCategory.entries) {
-            val lfmPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            val miniPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                disableThinking = lfm.defaultDisableThinking,
+                disableThinking = miniCpm.defaultDisableThinking,
                 fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(appCategory = category),
-                llmChoice = lfm
+                llmChoice = miniCpm
             )
             assertTrue(
-                "LFM3 prompt for $category must stay compact (< 960 chars) to hit prefill_256, got ${lfmPrompt.length}",
-                lfmPrompt.length in 450..960
+                "MiniCPM 5 2B prompt for $category must stay compact (< 960 chars) to hit prefill_256, got ${miniPrompt.length}",
+                miniPrompt.length in 380..960
             )
             assertFalse(
-                "LFM3 default prompt with thinking disabled must not append reasoning hints",
-                lfmPrompt.contains("internal reasoning")
+                "MiniCPM 5 2B default prompt with thinking disabled must not append reasoning hints",
+                miniPrompt.contains("internal reasoning")
             )
         }
 
-        // LFM3 orphan </think> prefix, <tool_call> blocks, and <|startoftext|> / <|pad|> tokens strip cleanly
+        // 2. SmolLM3 3B injects Reasoning Mode: /no_think vs /think metadata header required by its Jinja template
+        val smolNoThink = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true,
+            llmChoice = smolLm3
+        )
+        assertTrue(smolNoThink.startsWith("## Metadata\n\nReasoning Mode: /no_think\n\n## Custom Instructions\n\n"))
+        val smolThink = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = false,
+            llmChoice = smolLm3
+        )
+        assertTrue(smolThink.startsWith("## Metadata\n\nReasoning Mode: /think\n\n## Custom Instructions\n\n"))
+
+        val smolSpanPatch = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSpanPatchSystemInstruction(
+            languageCode = "en",
+            customVocabulary = emptyList(),
+            llmChoice = smolLm3
+        )
+        assertTrue(smolSpanPatch.startsWith("## Metadata\n\nReasoning Mode: /no_think"))
+
+        // 3. Automatic cleanup of removed legacy LFM3 and Qwen directories preserves Gemma 4 E2B & Voz
+        val modelsRoot = kotlin.io.path.createTempDirectory("legacy_cleanup_test").toFile()
+        try {
+            val legacyDirs = listOf("lfm3_1_7b", "qwen3_0_6b_lite", "qwen3_0_6b", "qwen3_1_7b", "qwen2_5_1_5b", "clear", "uhm")
+            for (legacyId in legacyDirs) {
+                java.io.File(modelsRoot, "$legacyId/v1.0.0").apply {
+                    mkdirs()
+                    java.io.File(this, "stale.litertlm").writeText("deprecated")
+                }
+            }
+            val gemmaDir = java.io.File(modelsRoot, "gemma4_e2b/v1.0.0").apply {
+                mkdirs()
+                java.io.File(this, "gemma-4-E2B-it.litertlm").writeText("keep")
+            }
+            val vozDir = java.io.File(modelsRoot, "voz/v1.0.0").apply {
+                mkdirs()
+                java.io.File(this, "encoder.onnx").writeText("keep")
+            }
+
+            val deletedCount = com.voicebubble.openflow.settings.DesertAntModelStorage.cleanupLegacyRemovedModelsInDirectory(modelsRoot)
+            assertEquals(legacyDirs.size, deletedCount)
+            for (legacyId in legacyDirs) {
+                assertFalse("Legacy model directory $legacyId must be deleted", java.io.File(modelsRoot, legacyId).exists())
+            }
+            assertTrue("Existing Gemma 4 E2B download must be preserved", java.io.File(gemmaDir, "gemma-4-E2B-it.litertlm").exists())
+            assertTrue("Existing Voz download must be preserved", java.io.File(vozDir, "encoder.onnx").exists())
+        } finally {
+            modelsRoot.deleteRecursively()
+        }
+
+        // 4. Orphan </think> prefix, <function>/<tool_call> blocks, and special turn tokens strip cleanly
         assertEquals(
             "Meet Wednesday at 3:30 PM.",
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
-                rawOutput = "<|startoftext|>\n\n</think>\n\n<tool_call>{\"name\":\"noop\"}</tool_call>Meet Wednesday at 3:30 PM.<|im_end|><|pad|>",
+                rawOutput = "<|startoftext|>\n\n</think>\n\n<function name=\"noop\">{}</function><tool_call>{\"name\":\"noop\"}</tool_call>Meet Wednesday at 3:30 PM.<|im_end|><|pad|>",
                 fallbackInput = "meet wednesday at three thirty pm",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
             )
@@ -2847,99 +2978,137 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `LFM3 loading stability guards skip NPU JIT lock ekv2048 window preserve native activations and recover from crash sentinels`() {
-        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
-        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+    fun `Hardware backend guards lock static ekv4096 windows gate NPU JIT scale CPU RAM checks and recover from crash sentinels`() {
+        val miniCpm = com.voicebubble.openflow.settings.LlmModelChoice.MINICPM_5_2B
+        val smolLm3 = com.voicebubble.openflow.settings.LlmModelChoice.SMOLLM_3_3B
+        val granite = com.voicebubble.openflow.settings.LlmModelChoice.GRANITE_4_MICRO
+        val ministral = com.voicebubble.openflow.settings.LlmModelChoice.MINISTRAL_3_3B
+        val gemma2b = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+        val gemma4b = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E4B
 
-        // 1. Standard LFM3 never probes NPU JIT (neither in AUTO nor in explicit NPU mode), avoiding native compiler crashes
-        for (accel in com.voicebubble.openflow.settings.HardwareAccelerator.entries) {
-            assertFalse(
-                "Standard LFM3 must skip NPU backend in $accel mode",
+        // 1. Standard CPU/GPU-only bundles never probe NPU JIT unless a custom *_npu.litertlm bundle is side-loaded
+        for (cpuGpuChoice in listOf(miniCpm, smolLm3, granite, ministral)) {
+            for (accel in com.voicebubble.openflow.settings.HardwareAccelerator.entries) {
+                assertFalse(
+                    "Standard ${cpuGpuChoice.id} must skip NPU backend in $accel mode",
+                    com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
+                        llmChoice = cpuGpuChoice,
+                        accelerator = accel,
+                        hasHardwareNpu = true,
+                        hasCustomNpuModelFile = false
+                    )
+                )
+            }
+            assertTrue(
+                "Custom side-loaded *_npu.litertlm ${cpuGpuChoice.id} bundle may probe NPU",
                 com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
-                    llmChoice = lfm,
-                    accelerator = accel,
+                    llmChoice = cpuGpuChoice,
+                    accelerator = com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
                     hasHardwareNpu = true,
-                    hasCustomNpuModelFile = false
+                    hasCustomNpuModelFile = true
                 )
             )
         }
         assertTrue(
-            "Custom side-loaded *_npu.litertlm LFM3 bundle may probe NPU",
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
-                llmChoice = lfm,
+                llmChoice = gemma2b,
                 accelerator = com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
                 hasHardwareNpu = true,
-                hasCustomNpuModelFile = true
+                hasCustomNpuModelFile = false
             )
         )
         assertTrue(
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldAllowNpuBackend(
-                llmChoice = gemma,
+                llmChoice = gemma4b,
                 accelerator = com.voicebubble.openflow.settings.HardwareAccelerator.AUTO,
                 hasHardwareNpu = true,
                 hasCustomNpuModelFile = false
             )
         )
 
-        // 2. Static ekv2048 KV window is strictly locked across ALL memory modes (including LOW_MEMORY)
-        for (memMode in com.voicebubble.openflow.core.speech.GemmaMemoryMode.entries) {
-            assertEquals(
-                "LFM3 must lock maxNumTokens=2048 in $memMode to match static ekv2048 & kv_cache_c buffers",
-                listOf(2_048),
-                com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
-                    memoryMode = memMode,
-                    llmChoice = lfm,
-                    fileMaxContextTokens = 2_048
+        // 2. Static ekv4096 KV windows stay strictly locked across ALL memory modes (including LOW_MEMORY)
+        for (staticChoice in listOf(miniCpm, smolLm3, granite, ministral)) {
+            for (memMode in com.voicebubble.openflow.core.speech.GemmaMemoryMode.entries) {
+                assertEquals(
+                    "${staticChoice.id} must lock maxNumTokens=4096 in $memMode to match static ekv4096 tensors",
+                    listOf(4_096),
+                    com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
+                        memoryMode = memMode,
+                        llmChoice = staticChoice,
+                        fileMaxContextTokens = 4_096
+                    )
                 )
-            )
-            assertEquals(
-                listOf(2_048),
-                com.voicebubble.openflow.core.speech.GemmaTextProcessor.selectTokenWindowCandidates(
-                    memoryMode = memMode,
-                    llmChoice = lfm,
-                    fileMaxContextTokens = null
-                )
-            )
+            }
         }
 
-        // 3. Native activation types & kv_cache_c channel filter safety
-        assertEquals(
-            null,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(lfm, isCpuBackend = false)
+        // 3. Per-model CPU XNNPACK RAM headroom guards & GPU FLOAT16 activation selection
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.minCpuFallbackAvailRamMb(gemma4b) >
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.minCpuFallbackAvailRamMb(gemma2b)
+        )
+        assertTrue(
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.minCpuFallbackAvailRamMb(gemma2b) >
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.minCpuFallbackAvailRamMb(miniCpm)
         )
         assertEquals(
             com.google.ai.edge.litertlm.ActivationDataType.FLOAT16,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(gemma, isCpuBackend = false)
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(gemma2b, isCpuBackend = false)
         )
-        assertFalse(com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldFilterChannelContentFromKvCache(lfm))
-        assertTrue(com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldFilterChannelContentFromKvCache(gemma))
-
-        // 4. Memory pressure swaps Voz out before loading 1.34 GB LFM3 on tighter mid-range RAM & skips split prewarming
-        val highRamPhone = com.voicebubble.openflow.core.speech.MemoryPressureReport(
-            systemAvailMb = 3_200L,
-            systemTotalMb = 11_800L,
-            systemLowMemoryFlag = false,
-            jvmUsedMb = 64L,
-            jvmMaxMb = 512L,
-            jvmFreeHeadroomMb = 448L,
-            nativeAllocatedMb = 900L
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.preferredActivationDataType(gemma2b, isCpuBackend = true)
         )
-        assertFalse("LFM3 single-bucket prefill_256 skips split prewarming", highRamPhone.canPrewarmLlmPromptCache(lfm))
-        assertTrue(highRamPhone.canKeepVozAndLlmCoResident(lfm, vozAlreadyLoaded = true, llmAlreadyLoaded = false))
+        for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
+            assertEquals(
+                choice.supportsThinking,
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldFilterChannelContentFromKvCache(choice)
+            )
+        }
 
-        val tightMidPhone = highRamPhone.copy(systemAvailMb = 1_600L, systemTotalMb = 5_800L)
+        // 4. Thinking metadata resolution & template extraContext
+        assertTrue(
+            "SmolLM3 & MiniCPM preserve supportsThinking=true even if metadata omits LlmMetadata.supports_thinking",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = smolLm3,
+                metadataSupportsThinking = false
+            )
+        )
         assertFalse(
-            "Tight 1.6 GB free RAM must release Voz before loading LFM3 to prevent LMKD OOM kills",
-            tightMidPhone.canKeepVozAndLlmCoResident(lfm, vozAlreadyLoaded = true, llmAlreadyLoaded = false)
+            "Direct instruct Granite 4.0 Micro & Ministral 3 3B stay non-thinking when metadata is false/null",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
+                llmChoice = ministral,
+                metadataSupportsThinking = false
+            )
+        )
+        assertEquals(
+            mapOf<String, Any>("enable_thinking" to false),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = true,
+                effectiveDisableThinking = true
+            )
+        )
+        assertEquals(
+            mapOf<String, Any>("enable_thinking" to true),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = true,
+                effectiveDisableThinking = false
+            )
+        )
+        assertEquals(
+            emptyMap<String, Any>(),
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
+                modelSupportsThinking = false,
+                effectiveDisableThinking = true
+            )
         )
 
         // 5. Runtime cache stamp + crash-sentinel recovery
-        val cacheDir = kotlin.io.path.createTempDirectory("lfm3_cache_guard_test").toFile()
+        val cacheDir = kotlin.io.path.createTempDirectory("litert_cache_guard_test").toFile()
         try {
             val staleShader = java.io.File(cacheDir, "stale_v2_14_0.program").apply { writeText("corrupt") }
-            assertTrue(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 1_441_620_928L))
+            assertTrue(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 2_588_147_712L))
             assertFalse("Stale shader from older runtime must be purged", staleShader.exists())
-            assertFalse(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 1_441_620_928L))
+            assertFalse(com.voicebubble.openflow.core.speech.GemmaTextProcessor.ensureCacheRuntimeStamp(cacheDir, 2_588_147_712L))
 
             // Attempt 1: normal clean start uses disk cache; caught Kotlin error clears lock without counting as native crash
             val plan1 = com.voicebubble.openflow.core.speech.GemmaTextProcessor.prepareBackendInitAttempt(cacheDir, "gpu", isCpuBackend = false)
@@ -2976,167 +3145,5 @@ class SmartPipelineTest {
         } finally {
             cacheDir.deleteRecursively()
         }
-    }
-
-    @Test
-    fun `LFM3 non-thinking template context token suppression and direct rewrite guards prevent hidden think exhaustion`() {
-        val lfm = com.voicebubble.openflow.settings.LlmModelChoice.LFM_3_1_7B
-        val gemma = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
-        val qwen25 = com.voicebubble.openflow.settings.LlmModelChoice.QWEN_2_5_1_5B
-
-        // 1. LFM3-1.7B_mixed_int4_ekv2048.litertlm omits LlmMetadata.supports_thinking (false),
-        //    yet its Jinja template defaults enable_thinking=true unless enable_thinking=false is passed!
-        assertTrue(
-            "LFM3 must preserve supportsThinking=true even when ModelInfo.Llm.supportsThinking() is false",
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
-                llmChoice = lfm,
-                metadataSupportsThinking = false
-            )
-        )
-        assertTrue(
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
-                llmChoice = lfm,
-                metadataSupportsThinking = null
-            )
-        )
-        assertFalse(
-            "Direct instruct Qwen 2.5 1.5B must stay non-thinking when metadata is false/null",
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
-                llmChoice = qwen25,
-                metadataSupportsThinking = false
-            )
-        )
-        assertFalse(
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
-                llmChoice = qwen25,
-                metadataSupportsThinking = null
-            )
-        )
-        assertTrue(
-            "Side-loaded thinking model in non-thinking slot respects positive metadata",
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.resolveEffectiveSupportsThinking(
-                llmChoice = qwen25,
-                metadataSupportsThinking = true
-            )
-        )
-
-        // 2. Template extraContext explicitly passes enable_thinking=false when thinking is disabled on LFM3
-        assertEquals(
-            mapOf<String, Any>("enable_thinking" to false),
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
-                modelSupportsThinking = true,
-                effectiveDisableThinking = true
-            )
-        )
-        assertEquals(
-            mapOf<String, Any>("enable_thinking" to true),
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
-                modelSupportsThinking = true,
-                effectiveDisableThinking = false
-            )
-        )
-        assertEquals(
-            emptyMap<String, Any>(),
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTemplateExtraContext(
-                modelSupportsThinking = false,
-                effectiveDisableThinking = true
-            )
-        )
-
-        // 3. Logit-level token suppression masks <think> (124901) & tool start tokens (124903, 124905)
-        //    on standard LFM3 GPU/CPU turns when thinking is disabled, and stays null when thinking is enabled
-        val lfmSuppressed = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
-            llmChoice = lfm,
-            isStandardModelFile = true,
-            effectiveDisableThinking = true,
-            isNpu = false
-        )
-        assertTrue(lfmSuppressed != null)
-        assertEquals(
-            listOf(
-                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_THINK_OPEN_TOKEN_ID,
-                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_TOOL_LIST_START_TOKEN_ID,
-                com.voicebubble.openflow.core.speech.GemmaTextProcessor.LFM3_TOOL_CALL_START_TOKEN_ID
-            ),
-            lfmSuppressed!!.suppressTokens.toList()
-        )
-        assertEquals(
-            null,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
-                llmChoice = lfm,
-                isStandardModelFile = true,
-                effectiveDisableThinking = false,
-                isNpu = false
-            )
-        )
-        assertEquals(
-            null,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
-                llmChoice = lfm,
-                isStandardModelFile = false,
-                effectiveDisableThinking = true,
-                isNpu = false
-            )
-        )
-        assertEquals(
-            null,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
-                llmChoice = lfm,
-                isStandardModelFile = true,
-                effectiveDisableThinking = true,
-                isNpu = true
-            )
-        )
-        assertEquals(
-            null,
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildTurnSuppressTokensConfig(
-                llmChoice = gemma,
-                isStandardModelFile = true,
-                effectiveDisableThinking = true,
-                isNpu = false
-            )
-        )
-
-        // 4. LFM3 bypasses SPAN_PATCH in favor of direct single-pass rewrite
-        val longProseSegment =
-            "um hey everyone i wanted to share a quick update on our mobile release schedule because we originally targeted tuesday morning wait no make that thursday afternoon at four thirty pm so the qa team has plenty of time to verify battery drain and memory usage across six different android phones before we roll out to production"
-        assertFalse(
-            "LFM3 must use direct single-pass rewrite instead of SPAN_PATCH",
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
-                segment = longProseSegment,
-                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                llmChoice = lfm
-            )
-        )
-        assertTrue(
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.shouldUseSpanPatchMode(
-                segment = longProseSegment,
-                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                llmChoice = gemma
-            )
-        )
-
-        // 5. LFM3 prompt grounds 'wait no', 'make that', and 'number one/two' with clean Input:/Output: example
-        val lfmInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = true,
-            llmChoice = lfm
-        )
-        assertTrue(lfmInstruction.contains("wait no"))
-        assertTrue(lfmInstruction.contains("make that"))
-        assertTrue(lfmInstruction.contains("number one/two"))
-        assertTrue(lfmInstruction.contains("Input: <transcript>"))
-        assertTrue(lfmInstruction.contains("Output:\n"))
-        assertFalse(lfmInstruction.contains("</transcript> ->"))
-
-        // 6. Sanitizer strips LFM3 <|tool_list_start|>...<|tool_list_end|> blocks and Example Output: labels
-        assertEquals(
-            "We tested three local models on 6 GB of RAM.",
-            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
-                rawOutput = "<think></think><|tool_list_start|>[]<|tool_list_end|>Example Output:\nWe tested three local models on 6 GB of RAM.<|im_end|>",
-                fallbackInput = "um we tested three local models on eight gigabytes of ram wait no make that six gigabytes of ram",
-                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
-            )
-        )
     }
 }

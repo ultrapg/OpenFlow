@@ -67,6 +67,7 @@ import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
+import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelQueueStatus
 import com.voicebubble.openflow.settings.ModelSettings
@@ -247,11 +248,11 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        // On-Device AI Post-Processing (Off by default; defaults to Liquid AI LFM3 1.7B)
+                        // On-Device AI Post-Processing (Off by default; defaults to Gemma 4 E2B)
                         val onboardingLlm = configuredSettings.selectedLlmModel
                         OnboardingModelRow(
                             title = "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)",
-                            subtitle = "${onboardingLlm.description} (6 AI models selectable in Settings)",
+                            subtitle = "${onboardingLlm.description} (${LlmModelChoice.entries.size} AI models selectable in Settings)",
                             checked = gemmaSelected,
                             enabled = true,
                             isLocked = false,

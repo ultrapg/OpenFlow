@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.15.0] - 2026-11-01
+
+### Added, Changed & Removed
+- **Replaced Legacy LLM Catalog with Curated Pure-Transformer 2026 Lineup & Promoted `Gemma 4 E2B` to Default (`ModelSettings`, `ModelDownloadManager`, `GemmaTextProcessor`, `SmartPipeline`, `SpeechRecognitionSettingsSection`, `OnboardingScreen`):**
+  - **Removed Unstable `Liquid AI LFM3 1.7B` & Underperforming Small `Qwen` Models + Automatic Storage Cleanup:** Completely removed `Liquid AI LFM3 1.7B` (`lfm3_1_7b`), `Qwen 3 0.6B Lite` (`qwen3_0_6b_lite`), `Qwen 3 0.6B` (`qwen3_0_6b`), `Qwen 3 1.7B` (`qwen3_1_7b`), and `Qwen 2.5 1.5B Instruct` (`qwen2_5_1_5b`). On app launch, `DesertAntModelStorage.cleanupLegacyRemovedModels()` automatically deletes leftover cached model directories on device to reclaim storage cleanly, and `ModelSettings.load()` seamlessly migrates saved selections from removed IDs to **`Gemma 4 E2B`** (preserving existing `Gemma 4 E2B` downloads without re-downloading, and avoiding trapping upgrading users in Onboarding if `Gemma 4 E2B` is not yet downloaded).
+  - **Promoted `Gemma 4 E2B` (`2.41 GB`) to `DEFAULT`:** Positioned **`Gemma 4 E2B`** (`litert-community/gemma-4-E2B-it-litert-lm`, `2,588,147,712` bytes) as OpenFlow's default recommended AI Post-Processing model with Adaptive Smart Thinking enabled by default and full NPU/GPU/CPU + MTP support.
+  - **5 New Verified Apache-2.0 Pure-Transformer `.litertlm` Models (`1.45 GB` – `3.41 GB`):**
+    1. **`MiniCPM 5 2B` (`1.45 GB`, `COMPACT`):** `litert-community/MiniCPM5-2B-LiteRT` (`MiniCPM5-2B_int4.litertlm`, `1,553,670,064` bytes) — compact 2.5B Transformer with a custom `< 240`-token `COMPACT_2B` system prompt engineered to fit inside its `prefill_256` signature bucket (avoiding `4×` padding to `prefill_1024`) and thinking disabled by default for fast single-pass cleanup.
+    2. **`SmolLM3 3B` (`1.87 GB`, `BALANCED`):** `litert-community/SmolLM3-3B` (`SmolLM3-3B_q4_block32_ekv4096.litertlm`, `2,004,664,320` bytes) — balanced 3B multi-clause editor with automatic `## Metadata\n\nReasoning Mode: /no_think` vs `/think` system-header injection (`applyModelSystemHeader`) matching SmolLM3's baked-in Jinja chat template.
+    3. **`IBM Granite 4.0 Micro` (`2.05 GB`, `DIRECT`):** `litert-community/granite-4.0-micro-LiteRT` (`granite-4.0-micro_int4.litertlm`, `2,198,475,104` bytes) — pure dense 3.4B Transformer direct-instruct editor (`supportsThinking = false`, zero `<think>` token overhead).
+    4. **`Ministral 3 3B Instruct` (`2.18 GB`, `MULTILINGUAL`):** `litert-community/Ministral-3-3B-Instruct-2512` (`Ministral-3-3B-Instruct-2512_q4_block32_ekv4096.litertlm`, `2,342,895,616` bytes) — Mistral's 2512 3.4B direct-instruct model tuned for high-accuracy European multilingual formatting (`supportsThinking = false`).
+    5. **`Gemma 4 E4B` (`3.41 GB`, `PRO 4B`):** `litert-community/gemma-4-E4B-it-litert-lm` (`gemma-4-E4B-it.litertlm`, `3,659,530,240` bytes) — flagship 4.5B Gemma 4 model with dynamic KV cache, NPU/GPU/CPU + MTP support, and maximum multi-clause reasoning accuracy for 10–16 GB RAM flagship devices.
+  - **Per-Architecture KV Window Locking, RAM Headroom Guards & Special-Token Sanitization:** Keyed dynamic vs static KV window selection on `LlmModelChoice.hasDynamicKvCache` (locking static `ekv4096` graphs cleanly to `4,096` tokens across all memory modes while scaling dynamic Gemma 4 E2B/E4B windows across `1,536` / `2,048` / `4,096`), scaled per-model CPU XNNPACK RAM headroom guards (`minCpuFallbackAvailRamMb`) and `SmartPipeline` `Voz` + LLM co-residency thresholds (`canKeepVozAndLlmCoResident`, `canPrewarmLlmPromptCache`), bumped runtime shader-cache stamp (`litertlm_0.19.0_litert_2.3.2_v2`), and expanded output sanitization for Granite (`<|start_of_role|>...<|end_of_role|>`, `<|end_of_text|>`), Ministral (`[SYSTEM_PROMPT]`, `[INST]`, `<s>`, `</s>`), MiniCPM 5 (`<function name=...>`), and Gemma 4 (`<|tool>`, `<|tool_call>`).
+
 ## [2.14.2] - 2026-10-30
 
 ### Fixed & Improved

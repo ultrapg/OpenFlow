@@ -248,53 +248,43 @@ object ModelDownloadManager {
                 )
             )
             ),
-        DesertAntModel.QWEN_3_0_6B_LITE to (
+        DesertAntModel.MINICPM_5_2B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
-                    relativePath = "Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm",
-                    sizeBytes = 344_671_744L,
-                    sha256 = "03e7da1eb1108b50dffaa9bb52cc7bcbad2eb0c66ca990267f480c1e545d2856",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm"
+                    relativePath = "MiniCPM5-2B_int4.litertlm",
+                    sizeBytes = 1_553_670_064L,
+                    sha256 = "05b78bb57dd5ded8a76907cc953cbc57d6261ee9fa66fbfca21ae677a897da45",
+                    downloadUrl = "https://huggingface.co/litert-community/MiniCPM5-2B/resolve/main/MiniCPM5-2B_int4.litertlm"
                 )
             )
             ),
-        DesertAntModel.QWEN_3_0_6B to (
+        DesertAntModel.SMOLLM_3_3B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
-                    relativePath = "Qwen3-0.6B.litertlm",
-                    sizeBytes = 613_722_264L,
-                    sha256 = "c5f39b4191926786c3e6668b62af4d6eb15248dfc7a5348252a9b406f33f2108",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/Qwen3-0.6B.litertlm"
+                    relativePath = "SmolLM3-3B_q4_block32_ekv4096.litertlm",
+                    sizeBytes = 2_004_664_320L,
+                    sha256 = "7ff3bf595a29cc8784d0cb6f68325922e70c2e5f3ac2e0050eb6a0bd5290468c",
+                    downloadUrl = "https://huggingface.co/litert-community/SmolLM3-3B/resolve/main/SmolLM3-3B_q4_block32_ekv4096.litertlm"
                 )
             )
             ),
-        DesertAntModel.QWEN_3_1_7B to (
+        DesertAntModel.GRANITE_4_MICRO to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
-                    relativePath = "Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm",
-                    sizeBytes = 977_184_032L,
-                    sha256 = "2a72330b504a6596d53a2c00923c57173b10f1b83e6a541213ffec08d1fc5de8",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-1.7B/resolve/main/Qwen3-1.7B_dynamic_wi4b32_afp32.litertlm"
+                    relativePath = "granite-4.0-micro_int4.litertlm",
+                    sizeBytes = 2_198_475_104L,
+                    sha256 = "b931889ac060fb563f5ae20b3f4ebc772297f15f77cdb9b0f55b1b25a160b325",
+                    downloadUrl = "https://huggingface.co/litert-community/granite-4.0-micro/resolve/main/granite-4.0-micro_int4.litertlm"
                 )
             )
             ),
-        DesertAntModel.LFM_3_1_7B to (
+        DesertAntModel.MINISTRAL_3_3B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(
-                    relativePath = "LFM3-1.7B_mixed_int4_ekv2048.litertlm",
-                    sizeBytes = 1_441_620_928L,
-                    sha256 = "0400d8ffdb00e4bbe1209120e2c7baf05322a8c900839b0a94cc28f599011196",
-                    downloadUrl = "https://huggingface.co/litert-community/LFM3-1.7B-LiteRT/resolve/main/LFM3-1.7B_mixed_int4_ekv2048.litertlm"
-                )
-            )
-            ),
-        DesertAntModel.QWEN_2_5_1_5B to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
-                    sizeBytes = 1_597_922_856L,
-                    sha256 = "c4a9b7289365ab80fe599b844b77ad253eb3c53fb0e5d963d699146a6f01255e",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm"
+                    relativePath = "Ministral-3-3B-Instruct-2512_q4_block32_ekv4096.litertlm",
+                    sizeBytes = 2_342_895_616L,
+                    sha256 = "2e01bdbef438c1a57da21cfc9c040b271b563c0f77b8b7d1907a6154f962d0f1",
+                    downloadUrl = "https://huggingface.co/litert-community/Ministral-3-3B-Instruct-2512/resolve/main/Ministral-3-3B-Instruct-2512_q4_block32_ekv4096.litertlm"
                 )
             )
             ),
@@ -305,6 +295,16 @@ object ModelDownloadManager {
                     sizeBytes = 2_588_147_712L,
                     sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
                     downloadUrl = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm"
+                )
+            )
+            ),
+        DesertAntModel.GEMMA_4_E4B to (
+            "v1.0.0" to listOf(
+                ModelFileArtifact(
+                    relativePath = "gemma-4-E4B-it.litertlm",
+                    sizeBytes = 3_659_530_240L,
+                    sha256 = "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0",
+                    downloadUrl = "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm"
                 )
             )
             )

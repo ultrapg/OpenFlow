@@ -40,7 +40,6 @@ import com.google.ai.edge.litertlm.Modality
 import com.google.ai.edge.litertlm.ModelInfo
 import com.google.ai.edge.litertlm.NoRepeatNgramConfig
 import com.google.ai.edge.litertlm.SamplerConfig
-import com.google.ai.edge.litertlm.SuppressTokensConfig
 import com.google.ai.edge.litertlm.ThinkingConfig
 import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
 import com.voicebubble.openflow.core.debug.DebugLogManager
@@ -175,20 +174,21 @@ sealed interface SpanPatchResult {
 
 /**
  * Wispr Flow–style on-device formatting & auto-editing engine powered by selectable **LiteRT-LM**
- * models (`Liquid AI LFM3 1.7B` [Default], `Qwen 3 0.6B Lite`, `Qwen 3 0.6B`, `Qwen 3 1.7B`,
- * `Qwen 2.5 1.5B Instruct`, and `Gemma 4 E2B` [High-End]).
+ * pure-Transformer models (`MiniCPM 5 2B`, `SmolLM3 3B`, `IBM Granite 4.0 Micro`,
+ * `Ministral 3 3B Instruct`, `Gemma 4 E2B` [Default], and `Gemma 4 E4B` [Pro 4B]).
  *
  * Key architectural guarantees:
  * 1. **Capability-Aware NPU / GPU / CPU Cascade:** Inspects `.litertlm` capabilities via `ModelInfo`
- *    so NPU-capable models prioritize Qualcomm Hexagon QNN, MediaTek NeuroPilot, and Google Tensor
- *    TPU while GPU/CPU-exported tri-hybrid models (`LFM3 1.7B`) go straight to OpenCL/Vulkan GPU +
- *    XNNPACK CPU in `AUTO` mode with zero wasted init probes.
+ *    so NPU-capable Gemma 4 models prioritize Qualcomm Hexagon QNN, MediaTek NeuroPilot, and Google
+ *    Tensor TPU while GPU/CPU-exported bundles go straight to OpenCL/Vulkan GPU + XNNPACK CPU in
+ *    `AUTO` mode with zero wasted init probes and per-model CPU RAM headroom guards.
  * 2. **Per-Model Prompt & Sampler Optimization:** Tailors prompt density, few-shot grounding,
  *    reasoning budgets, and `SamplerConfig` to each model's parameter scale & prefill buckets
- *    (`LIQUID_LFM_3`, `COMPACT_0_6B`, `DIRECT_INSTRUCT_1_5B`, `BALANCED_1_7B`, `FLAGSHIP_GEMMA_4`).
- * 3. **Model-Safe Reasoning Control:** Passes `ThinkingConfig` / `enable_thinking` only to models
- *    that support thinking channels (`LFM3` [off by default], `Qwen 3`, `Gemma 4`), keeping direct
- *    instruct models (`Qwen 2.5 1.5B Instruct`) pure zero-thought for instant first-token generation.
+ *    (`COMPACT_2B`, `DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`).
+ * 3. **Model-Safe Reasoning Control:** Passes `ThinkingConfig` / `enable_thinking` (plus SmolLM3's
+ *    `Reasoning Mode: /no_think` | `/think` metadata header) to thinking-capable models (`MiniCPM 5 2B`
+ *    and `SmolLM3 3B` [off by default], `Gemma 4 E2B` and `Gemma 4 E4B` [Adaptive Smart Thinking]),
+ *    while keeping direct instruct models (`Granite 4.0 Micro`, `Ministral 3 3B`) pure zero-thought.
  * 4. **RAM-Aware System-Prompt KV-Cache Pre-Warming (`prefillPrefaceOnInit = true`):** Holds at most
  *    one pre-prefilled standby `Conversation` while the user is speaking so `sendMessage` skips
  *    system-prompt prefill latency, while evicting immediately under memory pressure.
@@ -222,16 +222,7 @@ class GemmaTextProcessor(
         private const val DEFAULT_MAX_CONTEXT_TOKENS = 4_096
         private const val FALLBACK_MAX_CONTEXT_TOKENS = 2_048
         private const val LOW_MEM_MAX_CONTEXT_TOKENS = 1_536
-        private const val LFM3_MIN_CPU_AVAIL_RAM_MB = 1_700L
-        internal const val LFM3_THINK_OPEN_TOKEN_ID = 124_901
-        internal const val LFM3_TOOL_LIST_START_TOKEN_ID = 124_903
-        internal const val LFM3_TOOL_CALL_START_TOKEN_ID = 124_905
-        private val LFM3_NON_THINKING_SUPPRESSED_TOKEN_IDS = listOf(
-            LFM3_THINK_OPEN_TOKEN_ID,
-            LFM3_TOOL_LIST_START_TOKEN_ID,
-            LFM3_TOOL_CALL_START_TOKEN_ID
-        )
-        private const val RUNTIME_CACHE_STAMP_VERSION = "litertlm_0.19.0_litert_2.3.2_v1"
+        private const val RUNTIME_CACHE_STAMP_VERSION = "litertlm_0.19.0_litert_2.3.2_v2"
         private const val RUNTIME_CACHE_STAMP_FILE = "_openflow_runtime_stamp.txt"
         private const val INFLIGHT_LOCK_PREFIX = "_openflow_init_inflight_"
         private const val CRASH_COUNT_PREFIX = "_openflow_init_crash_count_"
@@ -252,11 +243,11 @@ class GemmaTextProcessor(
         private val ORPHAN_CLOSE_THINK_PREFIX_REGEX = Regex("^.*?</think>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val UNCLOSED_THINK_TAG_REGEX = Regex("<think>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val TOOL_CALL_BLOCK_REGEX = Regex(
-            "(?:<tool_call>.*?</tool_call>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>|<\\|tool_list_start\\|>.*?<\\|tool_list_end\\|>)",
+            "(?:<tool_call>.*?</tool_call>|<\\|tool_call>.*?<tool_call\\|>|<function\\s+name=[^>]*>.*?</function>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>|<\\|tool_list_start\\|>.*?<\\|tool_list_end\\|>)",
             setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
         )
         private val SPECIAL_TURN_TOKENS_REGEX = Regex(
-            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|endoftext\\|>|<\\|startoftext\\|>|<\\|pad\\|>|<\\|tool_list_start\\|>|<\\|tool_list_end\\|>|<\\|tool_call_start\\|>|<\\|tool_call_end\\|>)"
+            "(<\\|think\\|>|<\\|turn>[a-zA-Z0-9_-]*\\s*|<turn\\|>|<\\|tool>|\\s*<tool\\|>|<\\|eos\\|>|<end_of_turn>|<\\|im_end\\|>|<\\|im_start\\|>[a-zA-Z0-9_-]*\\s*|<\\|start_of_role\\|>[a-zA-Z0-9_-]*<\\|end_of_role\\|>\\s*|<\\|start_of_role\\|>|<\\|end_of_role\\|>|<\\|end_of_text\\|>|\\[/?SYSTEM_PROMPT\\]|\\[/?INST\\]|</?s>|<\\|endoftext\\|>|<\\|startoftext\\|>|<\\|pad\\|>|<\\|tool_list_start\\|>|<\\|tool_list_end\\|>|<\\|tool_call_start\\|>|<\\|tool_call_end\\|>)"
         )
         private val TRANSCRIPT_WRAPPER_REGEX = Regex("<transcript(?:\\s+[^>]*)?>\\s*(.*?)\\s*</transcript>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val STRAY_TRANSCRIPT_TAG_REGEX = Regex("</?transcript(?:\\s+[^>]*)?>", RegexOption.IGNORE_CASE)
@@ -377,7 +368,7 @@ class GemmaTextProcessor(
             options = setOf(RegexOption.IGNORE_CASE)
         )
         private val LOWERCASE_TECH_ACRONYM_REGEX = Regex(
-            pattern = "\\b(?:npu|gpu|cpu|ram|llm|llms|lfm|lfm3|api|apis|json|sql|usb|sdk|apk|ios|ui|ux|http|https|url|cli|ssh|jwt|oauth|html|css|github|gitlab|openai|gemma|qwen)\\b"
+            pattern = "\\b(?:npu|gpu|cpu|ram|llm|llms|api|apis|json|sql|usb|sdk|apk|ios|ui|ux|http|https|url|cli|ssh|jwt|oauth|html|css|github|gitlab|openai|gemma|minicpm|smollm|smollm3|granite|ministral)\\b"
         )
         private val BROKEN_PAUSE_PERIOD_REGEX = Regex(
             pattern = "(?:\\.[ \\t]+(?:[a-zäöüß]|(?:and|but|or|so|because|und|oder|aber|denn|weil)\\b)|[,;:.!?]{2,}(?<!\\.\\.\\.))"
@@ -778,9 +769,25 @@ class GemmaTextProcessor(
         }
 
         /**
+         * Prepends any model-specific system-turn control header required by the baked-in Jinja chat
+         * template of [llmChoice]. Specifically, `SmolLM3-3B_q4_block32_ekv4096.litertlm` controls
+         * reasoning mode via its `## Metadata` system header (`Reasoning Mode: /no_think` vs `/think`)
+         * rather than reading an `enable_thinking` Jinja variable.
+         */
+        internal fun applyModelSystemHeader(
+            prompt: String,
+            llmChoice: LlmModelChoice,
+            effectiveDisableThinking: Boolean
+        ): String {
+            if (llmChoice != LlmModelChoice.SMOLLM_3_3B) return prompt
+            val mode = if (effectiveDisableThinking) "/no_think" else "/think"
+            return "## Metadata\n\nReasoning Mode: $mode\n\n## Custom Instructions\n\n$prompt"
+        }
+
+        /**
          * Builds the model-optimized system instruction for [llmChoice], adapting prompt density,
          * role framing, few-shot grounding, and reasoning instructions to the active model's
-         * parameter scale (`COMPACT_0_6B`, `DIRECT_INSTRUCT_1_5B`, `BALANCED_1_7B`, `FLAGSHIP_GEMMA_4`).
+         * parameter scale (`COMPACT_2B`, `DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`).
          *
          * When [languageCode] is `null`, produces a universal language-agnostic system prompt
          * suitable for pre-prefilling (`prefillPrefaceOnInit = true`) before `Ear` runs, while
@@ -819,10 +826,10 @@ class GemmaTextProcessor(
                 null
             }
 
-            // Ultra-compact (<245 tokens including ChatML tags) prompt path engineered specifically for
-            // Liquid AI LFM3 1.7B's prefill_256 bucket (avoiding LFM3's missing-512 cliff to prefill_1024).
-            if (tier == LlmPromptTier.LIQUID_LFM_3 && preset != GemmaPromptPreset.CUSTOM) {
-                val lfmAppHint = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
+            // Ultra-compact (<240 tokens including ChatML tags) prompt path engineered specifically for
+            // MiniCPM 5 2B's prefill_256 bucket (avoiding its missing-512 cliff to prefill_1024).
+            if (tier == LlmPromptTier.COMPACT_2B && preset != GemmaPromptPreset.CUSTOM) {
+                val compactAppHint = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                     when (fieldContext.appCategory) {
                         AppContextCategory.PERSONAL_MESSAGING -> "App: Chat (relaxed, no email greetings/sign-offs)."
                         AppContextCategory.WORK_MESSAGING -> "App: Work chat (direct, keep @mentions/#channels)."
@@ -834,7 +841,7 @@ class GemmaTextProcessor(
                 } else {
                     null
                 }
-                val lfmCursorHint = if (cleanPrecedingTail == null) {
+                val compactCursorHint = if (cleanPrecedingTail == null) {
                     when {
                         fieldContext.continuingNumberedListFrom != null ->
                             "Cursor below list #${fieldContext.continuingNumberedListFrom}: continue at ${fieldContext.continuingNumberedListFrom + 1}."
@@ -845,10 +852,10 @@ class GemmaTextProcessor(
                 } else {
                     null
                 }
-                return buildString {
+                val compactBody = buildString {
                     appendLine(resolvedTask)
-                    if (lfmAppHint != null) appendLine(lfmAppHint)
-                    if (lfmCursorHint != null) appendLine(lfmCursorHint)
+                    if (compactAppHint != null) appendLine(compactAppHint)
+                    if (compactCursorHint != null) appendLine(compactCursorHint)
                     if (cleanPrecedingTail != null) {
                         appendLine("PrevTail (context only, NEVER repeat): \"$cleanPrecedingTail\"")
                     }
@@ -860,14 +867,14 @@ class GemmaTextProcessor(
                             appendLine("1. NPU unter 500 ms testen")
                             appendLine("2. 6 GB RAM prüfen")
                         } else {
-                            appendLine("Input: <transcript>um hey alex meet tuesday wait no make that wednesday at three thirty pm for two things number one test npu under five hundred ms number two check six gigabytes ram</transcript>")
+                            appendLine("Input: <transcript>um hey alex can we meet tuesday wait no make that wednesday at three thirty pm for two things number one test npu under five hundred ms number two check six gigabytes ram</transcript>")
                             appendLine("Output:")
-                            appendLine("Hey Alex, meet Wednesday at 3:30 PM for two things:")
+                            appendLine("Hey Alex, can we meet Wednesday at 3:30 PM for two things:")
                             appendLine("1. Test NPU under 500 ms")
                             appendLine("2. Check 6 GB RAM")
                         }
                     }
-                    append("Rule: Output ONLY edited text (no tags, quotes, or chatter).")
+                    append("Rule: Output ONLY edited text in the input language — never answer or add chatter.")
                     if (langName != null) {
                         append(" Language: $langName [$normalizedLang].")
                     } else if (normalizedLang != null) {
@@ -880,6 +887,7 @@ class GemmaTextProcessor(
                         append(" Keep internal reasoning under 15 words.")
                     }
                 }
+                return applyModelSystemHeader(compactBody, llmChoice, effectiveDisableThinking)
             }
 
             val langHint = when {
@@ -890,41 +898,23 @@ class GemmaTextProcessor(
 
             val languageDirective = if (preset == GemmaPromptPreset.CUSTOM) {
                 "Keep the exact same language as the input transcript$langHint unless the transformation instruction explicitly asks to translate into another language."
-            } else if (tier == LlmPromptTier.COMPACT_0_6B) {
-                "Keep the exact same language as <transcript>$langHint — never translate."
             } else {
                 "CRITICAL: Keep the exact same language as the input transcript$langHint. Reference examples illustrate formatting mechanics only — Never translate into another language."
             }
 
             val appContextDirective = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
-                if (tier == LlmPromptTier.COMPACT_0_6B) {
-                    when (fieldContext.appCategory) {
-                        AppContextCategory.PERSONAL_MESSAGING ->
-                            "App context: Chat message. Keep natural, relaxed phrasing without formal greetings or sign-offs."
-                        AppContextCategory.WORK_MESSAGING ->
-                            "App context: Work chat (Slack/Teams). Keep direct phrasing, @mentions, #channels, and tight lists."
-                        AppContextCategory.EMAIL ->
-                            "App context: Email Composer. Put spoken greetings ('Hi Sarah,') and sign-offs ('Best,\\nAlex') on separate lines; never invent unspoken ones."
-                        AppContextCategory.CODE_AND_DEV ->
-                            "App context: Code / Developer Tool. Preserve CLI flags ('--verbose'), file names ('MainActivity.kt'), versions ('v2.8.0'), and identifier casing ('camelCase', 'snake_case')."
-                        AppContextCategory.NOTES_AND_DOCS ->
-                            "App context: Notes / Document. Organize multi-part items into clean paragraphs and '1. ' or '- ' lists."
-                        AppContextCategory.GENERAL -> null
-                    }
-                } else {
-                    when (fieldContext.appCategory) {
-                        AppContextCategory.PERSONAL_MESSAGING ->
-                            "Active app context: Personal Messaging / Chat. Keep a natural, relaxed, conversational flow matching the speaker. Do not add formal email salutations or sign-offs, and keep short messages crisp."
-                        AppContextCategory.WORK_MESSAGING ->
-                            "Active app context: Work Chat (Slack / Teams). Keep phrasing direct and scannable, preserve @mentions, #channels, and technical terms, and use tight lists when enumerating multiple items."
-                        AppContextCategory.EMAIL ->
-                            "Active app context: Email Composer. Place spoken greetings (e.g., 'Hi Sarah,') on their own line followed by a blank line, group distinct topics into clean paragraphs, and place spoken sign-offs (e.g., 'Best,\\nAlex') on separate lines at the end. Never invent greetings or sign-offs that were not spoken."
-                        AppContextCategory.CODE_AND_DEV ->
-                            "Active app context: Code / Developer Tool / Terminal. Preserve exact technical syntax, CLI flags ('--verbose'), file names ('MainActivity.kt'), versions ('v2.8.0'), and code identifier casing ('camelCase', 'PascalCase', 'snake_case', 'kebab-case') when dictated."
-                        AppContextCategory.NOTES_AND_DOCS ->
-                            "Active app context: Notes / Document / AI Workspace. Organize multi-part thoughts into clean paragraphs and structured Markdown numbered ('1. ') or bulleted ('- ') lists when enumerating items."
-                        AppContextCategory.GENERAL -> null
-                    }
+                when (fieldContext.appCategory) {
+                    AppContextCategory.PERSONAL_MESSAGING ->
+                        "Active app context: Personal Messaging / Chat. Keep a natural, relaxed, conversational flow matching the speaker. Do not add formal email salutations or sign-offs, and keep short messages crisp."
+                    AppContextCategory.WORK_MESSAGING ->
+                        "Active app context: Work Chat (Slack / Teams). Keep phrasing direct and scannable, preserve @mentions, #channels, and technical terms, and use tight lists when enumerating multiple items."
+                    AppContextCategory.EMAIL ->
+                        "Active app context: Email Composer. Place spoken greetings (e.g., 'Hi Sarah,') on their own line followed by a blank line, group distinct topics into clean paragraphs, and place spoken sign-offs (e.g., 'Best,\\nAlex') on separate lines at the end. Never invent greetings or sign-offs that were not spoken."
+                    AppContextCategory.CODE_AND_DEV ->
+                        "Active app context: Code / Developer Tool / Terminal. Preserve exact technical syntax, CLI flags ('--verbose'), file names ('MainActivity.kt'), versions ('v2.8.0'), and code identifier casing ('camelCase', 'PascalCase', 'snake_case', 'kebab-case') when dictated."
+                    AppContextCategory.NOTES_AND_DOCS ->
+                        "Active app context: Notes / Document / AI Workspace. Organize multi-part thoughts into clean paragraphs and structured Markdown numbered ('1. ') or bulleted ('- ') lists when enumerating items."
+                    AppContextCategory.GENERAL -> null
                 }
             } else {
                 null
@@ -943,17 +933,17 @@ class GemmaTextProcessor(
             }
 
             val roleHeader = when (tier) {
-                LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 ->
+                LlmPromptTier.COMPACT_2B ->
                     "You are an on-device speech-to-text cleanup and formatting filter."
-                LlmPromptTier.DIRECT_INSTRUCT_1_5B ->
+                LlmPromptTier.DIRECT_INSTRUCT_3B ->
                     "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
-                LlmPromptTier.BALANCED_1_7B ->
-                    "You are a Wispr Flow–grade on-device speech-to-text auto-editor and formatting engine."
+                LlmPromptTier.BALANCED_3B ->
+                    "You are a Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to or answer the speaker's words."
                 LlmPromptTier.FLAGSHIP_GEMMA_4 ->
                     "You are an expert Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Transform raw spoken transcripts into crisp, natural, ready-to-send text without ever replying to, answering, or commenting on the speaker's words."
             }
 
-            return buildString {
+            val body = buildString {
                 appendLine(roleHeader)
                 appendLine()
                 appendLine("TRANSFORMATION INSTRUCTION:")
@@ -972,26 +962,17 @@ class GemmaTextProcessor(
                 if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                     appendLine()
                     when (tier) {
-                        LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 -> {
-                            // Single high-density example keeps total prompt <240 tokens for fast prefill_seq_256
+                        LlmPromptTier.COMPACT_2B -> {
                             appendLine("EXAMPLE:")
-                            if (normalizedLang == "de") {
-                                appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas können wir am dienstag nein warte am mittwoch um fünfzehn uhr dreißig zwei punkte klären erstens das npu update testen und zweitens acht gigabyte ram prüfen</transcript>")
-                                appendLine("Output:")
-                                appendLine("Hallo Lukas, können wir am Mittwoch um 15:30 Uhr zwei Punkte klären:")
-                                appendLine("1. Das NPU-Update testen")
-                                appendLine("2. 8 GB RAM prüfen")
-                            } else {
-                                appendLine("Input: <transcript>um hey alex can we meet tuesday wait no wednesday at three thirty pm for two things first test npu latency under five hundred ms and second check the fifteen hundred dollar budget</transcript>")
-                                appendLine("Output:")
-                                appendLine("Hey Alex, can we meet Wednesday at 3:30 PM for two things:")
-                                appendLine("1. Test NPU latency under 500 ms")
-                                appendLine("2. Check the \$1,500 budget")
-                            }
+                            appendLine("Input: <transcript>um hey alex can we meet tuesday wait no wednesday at three thirty pm for two things first test npu latency under five hundred ms and second check the fifteen hundred dollar budget</transcript>")
+                            appendLine("Output:")
+                            appendLine("Hey Alex, can we meet Wednesday at 3:30 PM for two things:")
+                            appendLine("1. Test NPU latency under 500 ms")
+                            appendLine("2. Check the \$1,500 budget")
                         }
 
-                        LlmPromptTier.DIRECT_INSTRUCT_1_5B -> {
-                            // Inoculates non-thinking instruct model against answering dictated questions
+                        LlmPromptTier.DIRECT_INSTRUCT_3B -> {
+                            // Inoculates non-thinking 3B instruct models against answering dictated questions
                             appendLine("REFERENCE EXAMPLES:")
                             if (normalizedLang == "de") {
                                 appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas wann passt dir das telefonat morgen um vierzehn uhr nein warte fünfzehn uhr dreißig wir haben zwei punkte erstens das npu update für version zwei punkt acht punkt null testen und zweitens acht gigabyte ram prüfen</transcript>")
@@ -1014,7 +995,7 @@ class GemmaTextProcessor(
                             }
                         }
 
-                        LlmPromptTier.BALANCED_1_7B -> {
+                        LlmPromptTier.BALANCED_3B -> {
                             appendLine("REFERENCE EXAMPLES:")
                             if (normalizedLang == "de") {
                                 appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
@@ -1041,28 +1022,28 @@ class GemmaTextProcessor(
                         LlmPromptTier.FLAGSHIP_GEMMA_4 -> {
                             appendLine("REFERENCE EXAMPLES:")
                             if (normalizedLang == "de") {
-                                appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas kurzes update\n\nwir haben drei lokale modelle auf acht gigabyte nein warte sechs gigabyte ram getestet: punkt eins qwen drei null punkt sechs b lief unter vierhundert millisekunden punkt zwei der leerlauf sank nach fünf minuten auf null megabyte punkt drei wir schicken version zwei punkt zehn morgen raus\n\nbitte schreib an lukas@openflow.dev falls fragen offen sind</transcript>")
+                                appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas kurzes update\n\nwir haben drei lokale modelle auf acht gigabyte nein warte sechs gigabyte ram getestet: punkt eins gemma vier e zwei b lief unter vierhundert millisekunden punkt zwei der leerlauf sank nach fünf minuten auf null megabyte punkt drei wir schicken version zwei punkt fünfzehn morgen raus\n\nbitte schreib an lukas@openflow.dev falls fragen offen sind</transcript>")
                                 appendLine("Output:")
                                 appendLine("Hallo Lukas, kurzes Update.")
                                 appendLine()
                                 appendLine("Wir haben drei lokale Modelle auf 6 GB RAM getestet:")
-                                appendLine("1. Qwen 3 0.6B lief unter 400 ms.")
+                                appendLine("1. Gemma 4 E2B lief unter 400 ms.")
                                 appendLine("2. Der Leerlauf sank nach 5 Minuten auf 0 MB.")
-                                appendLine("3. Wir schicken Version 2.10 morgen raus.")
+                                appendLine("3. Wir schicken Version 2.15 morgen raus.")
                                 appendLine()
                                 appendLine("Bitte schreib an lukas@openflow.dev, falls Fragen offen sind.")
                             } else {
                                 appendLine("Example 1 Input: <transcript>um hey alex let's meet tuesday at two pm wait no make that wednesday at three thirty pm to review the uh fifteen hundred dollar budget i really like the three new designs</transcript>")
                                 appendLine("Example 1 Output: Hey Alex, let's meet Wednesday at 3:30 PM to review the \$1,500 budget. I really like the three new designs.")
-                                appendLine("Example 2 Input: <transcript>um hi team quick update\n\ncan we check two builds on eight gigabytes wait no make that six gigabytes of ram: number one qwen three zero point six b finished in four hundred milliseconds at ninety eight percent accuracy number two idle memory dropped to zero megabytes after five minutes\n\nplease ping dev@openflow.dev before version two point ten ships</transcript>")
+                                appendLine("Example 2 Input: <transcript>um hi team quick update\n\ncan we check two builds on eight gigabytes wait no make that six gigabytes of ram: number one gemma four e two b finished in four hundred milliseconds at ninety eight percent accuracy number two idle memory dropped to zero megabytes after five minutes\n\nplease ping dev@openflow.dev before version two point fifteen ships</transcript>")
                                 appendLine("Example 2 Output:")
                                 appendLine("Hi team, quick update.")
                                 appendLine()
                                 appendLine("Can we check two builds on 6 GB of RAM?")
-                                appendLine("1. Qwen 3 0.6B finished in 400 ms at 98% accuracy.")
+                                appendLine("1. Gemma 4 E2B finished in 400 ms at 98% accuracy.")
                                 appendLine("2. Idle memory dropped to 0 MB after 5 minutes.")
                                 appendLine()
-                                appendLine("Please ping dev@openflow.dev before version 2.10 ships.")
+                                appendLine("Please ping dev@openflow.dev before version 2.15 ships.")
                                 if (normalizedLang == null) {
                                     appendLine("Example 3 Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas lass uns am dienstag um vierzehn uhr nein warte am mittwoch um fünfzehn uhr dreißig sprechen wir müssen zwei punkte klären erstens das npu update testen und zweitens die acht gigabyte ram grenze prüfen</transcript>")
                                     appendLine("Example 3 Output:")
@@ -1082,9 +1063,9 @@ class GemmaTextProcessor(
                 appendLine("3. $languageDirective")
                 val thinkingConcisenessHint = if (!effectiveDisableThinking) {
                     when (tier) {
-                        LlmPromptTier.COMPACT_0_6B ->
+                        LlmPromptTier.COMPACT_2B ->
                             " Keep internal reasoning under 15 words focused only on fillers, self-corrections, and formatting."
-                        LlmPromptTier.BALANCED_1_7B ->
+                        LlmPromptTier.BALANCED_3B ->
                             " Keep internal reasoning brief (under 25 words) focused on identifying disfluencies, backtracks, and structure."
                         LlmPromptTier.FLAGSHIP_GEMMA_4 ->
                             " Keep internal reasoning brief and telegraphic (under 35 words: list only backtracks, list newlines, and unit conversions), then emit the final edited text immediately."
@@ -1101,6 +1082,7 @@ class GemmaTextProcessor(
                     append("4. Output ONLY the final transformed text. Do NOT include <transcript> tags, markdown code blocks, surrounding quotation marks, or introductory chatter.$thinkingConcisenessHint")
                 }
             }
+            return applyModelSystemHeader(body, llmChoice, effectiveDisableThinking)
         }
 
         /**
@@ -1157,9 +1139,9 @@ class GemmaTextProcessor(
                 else -> 192
             }
             val tierHeadroomCap = when (llmChoice.promptTier) {
-                LlmPromptTier.COMPACT_0_6B, LlmPromptTier.LIQUID_LFM_3 -> 192
-                LlmPromptTier.DIRECT_INSTRUCT_1_5B -> 0
-                LlmPromptTier.BALANCED_1_7B -> 320
+                LlmPromptTier.COMPACT_2B -> 224
+                LlmPromptTier.DIRECT_INSTRUCT_3B -> 0
+                LlmPromptTier.BALANCED_3B -> 320
                 LlmPromptTier.FLAGSHIP_GEMMA_4 -> 640
             }
             val thinkingHeadroom = min(windowHeadroom, tierHeadroomCap)
@@ -1172,9 +1154,9 @@ class GemmaTextProcessor(
         }
 
         /**
-         * Sanitizes raw LLM generation output across Qwen 3, Qwen 2.5, and Gemma 4 E2B, stripping
-         * reasoning channels (`<|channel>thought`, `<think>`), ChatML/Gemma turn tokens, `<transcript>`
-         * echoes, markdown fences, conversational preambles, or echoed continuity snippets, and falling
+         * Sanitizes raw LLM generation output across Gemma 4, Ministral 3, Granite 4.0, SmolLM3, and MiniCPM 5,
+         * stripping reasoning channels (`<|channel>thought`, `<think>`), ChatML/Granite/Mistral/Gemma turn tokens,
+         * `<transcript>` echoes, markdown fences, conversational preambles, or echoed continuity snippets, and falling
          * back safely to [fallbackInput] if generation is blank, runaway, or an AI assistant refusal.
          */
         fun sanitizeGemmaOutput(
@@ -1191,7 +1173,7 @@ class GemmaTextProcessor(
                 .replace("\r\n", "\n")
                 .replace('\r', '\n')
 
-            // 1. Strip Gemma 4 thinking channels, Qwen 3 / LFM3 <think> blocks (closed, orphan-closed, or truncated) & tool calls
+            // 1. Strip Gemma 4 thinking channels, <think> reasoning blocks (closed, orphan-closed, or truncated) & tool calls
             text = text.replace(CHANNEL_BLOCK_REGEX, "")
             text = text.replace(UNCLOSED_CHANNEL_REGEX, "")
             text = text.replace(THOUGHT_TAG_REGEX, "")
@@ -1746,7 +1728,7 @@ class GemmaTextProcessor(
             if (LIST_SEQUENCE_TRIGGER_REGEX.containsMatchIn(trimmed)) return true
 
             val wordCount = countWordsFast(trimmed)
-            val denseThreshold = if (llmChoice.promptTier == LlmPromptTier.COMPACT_0_6B) 75 else 60
+            val denseThreshold = if (llmChoice.promptTier == LlmPromptTier.COMPACT_2B) 75 else 60
             return wordCount >= denseThreshold
         }
 
@@ -1859,9 +1841,7 @@ class GemmaTextProcessor(
             hasCustomLora: Boolean = false
         ): Boolean {
             if (hasCustomLora) return false
-            if (llmChoice.promptTier == LlmPromptTier.COMPACT_0_6B ||
-                llmChoice.promptTier == LlmPromptTier.LIQUID_LFM_3
-            ) {
+            if (llmChoice.promptTier == LlmPromptTier.COMPACT_2B) {
                 return false
             }
             if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
@@ -1885,6 +1865,7 @@ class GemmaTextProcessor(
             disableThinking: Boolean = true,
             llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
         ): String {
+            val effectiveDisableThinking = disableThinking || !llmChoice.supportsThinking
             val normalizedLang = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
             val langName = normalizedLang?.let { LANGUAGE_NAMES_EN[it] }
             val langNote = if (langName != null) " ($langName [$normalizedLang])" else ""
@@ -1894,12 +1875,12 @@ class GemmaTextProcessor(
             } else {
                 ""
             }
-            val thinkNote = if (!disableThinking && llmChoice.supportsThinking) {
+            val thinkNote = if (!effectiveDisableThinking) {
                 " Keep internal reasoning under 20 words."
             } else {
                 ""
             }
-            return """You are a surgical speech-to-text diff editor. Instead of rewriting the whole transcript, output ONLY minimal phrase replacements in the speaker's exact language$langNote:
+            val body = """You are a surgical speech-to-text diff editor. Instead of rewriting the whole transcript, output ONLY minimal phrase replacements in the speaker's exact language$langNote:
 - Fix vocal fillers ('um', 'uh', 'äh', 'ähm', hesitation 'like'), stutters ('the the'), mid-sentence self-corrections ('tuesday wait no wednesday' -> 'Wednesday'), spoken numbers/times/currencies/versions/units ('three thirty pm' -> '3:30 PM', 'eight gigabyte ram' -> '8 GB RAM'), acronyms ('npu' -> 'NPU'), and broken mid-sentence punctuation/casing.$vocabLine
 - Format: One replacement per line as `exact source phrase => edited phrase`. Include 2–4 surrounding source words on BOTH sides so every `exact source phrase` matches a unique substring of <transcript> verbatim.
 - If <transcript> already needs NO changes, output the single word `NONE`.
@@ -1909,6 +1890,7 @@ EXAMPLE Output:
 solid. Um let's move => solid. Let's move
 from tuesday wait no thursday at three thirty pm => from Thursday at 3:30 PM
 check eight gigabyte ram headroom => check 8 GB RAM headroom"""
+            return applyModelSystemHeader(body, llmChoice, effectiveDisableThinking)
         }
 
         fun computeSpanPatchMaxOutputTokens(
@@ -2044,20 +2026,18 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         /**
-         * Pillar 5 — Right-Sized KV Context Windows: Orders `maxNumTokens` candidates to match each
-         * model's actual dictation footprint (`1,536` for 0.6B / 1.5B Direct, `2,048` for 1.7B / Gemma 4)
-         * while locking static-KV / short-convolution models (`Liquid AI LFM3 1.7B` `ekv2048` + `kv_cache_c_*`)
-         * to their exact baked-in context length across all memory modes (preventing native LiteRT buffer-size aborts).
+         * Pillar 5 — Right-Sized KV Context Windows: Scales `maxNumTokens` dynamically (`1,536` / `2,048` / `4,096`)
+         * on dynamic-context models (`Gemma 4 E2B` & `Gemma 4 E4B`), while locking static `ekv4096` `.litertlm`
+         * graphs (`MiniCPM 5 2B`, `SmolLM3 3B`, `Granite 4.0 Micro`, `Ministral 3 3B`) to their exact compiled
+         * KV buffer length across all memory modes so LiteRT never hits static tensor shape mismatches.
          */
         fun selectTokenWindowCandidates(
             memoryMode: GemmaMemoryMode,
             llmChoice: LlmModelChoice,
             fileMaxContextTokens: Int? = null,
-            isDynamicContext: Boolean = llmChoice != LlmModelChoice.LFM_3_1_7B
+            isDynamicContext: Boolean = llmChoice.hasDynamicKvCache
         ): List<Int> {
-            if (llmChoice == LlmModelChoice.LFM_3_1_7B ||
-                (!isDynamicContext && fileMaxContextTokens != null && fileMaxContextTokens >= 512)
-            ) {
+            if (!isDynamicContext) {
                 val lockedTokens = (fileMaxContextTokens?.takeIf { it >= 512 } ?: llmChoice.preferredMaxContextTokens)
                     .coerceIn(512, DEFAULT_MAX_CONTEXT_TOKENS)
                 return listOf(lockedTokens)
@@ -2077,9 +2057,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         /**
          * Determines whether native `Backend.NPU` / `Backend.GOOGLE_TENSOR` JIT compilation may be probed.
-         * Standard `Liquid AI LFM3 1.7B` (`LFM3-1.7B_mixed_int4_ekv2048.litertlm`) is a CPU/GPU-only
-         * tri-hybrid graph with 13 custom `kv_cache_c_*` short-conv tensors and no NPU partitioning,
-         * so probing NPU JIT on it fatally crashes `LiteRtCompilerPluginCompile` in native C++.
+         * Standard CPU/GPU-exported `q4_block32` / `int4` community bundles (`MiniCPM 5 2B`, `SmolLM3 3B`,
+         * `Granite 4.0 Micro`, `Ministral 3 3B`) declare `supported_backends = [CPU, GPU]` without NPU
+         * partitioning, so they go directly to `Backend.GPU` -> `Backend.CPU` unless a custom `*_npu.litertlm`
+         * bundle is side-loaded.
          */
         internal fun shouldAllowNpuBackend(
             llmChoice: LlmModelChoice,
@@ -2094,36 +2075,46 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         /**
-         * Returns the preferred `EngineConfig.activationDataType` for [llmChoice].
-         * `LFM3 1.7B` omits `prefer_activation_type` in `LlmMetadata` and mixes FP16 OpenCL matmuls with
-         * native `kv_cache_c_*` short-conv state tensors, so `null` preserves native tensor activation types.
+         * Minimum free system RAM (in MB) required before falling back to `Backend.CPU` (`XNNPACK`),
+         * which unpacks quantized weights into host RAM (~1.8–3.2 GB depending on parameter count).
+         */
+        internal fun minCpuFallbackAvailRamMb(llmChoice: LlmModelChoice): Long = when (llmChoice) {
+            LlmModelChoice.MINICPM_5_2B -> 1_500L
+            LlmModelChoice.GEMMA_4_E2B -> 1_600L
+            LlmModelChoice.SMOLLM_3_3B,
+            LlmModelChoice.GRANITE_4_MICRO,
+            LlmModelChoice.MINISTRAL_3_3B -> 2_000L
+            LlmModelChoice.GEMMA_4_E4B -> 2_500L
+        }
+
+        /**
+         * Returns the preferred `EngineConfig.activationDataType` for [llmChoice] (`FLOAT16` on GPU/NPU,
+         * `null` on CPU XNNPACK).
          */
         internal fun preferredActivationDataType(
             llmChoice: LlmModelChoice,
             isCpuBackend: Boolean
         ): ActivationDataType? {
-            if (isCpuBackend || llmChoice == LlmModelChoice.LFM_3_1_7B) return null
+            if (isCpuBackend) return null
             return ActivationDataType.FLOAT16
         }
 
         /**
-         * Returns whether `ExperimentalFlags.filterChannelContentFromKvCache` is safe for [llmChoice].
-         * Position-based KV rewinding is designed for pure attention KV caches (`Gemma 4`, `Qwen 3`),
-         * not `LFM3`'s non-positional rolling short-convolution state (`kv_cache_c_*`).
+         * Returns whether `ExperimentalFlags.filterChannelContentFromKvCache` should strip reasoning
+         * channel tokens (`<think>...</think>` or `<|channel>thought...<channel|>`) from the KV cache.
          */
         internal fun shouldFilterChannelContentFromKvCache(llmChoice: LlmModelChoice): Boolean {
-            return llmChoice != LlmModelChoice.LFM_3_1_7B
+            return llmChoice.supportsThinking
         }
 
         /**
          * Resolves whether the active model uses a thinking channel (`<think>...</think>` or `<|channel>thought`)
-         * whose Jinja template must receive explicit `enable_thinking` control (`ThinkingConfig` + `extraContext`).
+         * whose Jinja template / runtime must receive explicit `enable_thinking` control (`ThinkingConfig` + `extraContext`).
          *
-         * `LFM3-1.7B_mixed_int4_ekv2048.litertlm` omits `LlmMetadata.supports_thinking` in its protobuf header
-         * (`ModelInfo.Llm.supportsThinking() == false`), yet its baked-in Jinja chat template defaults
-         * `{% set enable_thinking = enable_thinking | default(true) %}` and opens `<|im_start|>assistant\n<think>`
-         * unless `enable_thinking = false` is explicitly passed! Treating [LlmModelChoice.supportsThinking] as
-         * authoritative ensures `enable_thinking = false` renders `<think></think>` so tokens stream into visible text.
+         * Several `.litertlm` exports (such as `MiniCPM5-2B_int4.litertlm` and `SmolLM3-3B_q4_block32_ekv4096.litertlm`)
+         * omit `LlmMetadata.supports_thinking` in their protobuf header (`ModelInfo.Llm.supportsThinking() == false`)
+         * while defining a `thought` `<think>...</think>` channel in their Jinja template. Treating
+         * [LlmModelChoice.supportsThinking] as authoritative keeps both `Thinking Off` and `Thinking On` exact.
          */
         internal fun resolveEffectiveSupportsThinking(
             llmChoice: LlmModelChoice,
@@ -2134,7 +2125,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         /**
          * Builds the Jinja chat-template `extraContext` map controlling `enable_thinking` for models with
-         * reasoning channels (`LFM3`, `Qwen 3`, `Gemma 4`), while returning an empty map for direct instruct models.
+         * reasoning channels (`MiniCPM 5 2B`, `SmolLM3 3B`, `Gemma 4 E2B`, `Gemma 4 E4B`), while returning
+         * an empty map for direct instruct models (`Granite 4.0 Micro`, `Ministral 3 3B`).
          */
         internal fun buildTemplateExtraContext(
             modelSupportsThinking: Boolean,
@@ -2145,22 +2137,6 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             } else {
                 mapOf("enable_thinking" to !effectiveDisableThinking)
             }
-        }
-
-        /**
-         * Masks `<think>` (`124901`) and tool-call start tokens (`124903`, `124905`) at logit level on standard
-         * `Liquid AI LFM3 1.7B` non-NPU turns when thinking is disabled so `LFM3` can never re-open a `<think>`
-         * channel or emit stray tool-call blocks after `<|im_start|>assistant\n<think></think>`.
-         */
-        internal fun buildTurnSuppressTokensConfig(
-            llmChoice: LlmModelChoice,
-            isStandardModelFile: Boolean,
-            effectiveDisableThinking: Boolean,
-            isNpu: Boolean
-        ): SuppressTokensConfig? {
-            if (isNpu || !effectiveDisableThinking || !isStandardModelFile) return null
-            if (llmChoice != LlmModelChoice.LFM_3_1_7B) return null
-            return SuppressTokensConfig(LFM3_NON_THINKING_SUPPRESSED_TOKEN_IDS)
         }
 
         internal data class BackendInitGuardPlan(
@@ -2333,11 +2309,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             languageCode: String? = null,
             customVocabulary: List<String> = emptyList(),
             fieldContext: FlowFieldContext = FlowFieldContext.NONE,
-            precedingSegmentTail: String? = null
+            precedingSegmentTail: String? = null,
+            disableThinking: Boolean = true,
+            llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
         ): String {
+            val effectiveDisableThinking = disableThinking || !llmChoice.supportsThinking
             val langTag = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
             val cleanedVocab = customVocabulary.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(30)
-            return buildString {
+            val body = buildString {
                 if (preset == GemmaPromptPreset.CUSTOM && customPrompt.isNotBlank()) {
                     append(customPrompt.trim())
                 } else {
@@ -2352,6 +2331,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     append(" PrevTail: \"").append(precedingSegmentTail.trim()).append('"')
                 }
             }
+            return applyModelSystemHeader(body, llmChoice, effectiveDisableThinking)
         }
 
         private fun getOrCreateVocabRegex(term: String): Regex {
@@ -2550,7 +2530,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private fun initializeWithHardwareCascade(startIndex: Int) {
         synchronized(engineLock) {
             closeEngineLocked()
-            supportsPrefacePrefill = llmChoice != LlmModelChoice.LFM_3_1_7B
+            supportsPrefacePrefill = true
             ensureCacheRuntimeStamp(cacheDirectory, modelFile.length())
 
             val profile = NpuHardwareManager.detectHardwareProfile()
@@ -2579,15 +2559,16 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     is Backend.CPU -> "cpu"
                 }
 
-                // LFM3 1.7B unpacks ~2.21 GB on CPU XNNPACK; verify RAM headroom before malloc so LMKD never SIGKILLs the app.
-                if (isCpuCandidate && llmChoice == LlmModelChoice.LFM_3_1_7B) {
+                // Verify CPU XNNPACK RAM headroom before native weight allocation so Android LMKD never SIGKILLs the app.
+                if (isCpuCandidate) {
+                    val minCpuRamMb = minCpuFallbackAvailRamMb(llmChoice)
                     val availRamMb = queryAvailableSystemRamMb()
-                    if (availRamMb in 1L until LFM3_MIN_CPU_AVAIL_RAM_MB) {
+                    if (availRamMb in 1L until minCpuRamMb) {
                         val oomGuardErr = IllegalStateException(
-                            "Insufficient free RAM (${availRamMb}MB < ${LFM3_MIN_CPU_AVAIL_RAM_MB}MB) for ${llmChoice.title} CPU fallback"
+                            "Insufficient free RAM (${availRamMb}MB < ${minCpuRamMb}MB) for ${llmChoice.title} CPU fallback"
                         )
                         lastError = oomGuardErr
-                        DebugLogManager.logWarn(TAG, oomGuardErr.message ?: "Skipped LFM3 CPU fallback due to low RAM")
+                        DebugLogManager.logWarn(TAG, oomGuardErr.message ?: "Skipped CPU fallback due to low RAM")
                         continue
                     }
                 }
@@ -2793,7 +2774,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 val declaredBackends = runCatching { info.supportedBackends(Modality.TEXT).toSet() }.getOrDefault(emptySet())
                 val maxCtx = runCatching { info.maxContextTokens().takeIf { it > 0 } }.getOrNull()
                 val isDynamicCtx = runCatching { info.isDynamicContext() }
-                    .getOrDefault(llmChoice != LlmModelChoice.LFM_3_1_7B)
+                    .getOrDefault(llmChoice.hasDynamicKvCache)
                 DetectedModelMetadata(
                     supportsMtp = supportsMtp,
                     supportsThinking = supportsThinking,
@@ -2808,7 +2789,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 supportsThinking = llmChoice.supportsThinking,
                 declaredTextBackends = emptySet(),
                 fileMaxContextTokens = null,
-                isDynamicContext = llmChoice != LlmModelChoice.LFM_3_1_7B
+                isDynamicContext = llmChoice.hasDynamicKvCache
             )
         }
     }
@@ -2911,7 +2892,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         adaptiveThinking: Boolean = false,
         fieldContext: FlowFieldContext = inspectActiveFieldContext()
     ): Boolean {
-        if (memoryMode == GemmaMemoryMode.LOW_MEMORY || llmChoice == LlmModelChoice.LFM_3_1_7B) {
+        if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
             evictCachedSystemPrompt()
             return false
         }
@@ -2964,7 +2945,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     languageCode = null,
                     customVocabulary = customVocabulary,
                     fieldContext = fieldContext,
-                    precedingSegmentTail = null
+                    precedingSegmentTail = null,
+                    disableThinking = effectiveDisableThinking,
+                    llmChoice = llmChoice
                 )
             } else {
                 buildSystemInstruction(
@@ -3043,12 +3026,6 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         disableThinking: Boolean = false,
         adaptiveThinking: Boolean = false
     ) {
-        if (llmChoice == LlmModelChoice.LFM_3_1_7B) {
-            // Engine.initialize() already compiled & cached GPU OpenCL kernels; avoid dummy conversations
-            // so LFM3's kv_cache_c_* short-convolution state stays clean for the first dictation turn.
-            evictCachedSystemPrompt()
-            return
-        }
         if (memoryMode != GemmaMemoryMode.LOW_MEMORY &&
             prewarmSystemPrompt(
                 preset = preset,
@@ -3066,7 +3043,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             val isNpu = isRunningOnNpu
             val modelSupportsThinking = effectiveSupportsThinking
             val config = ConversationConfig(
-                systemInstruction = Contents.of("Output OK."),
+                systemInstruction = Contents.of(
+                    applyModelSystemHeader("Output OK.", llmChoice, effectiveDisableThinking = true)
+                ),
                 samplerConfig = buildModelSamplerConfig(isNpu, preset),
                 automaticToolCalling = false,
                 extraContext = buildTemplateExtraContext(
@@ -3455,7 +3434,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 languageCode = if (requestedCacheKey != null) null else languageCode,
                 customVocabulary = customVocabulary,
                 fieldContext = effectiveFieldContext,
-                precedingSegmentTail = precedingTail
+                precedingSegmentTail = precedingTail,
+                disableThinking = segmentDisableThinking,
+                llmChoice = llmChoice
             )
         } else {
             buildSystemInstruction(
@@ -3883,12 +3864,6 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             640
         }
         val noRepeatNgram = if (isNpu) null else NoRepeatNgramConfig(6, 64)
-        val suppressTokens = buildTurnSuppressTokensConfig(
-            llmChoice = llmChoice,
-            isStandardModelFile = modelFile.name == llmChoice.modelFileName,
-            effectiveDisableThinking = effectiveDisableThinking,
-            isNpu = isNpu
-        )
         val sendStartNs = SystemClock.elapsedRealtimeNanos()
 
         val callback = object : MessageCallback {
@@ -3973,7 +3948,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 templateContext,
                 null,
                 noRepeatNgram,
-                suppressTokens,
+                null,
                 maxOutTokens,
                 thinkingConfig
             )
@@ -3984,7 +3959,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 templateContext,
                 null,
                 noRepeatNgram,
-                suppressTokens,
+                null,
                 maxOutTokens,
                 thinkingConfig
             )
@@ -4166,7 +4141,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     languageCode = null,
                     customVocabulary = customVocabulary,
                     fieldContext = FlowFieldContext.NONE,
-                    precedingSegmentTail = null
+                    precedingSegmentTail = null,
+                    disableThinking = noThink,
+                    llmChoice = llmChoice
                 )
             } else {
                 buildSystemInstruction(
@@ -4297,21 +4274,6 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         }
 
         // Pass 2: Warm / Cached System Prompt (KV Cache Prefilled)
-        if (llmChoice == LlmModelChoice.LFM_3_1_7B) {
-            return LlmBenchmarkResult(
-                modelTitle = llmChoice.title,
-                backendSummary = activeBackendSummary,
-                promptPresetTitle = preset.title,
-                thinkingModeSummary = thinkingSummary,
-                inputText = trimmedRaw,
-                cleanedOutput = uncachedCleaned,
-                uncached = uncachedMetrics,
-                cached = null,
-                cachePrewarmMs = 0L,
-                cachedSystemPromptTokens = 0,
-                cacheUnavailableReason = "LFM3 1.7B runs each turn as a fresh single-pass prefill to keep kv_cache_c short-conv state clean across dictations."
-            )
-        }
         if (memoryMode == GemmaMemoryMode.LOW_MEMORY) {
             return LlmBenchmarkResult(
                 modelTitle = llmChoice.title,

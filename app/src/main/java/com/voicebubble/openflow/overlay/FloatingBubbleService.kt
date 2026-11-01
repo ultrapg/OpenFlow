@@ -1002,7 +1002,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             // Fast (<2ms, zero-BFS) pin of the currently focused editable field
                             TextInjectionAccessibilityService.getSharedInstance()?.captureTargetNodeForDictation()
 
-                            // Start overlapping Ear + Voz + LFM3/LLM preparation immediately at t = 0 ms in parallel
+                            // Start overlapping Ear + Voz + LLM preparation immediately at t = 0 ms in parallel
                             // with AudioRecord Binder initialization on Dispatchers.IO
                             smartPipeline.onRecordingStartedAsync()
 

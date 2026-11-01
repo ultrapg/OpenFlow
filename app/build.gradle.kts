@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 49
-        versionName = "2.14.2"
+        versionCode = 50
+        versionName = "2.15.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

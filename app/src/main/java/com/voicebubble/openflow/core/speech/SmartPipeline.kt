@@ -144,13 +144,16 @@ data class MemoryPressureReport(
 
     /**
      * Scales system-prompt KV-cache pre-warming threshold to the active [llmChoice]'s KV footprint.
-     * Liquid AI LFM3 1.7B skips separate system-prompt prewarming because its <200-token LIQUID_LFM_3
-     * prompt + <transcript> pack into a single prefill_256 pass and keep kv_cache_c_* state clean.
      */
     fun canPrewarmLlmPromptCache(llmChoice: LlmModelChoice): Boolean {
-        if (llmChoice == LlmModelChoice.LFM_3_1_7B) return false
-        if (llmChoice == LlmModelChoice.GEMMA_4_E2B) return canPrewarmGemmaPromptCache
-        return !isAnyMemoryTight && systemAvailMb >= 900L && jvmFreeHeadroomMb >= 72L
+        return when (llmChoice) {
+            LlmModelChoice.GEMMA_4_E4B ->
+                !isAnyMemoryTight && systemAvailMb >= 1_750L && jvmFreeHeadroomMb >= 96L
+            LlmModelChoice.GEMMA_4_E2B ->
+                canPrewarmGemmaPromptCache
+            else ->
+                !isAnyMemoryTight && systemAvailMb >= 1_050L && jvmFreeHeadroomMb >= 80L
+        }
     }
 
     /**
@@ -166,6 +169,18 @@ data class MemoryPressureReport(
         llmAlreadyLoaded: Boolean
     ): Boolean {
         if (isAnyMemoryTight) return false
+        if (llmChoice == LlmModelChoice.GEMMA_4_E4B) {
+            return when {
+                vozAlreadyLoaded && llmAlreadyLoaded ->
+                    systemAvailMb >= 1_300L
+                vozAlreadyLoaded && !llmAlreadyLoaded ->
+                    systemTotalMb >= 9_500L && systemAvailMb >= 2_800L
+                !vozAlreadyLoaded && llmAlreadyLoaded ->
+                    systemTotalMb >= 9_500L && systemAvailMb >= 2_500L
+                else ->
+                    systemTotalMb >= 10_000L && systemAvailMb >= 3_400L
+            }
+        }
         if (llmChoice == LlmModelChoice.GEMMA_4_E2B) {
             return when {
                 vozAlreadyLoaded && llmAlreadyLoaded ->
@@ -180,17 +195,16 @@ data class MemoryPressureReport(
         }
         val llmNeedMb = llmChoice.estimatedStandaloneRamMb.toLong()
         val minTotalRamMb = when {
-            llmNeedMb <= 700L -> 3_600L
             llmNeedMb <= 1_150L -> 5_200L
-            else -> 5_600L
+            else -> 6_200L
         }
         return when {
             vozAlreadyLoaded && llmAlreadyLoaded ->
-                systemAvailMb >= 800L
+                systemAvailMb >= 850L
             vozAlreadyLoaded && !llmAlreadyLoaded ->
                 systemTotalMb >= minTotalRamMb && systemAvailMb >= llmNeedMb + 500L
             !vozAlreadyLoaded && llmAlreadyLoaded ->
-                systemTotalMb >= minTotalRamMb && systemAvailMb >= 1_850L
+                systemTotalMb >= minTotalRamMb && systemAvailMb >= 1_900L
             else ->
                 systemTotalMb >= minTotalRamMb && systemAvailMb >= llmNeedMb + 1_650L
         }
@@ -244,7 +258,7 @@ data class PipelineStatus(
  * 1. `Ear` — Spoken language identification (optional)
  * 2. `Voz` — Multilingual speech-to-text across 25 European languages
  * 3. Cross-chunk stitching & custom vocabulary normalization
- * 4. Optional single-model AI post-processing (`Qwen 3` / `Qwen 2.5` / `Gemma 4 E2B` via `LiteRT-LM`) or `Punct`
+ * 4. Optional single-model AI post-processing (`Gemma 4` / `Ministral 3` / `Granite 4.0` / `SmolLM3` / `MiniCPM 5` via `LiteRT-LM`) or `Punct`
  */
 class SmartPipeline(
     context: Context,
@@ -627,8 +641,7 @@ class SmartPipeline(
                 val postProcAlreadyLoaded = (needsLlm && gemmaProcessor != null && loadedLlmChoice == activeSnap.selectedLlmModel) ||
                     (needsPunct && punctRestorer != null)
                 val isCompactPostProc = needsPunct ||
-                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B_LITE ||
-                    activeSnap.selectedLlmModel == LlmModelChoice.QWEN_3_0_6B
+                    activeSnap.selectedLlmModel == LlmModelChoice.MINICPM_5_2B
                 targetPostProcOverlapMs = when {
                     postProcAlreadyLoaded -> 0L // Prewarm system-prompt KV cache immediately while user starts speaking!
                     isCompactPostProc -> FAST_POST_PROC_OVERLAP_MS
@@ -678,11 +691,12 @@ class SmartPipeline(
                             }
                             val memBeforeLlm = evaluateMemoryPressure()
                             val safeLiveOverlapHeadroom = when (selectedLlm) {
+                                LlmModelChoice.GEMMA_4_E4B ->
+                                    memBeforeLlm.systemAvailMb >= 3_600L && memBeforeLlm.systemTotalMb >= 11_000L
                                 LlmModelChoice.GEMMA_4_E2B ->
                                     memBeforeLlm.systemAvailMb >= 2_900L && memBeforeLlm.systemTotalMb >= 9_000L
-                                LlmModelChoice.LFM_3_1_7B ->
-                                    memBeforeLlm.systemAvailMb >= 2_400L && memBeforeLlm.systemTotalMb >= 7_200L
-                                else -> true
+                                else ->
+                                    memBeforeLlm.systemAvailMb >= 2_200L && memBeforeLlm.systemTotalMb >= 7_000L
                             }
                             if (gemmaProcessor == null &&
                                 safeLiveOverlapHeadroom &&
@@ -916,7 +930,11 @@ class SmartPipeline(
                 if (!activeSnap.gemmaEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
                 val selectedLlm = activeSnap.selectedLlmModel
                 val mem = evaluateMemoryPressure()
-                val minPostDictationAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 1_350L else 950L
+                val minPostDictationAvailMb = when (selectedLlm) {
+                    LlmModelChoice.GEMMA_4_E4B -> 1_750L
+                    LlmModelChoice.GEMMA_4_E2B -> 1_350L
+                    else -> 1_050L
+                }
                 if (mem.canPrewarmLlmPromptCache(selectedLlm) && mem.systemAvailMb >= minPostDictationAvailMb) {
                     gemma.prewarmSystemPrompt(
                         preset = activeSnap.gemmaPromptPreset,
@@ -1673,7 +1691,11 @@ class SmartPipeline(
                         vozAlreadyLoaded = voz != null,
                         llmAlreadyLoaded = true
                     )
-                    val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
+                    val minPostPassAvailMb = when (selectedLlm) {
+                        LlmModelChoice.GEMMA_4_E4B -> 1_200L
+                        LlmModelChoice.GEMMA_4_E2B -> 950L
+                        else -> 800L
+                    }
                     if (!activeSettings.gemmaEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
                         closeGemmaLocked()
                         System.gc()
@@ -2641,7 +2663,11 @@ class SmartPipeline(
                 vozAlreadyLoaded = voz != null,
                 llmAlreadyLoaded = true
             )
-            val minPostPassAvailMb = if (selectedLlm == LlmModelChoice.GEMMA_4_E2B) 950L else 700L
+            val minPostPassAvailMb = when (selectedLlm) {
+                LlmModelChoice.GEMMA_4_E4B -> 1_200L
+                LlmModelChoice.GEMMA_4_E2B -> 950L
+                else -> 800L
+            }
             if (!keepWarmForStreamingOverlap &&
                 (dynamicStageRelease || postGemmaMem.systemAvailMb < minPostPassAvailMb || cannotKeepAlongsideVoz)
             ) {

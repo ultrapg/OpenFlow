@@ -1355,8 +1355,8 @@ private fun LlmModelOptionCard(
                     Surface(
                         shape = RoundedCornerShape(8.dp),
                         color = when (choice) {
-                            LlmModelChoice.LFM_3_1_7B -> MaterialTheme.colorScheme.primaryContainer
-                            LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.tertiaryContainer
+                            LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.primaryContainer
+                            LlmModelChoice.GEMMA_4_E4B -> MaterialTheme.colorScheme.tertiaryContainer
                             else -> MaterialTheme.colorScheme.secondaryContainer
                         }
                     ) {
@@ -1365,8 +1365,8 @@ private fun LlmModelOptionCard(
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = when (choice) {
-                                LlmModelChoice.LFM_3_1_7B -> MaterialTheme.colorScheme.onPrimaryContainer
-                                LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.onTertiaryContainer
+                                LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.onPrimaryContainer
+                                LlmModelChoice.GEMMA_4_E4B -> MaterialTheme.colorScheme.onTertiaryContainer
                                 else -> MaterialTheme.colorScheme.onSecondaryContainer
                             },
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
