@@ -81,46 +81,46 @@ enum class DesertAntModel(
         expectedBytes = 295_740_930L,
         isRequired = false
     ),
-    MINICPM_5_2B(
-        id = "minicpm5_2b",
-        shortLabel = "MiniCPM 5 2B",
-        displayName = "MiniCPM 5 2B",
-        roleSummary = "1.45 GB • Compact 2.5B cleanup & structure",
-        sizeMb = 1482,
-        expectedBytes = 1_553_670_064L,
+    GRANITE_4_1_3B(
+        id = "granite4_1_3b",
+        shortLabel = "Granite 4.1 3B",
+        displayName = "IBM Granite 4.1 3B",
+        roleSummary = "2.04 GB • IBM dense 3B direct instruct editor",
+        sizeMb = 2090,
+        expectedBytes = 2_191_540_224L,
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
     ),
-    SMOLLM_3_3B(
-        id = "smollm3_3b",
-        shortLabel = "SmolLM3 3B",
-        displayName = "SmolLM3 3B",
-        roleSummary = "1.87 GB • Balanced 3B multi-clause editor",
-        sizeMb = 1912,
-        expectedBytes = 2_004_664_320L,
+    QWEN3_4B_INSTRUCT_2507(
+        id = "qwen3_4b_instruct_2507",
+        shortLabel = "Qwen3 4B Instruct",
+        displayName = "Qwen3 4B Instruct 2507",
+        roleSummary = "2.48 GB • Strong 4B non-thinking multilingual editor",
+        sizeMb = 2536,
+        expectedBytes = 2_659_057_664L,
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
     ),
-    GRANITE_4_MICRO(
-        id = "granite4_micro",
-        shortLabel = "Granite 4.0 Micro",
-        displayName = "IBM Granite 4.0 Micro",
-        roleSummary = "2.05 GB • IBM 3B direct instruct editor",
-        sizeMb = 2097,
-        expectedBytes = 2_198_475_104L,
+    GRANITE_4_2_3B(
+        id = "granite4_2_3b",
+        shortLabel = "Granite 4.2 3B",
+        displayName = "IBM Granite 4.2 3B",
+        roleSummary = "2.04 GB • IBM 3B with switchable reasoning",
+        sizeMb = 2089,
+        expectedBytes = 2_190_819_328L,
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
     ),
-    MINISTRAL_3_3B(
-        id = "ministral3_3b",
-        shortLabel = "Ministral 3 3B",
-        displayName = "Ministral 3 3B Instruct",
-        roleSummary = "2.18 GB • Mistral 3B European multilingual",
-        sizeMb = 2234,
-        expectedBytes = 2_342_895_616L,
+    QWEN3_4B(
+        id = "qwen3_4b",
+        shortLabel = "Qwen3 4B",
+        displayName = "Qwen3 4B",
+        roleSummary = "2.12 GB • 4B hybrid thinking / non-thinking editor",
+        sizeMb = 2168,
+        expectedBytes = 2_272_935_936L,
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
@@ -135,17 +135,6 @@ enum class DesertAntModel(
         isRequired = false,
         isExperimental = true,
         isLlmModel = true
-    ),
-    GEMMA_4_E4B(
-        id = "gemma4_e4b",
-        shortLabel = "Gemma 4 E4B",
-        displayName = "Gemma 4 E4B",
-        roleSummary = "3.41 GB • Pro 4.5B maximum accuracy & reasoning",
-        sizeMb = 3490,
-        expectedBytes = 3_659_530_240L,
-        isRequired = false,
-        isExperimental = true,
-        isLlmModel = true
     );
 
     val sizeGbLabel: String
@@ -157,16 +146,13 @@ enum class DesertAntModel(
  * behavior, and reasoning architecture.
  */
 enum class LlmPromptTier {
-    /** Crisp <240-token prompt + 1 grounded example engineered to stay inside MiniCPM 5 2B's prefill_256 bucket (avoiding 4x padding to prefill_1024). */
-    COMPACT_2B,
-
-    /** Deterministic non-conversational text-filter framing for direct 3B instruct models with no `<think>` scratchpad (Granite 4.0 Micro & Ministral 3 3B). */
+    /** Deterministic non-conversational text-filter framing for direct 3-4B instruct models with no `<think>` scratchpad (Granite 4.1 3B & Qwen3 4B Instruct 2507). */
     DIRECT_INSTRUCT_3B,
 
-    /** High-signal multi-rule prompt + grounded examples + `/no_think` / `/think` metadata control for SmolLM3 3B. */
+    /** High-signal multi-rule prompt + grounded examples for 3-4B models with a switchable `<think>` channel (Qwen3 4B & Granite 4.2 3B). */
     BALANCED_3B,
 
-    /** Full Wispr Flow multi-clause, nuance-preserving prompt + multilingual examples for flagship Gemma 4 E2B & Gemma 4 E4B. */
+    /** Full Wispr Flow multi-clause, nuance-preserving prompt + multilingual examples for flagship Gemma 4 E2B. */
     FLAGSHIP_GEMMA_4
 }
 
@@ -193,91 +179,109 @@ enum class LlmModelChoice(
     val samplerTopP: Double,
     val samplerTemperature: Double,
     val defaultDisableThinking: Boolean = false,
-    val hasDynamicKvCache: Boolean = false
+    val hasDynamicKvCache: Boolean = false,
+    /**
+     * `false` when the bundled Jinja chat template dereferences `messages[0]` unconditionally (Qwen3 and
+     * Granite 4.2 families). LiteRT-LM renders the preface with an empty message list for
+     * `prefillPrefaceOnInit = true`, which makes `createConversation` fail with
+     * `Failed to apply template: undefined value`, so system-prompt KV pre-warming is skipped up front
+     * instead of paying for a doomed conversation creation on every dictation.
+     */
+    val supportsPrefaceKvPrefill: Boolean = true,
+    /**
+     * `true` when greedy decoding makes the model's `<think>` scratchpad degenerate into repetition loops
+     * (Qwen3 recommends `temperature 0.6 / top-p 0.95 / top-k 20` for thinking). Turns with thinking enabled
+     * use the model's sampler settings instead of pure argmax; thinking-off turns stay greedy.
+     */
+    val needsSamplingWhileThinking: Boolean = false
 ) {
-    MINICPM_5_2B(
-        id = "minicpm5_2b",
-        desertAntModel = DesertAntModel.MINICPM_5_2B,
-        modelFileName = "MiniCPM5-2B_int4.litertlm",
-        title = "MiniCPM 5 2B",
-        badgeLabel = "COMPACT",
-        speedAndRamSummary = "1.45 GB",
-        description = "Compact 2.5B cleanup & structure",
-        estimatedStandaloneRamMb = 1_150,
-        estimatedIncrementalRamMb = 700,
-        supportsThinking = true,
+    GRANITE_4_1_3B(
+        id = "granite4_1_3b",
+        desertAntModel = DesertAntModel.GRANITE_4_1_3B,
+        modelFileName = "granite-4.1-3b_int4.litertlm",
+        title = "IBM Granite 4.1 3B",
+        badgeLabel = "DIRECT",
+        speedAndRamSummary = "2.04 GB",
+        description = "IBM dense 3B direct instruct editor",
+        estimatedStandaloneRamMb = 1_450,
+        estimatedIncrementalRamMb = 850,
+        supportsThinking = false,
         supportsNpuBackend = false,
-        promptTier = LlmPromptTier.COMPACT_2B,
+        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
         preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 96,
+        thinkingTokenBudgetCap = 0,
         samplerTopK = 16,
         samplerTopP = 0.88,
         samplerTemperature = 0.06,
         defaultDisableThinking = true,
         hasDynamicKvCache = false
     ),
-    SMOLLM_3_3B(
-        id = "smollm3_3b",
-        desertAntModel = DesertAntModel.SMOLLM_3_3B,
-        modelFileName = "SmolLM3-3B_q4_block32_ekv4096.litertlm",
-        title = "SmolLM3 3B",
-        badgeLabel = "BALANCED",
-        speedAndRamSummary = "1.87 GB",
-        description = "Balanced 3B multi-clause editor",
-        estimatedStandaloneRamMb = 1_250,
-        estimatedIncrementalRamMb = 750,
+    QWEN3_4B_INSTRUCT_2507(
+        id = "qwen3_4b_instruct_2507",
+        desertAntModel = DesertAntModel.QWEN3_4B_INSTRUCT_2507,
+        modelFileName = "qwen3_4b_instruct_2507_mixed_int4.litertlm",
+        title = "Qwen3 4B Instruct 2507",
+        badgeLabel = "BALANCED 4B",
+        speedAndRamSummary = "2.48 GB",
+        description = "Strong 4B multilingual direct editor",
+        estimatedStandaloneRamMb = 1_650,
+        estimatedIncrementalRamMb = 950,
+        supportsThinking = false,
+        supportsNpuBackend = false,
+        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
+        preferredMaxContextTokens = 2_048,
+        thinkingTokenBudgetCap = 0,
+        samplerTopK = 20,
+        samplerTopP = 0.90,
+        samplerTemperature = 0.07,
+        defaultDisableThinking = true,
+        hasDynamicKvCache = false,
+        supportsPrefaceKvPrefill = false
+    ),
+    GRANITE_4_2_3B(
+        id = "granite4_2_3b",
+        desertAntModel = DesertAntModel.GRANITE_4_2_3B,
+        modelFileName = "granite-4.2-3b_int4.litertlm",
+        title = "IBM Granite 4.2 3B",
+        badgeLabel = "REASONING 3B",
+        speedAndRamSummary = "2.04 GB",
+        description = "IBM 3B with switchable reasoning",
+        estimatedStandaloneRamMb = 1_450,
+        estimatedIncrementalRamMb = 850,
         supportsThinking = true,
         supportsNpuBackend = false,
         promptTier = LlmPromptTier.BALANCED_3B,
         preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 112,
+        thinkingTokenBudgetCap = 128,
         samplerTopK = 20,
         samplerTopP = 0.90,
         samplerTemperature = 0.08,
         defaultDisableThinking = true,
-        hasDynamicKvCache = false
+        hasDynamicKvCache = false,
+        supportsPrefaceKvPrefill = false
     ),
-    GRANITE_4_MICRO(
-        id = "granite4_micro",
-        desertAntModel = DesertAntModel.GRANITE_4_MICRO,
-        modelFileName = "granite-4.0-micro_int4.litertlm",
-        title = "IBM Granite 4.0 Micro",
-        badgeLabel = "DIRECT",
-        speedAndRamSummary = "2.05 GB",
-        description = "IBM 3B direct instruct editor",
-        estimatedStandaloneRamMb = 1_380,
-        estimatedIncrementalRamMb = 800,
-        supportsThinking = false,
+    QWEN3_4B(
+        id = "qwen3_4b",
+        desertAntModel = DesertAntModel.QWEN3_4B,
+        modelFileName = "qwen3_4b_mixed_int4.litertlm",
+        title = "Qwen3 4B",
+        badgeLabel = "THINKING 4B",
+        speedAndRamSummary = "2.12 GB",
+        description = "4B hybrid thinking auto-editor",
+        estimatedStandaloneRamMb = 1_650,
+        estimatedIncrementalRamMb = 950,
+        supportsThinking = true,
         supportsNpuBackend = false,
-        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
+        promptTier = LlmPromptTier.BALANCED_3B,
         preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 0,
-        samplerTopK = 16,
-        samplerTopP = 0.88,
-        samplerTemperature = 0.06,
-        defaultDisableThinking = true,
-        hasDynamicKvCache = false
-    ),
-    MINISTRAL_3_3B(
-        id = "ministral3_3b",
-        desertAntModel = DesertAntModel.MINISTRAL_3_3B,
-        modelFileName = "Ministral-3-3B-Instruct-2512_q4_block32_ekv4096.litertlm",
-        title = "Ministral 3 3B Instruct",
-        badgeLabel = "MULTILINGUAL",
-        speedAndRamSummary = "2.18 GB",
-        description = "Mistral 3B European multilingual",
-        estimatedStandaloneRamMb = 1_400,
-        estimatedIncrementalRamMb = 820,
-        supportsThinking = false,
-        supportsNpuBackend = false,
-        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
-        preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 0,
-        samplerTopK = 16,
+        thinkingTokenBudgetCap = 160,
+        samplerTopK = 20,
         samplerTopP = 0.90,
-        samplerTemperature = 0.07,
+        samplerTemperature = 0.10,
         defaultDisableThinking = true,
-        hasDynamicKvCache = false
+        hasDynamicKvCache = false,
+        supportsPrefaceKvPrefill = false,
+        needsSamplingWhileThinking = true
     ),
     GEMMA_4_E2B(
         id = "gemma4_e2b",
@@ -289,27 +293,6 @@ enum class LlmModelChoice(
         description = "Recommended flagship auto-editor",
         estimatedStandaloneRamMb = 1_900,
         estimatedIncrementalRamMb = 850,
-        supportsThinking = true,
-        supportsNpuBackend = true,
-        promptTier = LlmPromptTier.FLAGSHIP_GEMMA_4,
-        preferredMaxContextTokens = 2_048,
-        thinkingTokenBudgetCap = 256,
-        samplerTopK = 20,
-        samplerTopP = 0.90,
-        samplerTemperature = 0.10,
-        defaultDisableThinking = false,
-        hasDynamicKvCache = true
-    ),
-    GEMMA_4_E4B(
-        id = "gemma4_e4b",
-        desertAntModel = DesertAntModel.GEMMA_4_E4B,
-        modelFileName = "gemma-4-E4B-it.litertlm",
-        title = "Gemma 4 E4B",
-        badgeLabel = "PRO 4B",
-        speedAndRamSummary = "3.41 GB",
-        description = "Maximum accuracy 4.5B reasoning",
-        estimatedStandaloneRamMb = 2_450,
-        estimatedIncrementalRamMb = 1_150,
         supportsThinking = true,
         supportsNpuBackend = true,
         promptTier = LlmPromptTier.FLAGSHIP_GEMMA_4,
@@ -367,7 +350,7 @@ enum class GemmaPromptPreset(
 1. Self-corrections & backtracks: When the speaker retracts or revises words mid-thought ('wait', 'no wait', 'wait no', 'actually', 'actually sorry', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'oder nein', 'ich meine', 'besser gesagt'), delete BOTH the abandoned phrase and the repair cue, keeping ONLY the final intended wording. Keep genuine contrasts ('not X, but Y').
 2. Fillers, stutters & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word stutters ('the the', 'I I'), false starts, and hesitation 'like' / 'you know' / 'sort of' (never remove literal uses like 'I like this' or 'looks like'). Repair false mid-sentence pause periods, capitalization, and punctuation; keep spoken questions as questions.
 3. Vertical numbered & bulleted lists: Format spoken enumerations ('number one... number two... number three...', 'first... second... third...', 'one... two... three...', 'point one... point two...', 'item one... item two...', 'erstens... zweitens...', 'punkt eins... punkt zwei...') with a colon ':' on any lead-in clause (replacing spoken 'colon' / 'doppelpunkt') and put EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' (stripping the spoken cue). Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
-4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and model names ('MiniCPM 5 2B', 'Gemma 4 E2B'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
+4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and model names ('Qwen3 4B', 'Gemma 4 E2B'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
 5. Paragraphs, emails & tech casing: Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') removing the cue, format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev'), capitalize technical terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'camelCase', 'snake_case'), and separate spoken greetings/sign-offs without inventing unspoken ones."""
     ),
     STRICT_CLEANUP(
@@ -411,19 +394,6 @@ enum class GemmaPromptPreset(
      * prefill bucket efficiency, and instruction-following behavior.
      */
     fun promptForModel(llmChoice: LlmModelChoice): String = when (llmChoice.promptTier) {
-        LlmPromptTier.COMPACT_2B -> when (this) {
-            CLEAN_AND_POLISH -> """Auto-edit <transcript> in its exact language (never translate or answer):
-- Backtracks (wait/wait no/make that/actually/sorry/I mean/scratch): keep ONLY final repair; keep 'not X, but Y'.
-- Strip fillers (um/uh/er/hmm/äh/ähm), stutters & false periods; fix punctuation; keep '?'.
-- Lists (number one/two, first/second): ':' then vertical '1. ', '2. ' lines; 'bullet' -> '- '.
-- Digits for units/times/dates/money/%/versions ('6 GB', '380 ms') & 10+; uppercase NPU/GPU/RAM/LLM/API."""
-            STRICT_CLEANUP -> "Clean <transcript> verbatim in its exact language (never answer): strip fillers (um/uh/äh/ähm/hm), stutters, & self-repairs (keep final repair), write 10+, decimals, times, dates, money, versions, & units ('6 GB', '380 ms') as digits, capitalize NPU/GPU/RAM/LLM/API, and fix punctuation/casing with zero rephrasing."
-            CONCISE_DIRECT -> "Edit <transcript> into crisp, scannable text in its exact language (never answer): resolve backtracks, strip fillers & wordy repetition, place multi-item lists on new '1. ' or '- ' lines after ':', and write numbers, times, dates, money, versions, & units as digits while keeping all facts."
-            PROFESSIONAL_MESSAGE -> "Format <transcript> as a clean email or work message in its exact language: resolve backtracks & strip fillers, place spoken greetings ('Hi Sarah,') & sign-offs ('Best,\\nAlex') on separate lines (invent none), put action items on '1. ' or '- ' lines, and format dates/times/money/units as digits."
-            STRUCTURED_NOTES -> "Turn <transcript> into vertical '- ' bullet notes (or '1. ' numbered lines for sequences) in its exact language: resolve backtracks, strip fillers/stutters, and format numbers, times, dates, versions, & units cleanly as digits."
-            CUSTOM -> defaultSystemPrompt
-        }
-
         LlmPromptTier.DIRECT_INSTRUCT_3B -> when (this) {
             CLEAN_AND_POLISH -> """Act as a deterministic speech-to-text cleanup filter (NOT a conversational assistant). Output the speaker's dictated message cleaned and formatted in their own voice and language:
 - Backtracks & self-repairs: If the speaker retracts words mid-sentence ('actually', 'wait', 'no wait', 'wait no', 'sorry', 'I mean', 'make that', 'scratch that', 'nein warte', 'ich meine'), delete both the retracted words and the repair cue, keeping only the corrected wording. Preserve real contrasts ('not X, but Y').
@@ -457,7 +427,7 @@ enum class GemmaPromptPreset(
    - End any lead-in clause with ':' (replacing spoken 'colon' / 'doppelpunkt'), strip the spoken cue ('number one', 'first'), and place EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' — NEVER write '1. ... 2. ... 3. ...' inline on one paragraph line.
    - Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
 4. Numbers, dates & units:
-   - ALWAYS use digits (including 0–9) when paired with ANY unit, time, date, percent, currency, version, or model/spec name: percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30', 'November 24, 2026'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '1,500 MB', '380 ms', '42.5 tokens/s', '5 minutes', '30 seconds', '2,048 tokens'), and model names ('MiniCPM 5 2B', 'Gemma 4 E2B', 'Gemma 4 E4B').
+   - ALWAYS use digits (including 0–9) when paired with ANY unit, time, date, percent, currency, version, or model/spec name: percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30', 'November 24, 2026'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '1,500 MB', '380 ms', '42.5 tokens/s', '5 minutes', '30 seconds', '2,048 tokens'), and model names ('Qwen3 4B', 'Granite 4.2 3B', 'Gemma 4 E2B').
    - Spell out standalone prose counts one through nine ONLY when not paired with a unit ('three local models', 'four things'), and use digits for standalone 10+.
 5. Paragraphs, emails & technical terms:
    - Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') and delete the cue words.
@@ -579,8 +549,8 @@ data class ModelSettings(
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
-     *   - Active LLM (`MiniCPM 5 2B` +700 MB, `SmolLM3 3B` +750 MB, `Granite 4.0 Micro` +800 MB,
-     *     `Ministral 3 3B` +820 MB, `Gemma 4 E2B` +850 MB, `Gemma 4 E4B` +1,150 MB), OR
+     *   - Active LLM (`Granite 4.1 3B` / `Granite 4.2 3B` +850 MB, `Gemma 4 E2B` +850 MB,
+     *     `Qwen3 4B` / `Qwen3 4B Instruct 2507` +950 MB), OR
      *   - `Punct` (+120 MB) when AI post-processing is disabled.
      */
     val estimatedPeakRamMb: Int
@@ -596,12 +566,11 @@ data class ModelSettings(
         DesertAntModel.VOZ -> true
         DesertAntModel.EAR -> earEnabled
         DesertAntModel.PUNCT -> punctEnabled
-        DesertAntModel.MINICPM_5_2B,
-        DesertAntModel.SMOLLM_3_3B,
-        DesertAntModel.GRANITE_4_MICRO,
-        DesertAntModel.MINISTRAL_3_3B,
-        DesertAntModel.GEMMA_4_E2B,
-        DesertAntModel.GEMMA_4_E4B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
+        DesertAntModel.GRANITE_4_1_3B,
+        DesertAntModel.QWEN3_4B_INSTRUCT_2507,
+        DesertAntModel.GRANITE_4_2_3B,
+        DesertAntModel.QWEN3_4B,
+        DesertAntModel.GEMMA_4_E2B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
     }
 
     val autoUnloadSummary: String
@@ -820,12 +789,11 @@ object DesertAntModelStorage {
         DesertAntModel.VOZ to "v0.4.0",
         DesertAntModel.EAR to "v0.2.0",
         DesertAntModel.PUNCT to "v1.0.0",
-        DesertAntModel.MINICPM_5_2B to "v1.0.0",
-        DesertAntModel.SMOLLM_3_3B to "v1.0.0",
-        DesertAntModel.GRANITE_4_MICRO to "v1.0.0",
-        DesertAntModel.MINISTRAL_3_3B to "v1.0.0",
-        DesertAntModel.GEMMA_4_E2B to "v1.0.0",
-        DesertAntModel.GEMMA_4_E4B to "v1.0.0"
+        DesertAntModel.GRANITE_4_1_3B to "v1.0.0",
+        DesertAntModel.QWEN3_4B_INSTRUCT_2507 to "v1.0.0",
+        DesertAntModel.GRANITE_4_2_3B to "v1.0.0",
+        DesertAntModel.QWEN3_4B to "v1.0.0",
+        DesertAntModel.GEMMA_4_E2B to "v1.0.0"
     )
 
     // In-memory cache of (targetDir.absolutePath -> (lastModifiedSum, sizeSum)) for verified model directories
@@ -845,7 +813,12 @@ object DesertAntModelStorage {
         "qwen3_0_6b",
         "qwen3_1_7b",
         "lfm3_1_7b",
-        "qwen2_5_1_5b"
+        "qwen2_5_1_5b",
+        "minicpm5_2b",
+        "smollm3_3b",
+        "granite4_micro",
+        "ministral3_3b",
+        "gemma4_e4b"
     )
 
     fun modelRevision(model: DesertAntModel): String {

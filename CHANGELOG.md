@@ -2,6 +2,24 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.17.0] - 2026-11-03
+
+### Changed, Added & Refined
+- **Curated 5-Model LLM Lineup: `Gemma 4 E2B` Kept, All Other Models Replaced with 4 New Pure-Transformer Models (`ModelSettings`, `ModelDownloadManager`, `GemmaTextProcessor`, `SmartPipeline`, `SpeechRecognitionSettingsSection`):**
+  - **Removed** `Gemma 4 E4B`, `MiniCPM 5 2B`, `SmolLM3 3B`, `IBM Granite 4.0 Micro`, and `Ministral 3 3B Instruct`. Their cached model directories are deleted automatically on launch (`DesertAntModelStorage.cleanupLegacyRemovedModels`) and saved selections migrate to `Gemma 4 E2B`.
+  - **Added 4 new Apache-2.0 `.litertlm` models** (all pure Transformers, ungated, downloaded at pinned Hugging Face commits with SHA-256 verification, requiring `litertlm-android` 0.19.0 which is already bundled):
+    1. **`Qwen3 4B Instruct 2507`** (`litert-community/Qwen3-4B-Instruct-2507`, `2.48 GB`, `BALANCED 4B`) — strong non-thinking multilingual direct editor with a statically compiled `2,048`-token window.
+    2. **`Qwen3 4B`** (`litert-community/Qwen3-4B`, `2.12 GB`, `THINKING 4B`) — hybrid thinking / non-thinking 4B with the new GPU-composite INT4 export (`4,096`-token window), thinking off by default.
+    3. **`IBM Granite 4.1 3B`** (`litert-community/granite-4.1-3b`, `2.04 GB`, `DIRECT`) — dense 3B direct instruct editor.
+    4. **`IBM Granite 4.2 3B`** (`litert-community/granite-4.2-3b`, `2.04 GB`, `REASONING 3B`) — dense 3B with switchable reasoning (`enable_thinking`), thinking off by default.
+  - Hybrid linear-attention models (`Qwen3.5`, `LFM2.5`, `Nemotron-3-Nano`), looped/always-reasoning models (`Nanbeige 4.2`, `Spark-X2.5`), gated repositories (`Gemma 3`, `Llama 3.2`) and the 3.9 GB `Phi-4-mini` were evaluated and deliberately excluded (recurrent state is not reset across `Conversation`s, mandatory reasoning is too slow for dictation, anonymous download is impossible, or RAM/latency is too high).
+- **LLM Text-Processing Engine Refinements (`GemmaTextProcessor`, `LlmModelChoice`):**
+  - **No Doomed System-Prompt Pre-Warm on Qwen3 / Granite 4.2 (`supportsPrefaceKvPrefill`):** Their bundled Jinja templates dereference `messages[0]`, so `prefillPrefaceOnInit = true` fails with `Failed to apply template: undefined value`. These models now skip KV pre-warming up front (including `canPrewarmLlmPromptCache`) and always run a fresh single-turn conversation (which also avoids the runtime's multi-turn stop-token embedding issue).
+  - **Per-Model Static Windows & Pass Sizing:** `Qwen3 4B Instruct 2507` locks its exported `2,048`-token window and uses smaller `1,300`-character passes so system prompt + transcript + output always fit; Granite and `Qwen3 4B` lock `4,096`.
+  - **Sampler for Thinking Turns (`needsSamplingWhileThinking`):** `Qwen3 4B` thinking turns use the model's top-k/top-p sampler instead of pure greedy (which makes Qwen's `<think>` scratchpad loop); thinking-off turns stay greedy.
+  - **Unspoken-Content Guard (`introducesUnspokenContent`):** On `Auto-Edit` and `Light Cleanup`, an output where at least 6 content words and 45% of its content words never occur in the transcript (an answered question or invented continuation) is rejected and replaced with the deterministically normalized transcript; digits, units and inflections never trigger it.
+  - **Right-Sized Prompts & RAM Guards:** Removed the obsolete `COMPACT_2B` tier and SmolLM3 metadata header; per-model CPU-fallback headroom (`2,800` MB for Granite, `3,600` MB for Qwen 4B), `Voz` + LLM co-residency (`7,200` MB total RAM for 4B), live-overlap and post-pass RAM thresholds.
+
 ## [2.16.0] - 2026-11-03
 
 ### Added, Improved & Fixed

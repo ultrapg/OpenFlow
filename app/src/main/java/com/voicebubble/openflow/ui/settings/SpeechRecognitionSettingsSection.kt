@@ -673,7 +673,7 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3b. AI Post-Processing & Reformatting (6 Selectable Local LLMs • Smart Single-Model RAM)
+        // 3b. AI Post-Processing & Reformatting (5 Selectable Local LLMs • Smart Single-Model RAM)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -1356,7 +1356,8 @@ private fun LlmModelOptionCard(
                         shape = RoundedCornerShape(8.dp),
                         color = when (choice) {
                             LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.primaryContainer
-                            LlmModelChoice.GEMMA_4_E4B -> MaterialTheme.colorScheme.tertiaryContainer
+                            LlmModelChoice.QWEN3_4B_INSTRUCT_2507,
+                            LlmModelChoice.QWEN3_4B -> MaterialTheme.colorScheme.tertiaryContainer
                             else -> MaterialTheme.colorScheme.secondaryContainer
                         }
                     ) {
@@ -1366,7 +1367,8 @@ private fun LlmModelOptionCard(
                             fontWeight = FontWeight.Bold,
                             color = when (choice) {
                                 LlmModelChoice.GEMMA_4_E2B -> MaterialTheme.colorScheme.onPrimaryContainer
-                                LlmModelChoice.GEMMA_4_E4B -> MaterialTheme.colorScheme.onTertiaryContainer
+                                LlmModelChoice.QWEN3_4B_INSTRUCT_2507,
+                                LlmModelChoice.QWEN3_4B -> MaterialTheme.colorScheme.onTertiaryContainer
                                 else -> MaterialTheme.colorScheme.onSecondaryContainer
                             },
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)

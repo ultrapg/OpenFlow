@@ -174,24 +174,29 @@ sealed interface SpanPatchResult {
 
 /**
  * Wispr Flow–style on-device formatting & auto-editing engine powered by selectable **LiteRT-LM**
- * pure-Transformer models (`MiniCPM 5 2B`, `SmolLM3 3B`, `IBM Granite 4.0 Micro`,
- * `Ministral 3 3B Instruct`, `Gemma 4 E2B` [Default], and `Gemma 4 E4B` [Pro 4B]).
+ * pure-Transformer models (`Gemma 4 E2B` [Default], `Qwen3 4B Instruct 2507`, `Qwen3 4B`,
+ * `IBM Granite 4.1 3B`, and `IBM Granite 4.2 3B`).
  *
  * Key architectural guarantees:
  * 1. **Capability-Aware NPU / GPU / CPU Cascade:** Inspects `.litertlm` capabilities via `ModelInfo`
- *    so NPU-capable Gemma 4 models prioritize Qualcomm Hexagon QNN, MediaTek NeuroPilot, and Google
+ *    so NPU-capable Gemma 4 prioritizes Qualcomm Hexagon QNN, MediaTek NeuroPilot, and Google
  *    Tensor TPU while GPU/CPU-exported bundles go straight to OpenCL/Vulkan GPU + XNNPACK CPU in
  *    `AUTO` mode with zero wasted init probes and per-model CPU RAM headroom guards.
  * 2. **Per-Model Prompt & Sampler Optimization:** Tailors prompt density, few-shot grounding,
- *    reasoning budgets, and `SamplerConfig` to each model's parameter scale & prefill buckets
- *    (`COMPACT_2B`, `DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`).
- * 3. **Model-Safe Reasoning Control:** Passes `ThinkingConfig` / `enable_thinking` (plus SmolLM3's
- *    `Reasoning Mode: /no_think` | `/think` metadata header) to thinking-capable models (`MiniCPM 5 2B`
- *    and `SmolLM3 3B` [off by default], `Gemma 4 E2B` and `Gemma 4 E4B` [Adaptive Smart Thinking]),
- *    while keeping direct instruct models (`Granite 4.0 Micro`, `Ministral 3 3B`) pure zero-thought.
+ *    reasoning budgets, and `SamplerConfig` to each model's parameter scale & context window
+ *    (`DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`); thinking turns of models whose `<think>`
+ *    scratchpad degenerates under greedy decoding (`Qwen3 4B`) use the model's recommended sampler.
+ * 3. **Model-Safe Reasoning Control:** Passes `ThinkingConfig` / `enable_thinking` to thinking-capable
+ *    models (`Qwen3 4B` and `Granite 4.2 3B` [off by default], `Gemma 4 E2B` [Adaptive Smart Thinking]),
+ *    while keeping direct instruct models (`Granite 4.1 3B`, `Qwen3 4B Instruct 2507`) pure zero-thought.
  * 4. **RAM-Aware System-Prompt KV-Cache Pre-Warming (`prefillPrefaceOnInit = true`):** Holds at most
  *    one pre-prefilled standby `Conversation` while the user is speaking so `sendMessage` skips
- *    system-prompt prefill latency, while evicting immediately under memory pressure.
+ *    system-prompt prefill latency, while evicting immediately under memory pressure. Models whose
+ *    chat template cannot render an empty-message preface (`Qwen3`, `Granite 4.2`) skip pre-warming up
+ *    front ([LlmModelChoice.supportsPrefaceKvPrefill]) and always run a fresh single-turn conversation.
+ * 5. **Unspoken-Content Guard:** [sanitizeGemmaOutput] rejects generations that introduce a large share of
+ *    content words the speaker never said (an answered question, an invented continuation) and falls back to the
+ *    deterministically normalized transcript.
  */
 class GemmaTextProcessor(
     context: Context,
@@ -229,6 +234,7 @@ class GemmaTextProcessor(
         private const val MAX_CHARS_PER_PASS = 1_800
         private const val MAX_CHARS_PER_PASS_THINK_2K = 1_200
         private const val MAX_CHARS_PER_PASS_LOW_MEM = 900
+        private const val MAX_CHARS_PER_PASS_STATIC_2K = 1_300
         private const val MAX_CURSOR_CONTEXT_CHARS = 140
         private const val MAX_CONTINUITY_TAIL_CHARS = 160
         private const val MAX_VOCAB_REGEX_CACHE_ENTRIES = 64
@@ -769,25 +775,23 @@ class GemmaTextProcessor(
         }
 
         /**
-         * Prepends any model-specific system-turn control header required by the baked-in Jinja chat
-         * template of [llmChoice]. Specifically, `SmolLM3-3B_q4_block32_ekv4096.litertlm` controls
-         * reasoning mode via its `## Metadata` system header (`Reasoning Mode: /no_think` vs `/think`)
-         * rather than reading an `enable_thinking` Jinja variable.
+         * Hook for prepending a model-specific system-turn control header required by a baked-in Jinja chat
+         * template. None of the current lineup (`Gemma 4 E2B`, `Qwen3 4B`, `Qwen3 4B Instruct 2507`,
+         * `Granite 4.1 3B`, `Granite 4.2 3B`) needs one: reasoning is controlled through the template's
+         * `enable_thinking` variable ([buildTemplateExtraContext]) and `ThinkingConfig`, so [prompt] is returned
+         * unchanged.
          */
+        @Suppress("UNUSED_PARAMETER")
         internal fun applyModelSystemHeader(
             prompt: String,
             llmChoice: LlmModelChoice,
             effectiveDisableThinking: Boolean
-        ): String {
-            if (llmChoice != LlmModelChoice.SMOLLM_3_3B) return prompt
-            val mode = if (effectiveDisableThinking) "/no_think" else "/think"
-            return "## Metadata\n\nReasoning Mode: $mode\n\n## Custom Instructions\n\n$prompt"
-        }
+        ): String = prompt
 
         /**
          * Builds the model-optimized system instruction for [llmChoice], adapting prompt density,
          * role framing, few-shot grounding, and reasoning instructions to the active model's
-         * parameter scale (`COMPACT_2B`, `DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`).
+         * parameter scale (`DIRECT_INSTRUCT_3B`, `BALANCED_3B`, `FLAGSHIP_GEMMA_4`).
          *
          * When [languageCode] is `null`, produces a universal language-agnostic system prompt
          * suitable for pre-prefilling (`prefillPrefaceOnInit = true`) before `Ear` runs, while
@@ -824,70 +828,6 @@ class GemmaTextProcessor(
                 precedingSegmentTail?.trim()?.takeIf { it.isNotEmpty() }
             } else {
                 null
-            }
-
-            // Ultra-compact (<240 tokens including ChatML tags) prompt path engineered specifically for
-            // MiniCPM 5 2B's prefill_256 bucket (avoiding its missing-512 cliff to prefill_1024).
-            if (tier == LlmPromptTier.COMPACT_2B && preset != GemmaPromptPreset.CUSTOM) {
-                val compactAppHint = if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
-                    when (fieldContext.appCategory) {
-                        AppContextCategory.PERSONAL_MESSAGING -> "App: Chat (relaxed, no email greetings/sign-offs)."
-                        AppContextCategory.WORK_MESSAGING -> "App: Work chat (direct, keep @mentions/#channels)."
-                        AppContextCategory.EMAIL -> "App: Email (separate spoken greeting/sign-off lines; invent none)."
-                        AppContextCategory.CODE_AND_DEV -> "App: Code/CLI (keep --flags, files, v2.8.0, camelCase/snake_case)."
-                        AppContextCategory.NOTES_AND_DOCS -> "App: Notes/Docs (clean paragraphs & '1. '/' - ' lists)."
-                        AppContextCategory.GENERAL -> null
-                    }
-                } else {
-                    null
-                }
-                val compactCursorHint = if (cleanPrecedingTail == null) {
-                    when {
-                        fieldContext.continuingNumberedListFrom != null ->
-                            "Cursor below list #${fieldContext.continuingNumberedListFrom}: continue at ${fieldContext.continuingNumberedListFrom + 1}."
-                        fieldContext.isContinuingBulletList ->
-                            "Cursor below '- ' bullet: continue with '- '."
-                        else -> null
-                    }
-                } else {
-                    null
-                }
-                val compactBody = buildString {
-                    appendLine(resolvedTask)
-                    if (compactAppHint != null) appendLine(compactAppHint)
-                    if (compactCursorHint != null) appendLine(compactCursorHint)
-                    if (cleanPrecedingTail != null) {
-                        appendLine("PrevTail (context only, NEVER repeat): \"$cleanPrecedingTail\"")
-                    }
-                    if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
-                        if (normalizedLang == "de") {
-                            appendLine("Input: <transcript lang=\"de\" language=\"German\">ähm hallo lukas am dienstag nein warte mittwoch um fünfzehn uhr dreißig zwei punkte erstens npu unter fünfhundert ms testen zweitens sechs gigabyte ram prüfen</transcript>")
-                            appendLine("Output:")
-                            appendLine("Hallo Lukas, am Mittwoch um 15:30 Uhr zwei Punkte:")
-                            appendLine("1. NPU unter 500 ms testen")
-                            appendLine("2. 6 GB RAM prüfen")
-                        } else {
-                            appendLine("Input: <transcript>um hey alex can we meet tuesday wait no make that wednesday at three thirty pm for two things number one test npu under five hundred ms number two check six gigabytes ram</transcript>")
-                            appendLine("Output:")
-                            appendLine("Hey Alex, can we meet Wednesday at 3:30 PM for two things:")
-                            appendLine("1. Test NPU under 500 ms")
-                            appendLine("2. Check 6 GB RAM")
-                        }
-                    }
-                    append("Rule: Output ONLY edited text in the input language — never answer or add chatter.")
-                    if (langName != null) {
-                        append(" Language: $langName [$normalizedLang].")
-                    } else if (normalizedLang != null) {
-                        append(" Language: $normalizedLang.")
-                    }
-                    if (cleanedVocab.isNotEmpty()) {
-                        append(" Vocab: ${cleanedVocab.joinToString(", ")}.")
-                    }
-                    if (!effectiveDisableThinking) {
-                        append(" Keep internal reasoning under 15 words.")
-                    }
-                }
-                return applyModelSystemHeader(compactBody, llmChoice, effectiveDisableThinking)
             }
 
             val langHint = when {
@@ -933,8 +873,6 @@ class GemmaTextProcessor(
             }
 
             val roleHeader = when (tier) {
-                LlmPromptTier.COMPACT_2B ->
-                    "You are an on-device speech-to-text cleanup and formatting filter."
                 LlmPromptTier.DIRECT_INSTRUCT_3B ->
                     "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
                 LlmPromptTier.BALANCED_3B ->
@@ -962,15 +900,6 @@ class GemmaTextProcessor(
                 if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                     appendLine()
                     when (tier) {
-                        LlmPromptTier.COMPACT_2B -> {
-                            appendLine("EXAMPLE:")
-                            appendLine("Input: <transcript>um hey alex can we meet tuesday wait no wednesday at three thirty pm for two things first test npu latency under five hundred ms and second check the fifteen hundred dollar budget</transcript>")
-                            appendLine("Output:")
-                            appendLine("Hey Alex, can we meet Wednesday at 3:30 PM for two things:")
-                            appendLine("1. Test NPU latency under 500 ms")
-                            appendLine("2. Check the \$1,500 budget")
-                        }
-
                         LlmPromptTier.DIRECT_INSTRUCT_3B -> {
                             // Inoculates non-thinking 3B instruct models against answering dictated questions
                             appendLine("REFERENCE EXAMPLES:")
@@ -1063,8 +992,6 @@ class GemmaTextProcessor(
                 appendLine("3. $languageDirective")
                 val thinkingConcisenessHint = if (!effectiveDisableThinking) {
                     when (tier) {
-                        LlmPromptTier.COMPACT_2B ->
-                            " Keep internal reasoning under 15 words focused only on fillers, self-corrections, and formatting."
                         LlmPromptTier.BALANCED_3B ->
                             " Keep internal reasoning brief (under 25 words) focused on identifying disfluencies, backtracks, and structure."
                         LlmPromptTier.FLAGSHIP_GEMMA_4 ->
@@ -1139,7 +1066,6 @@ class GemmaTextProcessor(
                 else -> 192
             }
             val tierHeadroomCap = when (llmChoice.promptTier) {
-                LlmPromptTier.COMPACT_2B -> 224
                 LlmPromptTier.DIRECT_INSTRUCT_3B -> 0
                 LlmPromptTier.BALANCED_3B -> 320
                 LlmPromptTier.FLAGSHIP_GEMMA_4 -> 640
@@ -1154,7 +1080,7 @@ class GemmaTextProcessor(
         }
 
         /**
-         * Sanitizes raw LLM generation output across Gemma 4, Ministral 3, Granite 4.0, SmolLM3, and MiniCPM 5,
+         * Sanitizes raw LLM generation output across Gemma 4, Qwen3, and Granite 4.1 / 4.2,
          * stripping reasoning channels (`<|channel>thought`, `<think>`), ChatML/Granite/Mistral/Gemma turn tokens,
          * `<transcript>` echoes, markdown fences, conversational preambles, or echoed continuity snippets, and falling
          * back safely to [fallbackInput] if generation is blank, runaway, or an AI assistant refusal.
@@ -1246,9 +1172,51 @@ class GemmaTextProcessor(
                 if (isSuspiciouslyTruncatedOutput(text, trimmedFallback, preset)) {
                     return preNormalizeSpokenConstructs(trimmedFallback, preset).ifBlank { trimmedFallback }
                 }
+                if (introducesUnspokenContent(text, trimmedFallback, preset)) {
+                    return preNormalizeSpokenConstructs(trimmedFallback, preset).ifBlank { trimmedFallback }
+                }
             }
 
             return text
+        }
+
+        /**
+         * Detects an "unspoken content" failure on the verbatim-style presets ([GemmaPromptPreset.CLEAN_AND_POLISH] /
+         * [GemmaPromptPreset.STRICT_CLEANUP]): a small instruct model that answers a dictated question, invents a
+         * continuation, or drifts into a different topic emits many content words (`>= 5` letters) that never
+         * occur in the transcript. Numbers (`500`), units (`GB`), e-mail punctuation and spoken-cue removal never trigger
+         * this because digits and short tokens are ignored and every spoken word (or its 4-letter stem, covering
+         * inflection and German compounds) counts as grounded.
+         *
+         * @return `true` when at least 6 novel content words make up at least 45% of the output's content words.
+         */
+        internal fun introducesUnspokenContent(
+            output: String,
+            fallbackInput: String,
+            preset: GemmaPromptPreset
+        ): Boolean {
+            if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
+                return false
+            }
+            val inputLower = fallbackInput.lowercase(Locale.ROOT)
+            if (inputLower.isBlank()) return false
+            val inputWords = HashSet<String>()
+            val inputStems = HashSet<String>()
+            for (match in OUTPUT_WORD_TOKEN_REGEX.findAll(inputLower)) {
+                val w = match.value
+                inputWords.add(w)
+                if (w.length >= 4) inputStems.add(w.substring(0, 4))
+            }
+            var contentWords = 0
+            var novelWords = 0
+            for (match in OUTPUT_WORD_TOKEN_REGEX.findAll(output.lowercase(Locale.ROOT))) {
+                val w = match.value
+                if (w.length < 5 || !w.all { it.isLetter() }) continue
+                contentWords++
+                if (w in inputWords || w.substring(0, 4) in inputStems) continue
+                novelWords++
+            }
+            return novelWords >= 6 && novelWords * 100 >= contentWords * 45
         }
 
         /**
@@ -1732,8 +1700,7 @@ class GemmaTextProcessor(
             if (LIST_SEQUENCE_TRIGGER_REGEX.containsMatchIn(trimmed)) return true
 
             val wordCount = countWordsFast(trimmed)
-            val denseThreshold = if (llmChoice.promptTier == LlmPromptTier.COMPACT_2B) 75 else 60
-            return wordCount >= denseThreshold
+            return wordCount >= 60
         }
 
         /**
@@ -1845,9 +1812,6 @@ class GemmaTextProcessor(
             hasCustomLora: Boolean = false
         ): Boolean {
             if (hasCustomLora) return false
-            if (llmChoice.promptTier == LlmPromptTier.COMPACT_2B) {
-                return false
-            }
             if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
                 return false
             }
@@ -2031,9 +1995,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         /**
          * Pillar 5 — Right-Sized KV Context Windows: Scales `maxNumTokens` dynamically (`1,536` / `2,048` / `4,096`)
-         * on dynamic-context models (`Gemma 4 E2B` & `Gemma 4 E4B`), while locking static `ekv4096` `.litertlm`
-         * graphs (`MiniCPM 5 2B`, `SmolLM3 3B`, `Granite 4.0 Micro`, `Ministral 3 3B`) to their exact compiled
-         * KV buffer length across all memory modes so LiteRT never hits static tensor shape mismatches.
+         * on the dynamic-context model (`Gemma 4 E2B`), while locking static `.litertlm` graphs (`Granite 4.1 3B`,
+         * `Granite 4.2 3B`, `Qwen3 4B` at `4,096`; `Qwen3 4B Instruct 2507` at its exported `2,048`) to their exact
+         * compiled KV buffer length across all memory modes so LiteRT never hits static tensor shape mismatches.
          */
         fun selectTokenWindowCandidates(
             memoryMode: GemmaMemoryMode,
@@ -2061,8 +2025,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         /**
          * Determines whether native `Backend.NPU` / `Backend.GOOGLE_TENSOR` JIT compilation may be probed.
-         * Standard CPU/GPU-exported `q4_block32` / `int4` community bundles (`MiniCPM 5 2B`, `SmolLM3 3B`,
-         * `Granite 4.0 Micro`, `Ministral 3 3B`) declare `supported_backends = [CPU, GPU]` without NPU
+         * Standard CPU/GPU-exported `int4` community bundles (`Qwen3 4B`, `Qwen3 4B Instruct 2507`,
+         * `Granite 4.1 3B`, `Granite 4.2 3B`) declare `supported_backends = [CPU, GPU]` without NPU
          * partitioning, so they go directly to `Backend.GPU` -> `Backend.CPU` unless a custom `*_npu.litertlm`
          * bundle is side-loaded.
          */
@@ -2083,12 +2047,11 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
          * which unpacks quantized weights into host RAM (~1.8–3.2 GB depending on parameter count).
          */
         internal fun minCpuFallbackAvailRamMb(llmChoice: LlmModelChoice): Long = when (llmChoice) {
-            LlmModelChoice.MINICPM_5_2B -> 1_500L
             LlmModelChoice.GEMMA_4_E2B -> 1_600L
-            LlmModelChoice.SMOLLM_3_3B,
-            LlmModelChoice.GRANITE_4_MICRO,
-            LlmModelChoice.MINISTRAL_3_3B -> 2_000L
-            LlmModelChoice.GEMMA_4_E4B -> 2_500L
+            LlmModelChoice.GRANITE_4_1_3B,
+            LlmModelChoice.GRANITE_4_2_3B -> 2_800L
+            LlmModelChoice.QWEN3_4B_INSTRUCT_2507,
+            LlmModelChoice.QWEN3_4B -> 3_600L
         }
 
         /**
@@ -2115,7 +2078,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
          * Resolves whether the active model uses a thinking channel (`<think>...</think>` or `<|channel>thought`)
          * whose Jinja template / runtime must receive explicit `enable_thinking` control (`ThinkingConfig` + `extraContext`).
          *
-         * Several `.litertlm` exports (such as `MiniCPM5-2B_int4.litertlm` and `SmolLM3-3B_q4_block32_ekv4096.litertlm`)
+         * Several `.litertlm` exports (such as `granite-4.2-3b_int4.litertlm` and `qwen3_4b_mixed_int4.litertlm`)
          * omit `LlmMetadata.supports_thinking` in their protobuf header (`ModelInfo.Llm.supportsThinking() == false`)
          * while defining a `thought` `<think>...</think>` channel in their Jinja template. Treating
          * [LlmModelChoice.supportsThinking] as authoritative keeps both `Thinking Off` and `Thinking On` exact.
@@ -2129,8 +2092,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         /**
          * Builds the Jinja chat-template `extraContext` map controlling `enable_thinking` for models with
-         * reasoning channels (`MiniCPM 5 2B`, `SmolLM3 3B`, `Gemma 4 E2B`, `Gemma 4 E4B`), while returning
-         * an empty map for direct instruct models (`Granite 4.0 Micro`, `Ministral 3 3B`).
+         * reasoning channels (`Qwen3 4B`, `Granite 4.2 3B`, `Gemma 4 E2B`), while returning
+         * an empty map for direct instruct models (`Granite 4.1 3B`, `Qwen3 4B Instruct 2507`).
          */
         internal fun buildTemplateExtraContext(
             modelSupportsThinking: Boolean,
@@ -2511,7 +2474,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private var candidates: List<BackendCandidate> = emptyList()
     private var cachedConversation: Conversation? = null
     private var cachedPromptKey: SystemPromptCacheKey? = null
-    private var supportsPrefacePrefill: Boolean = true
+    private var supportsPrefacePrefill: Boolean = llmChoice.supportsPrefaceKvPrefill
     private var loraDisabledAfterError: Boolean = false
 
     @Volatile
@@ -2534,7 +2497,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private fun initializeWithHardwareCascade(startIndex: Int) {
         synchronized(engineLock) {
             closeEngineLocked()
-            supportsPrefacePrefill = true
+            supportsPrefacePrefill = llmChoice.supportsPrefaceKvPrefill
             ensureCacheRuntimeStamp(cacheDirectory, modelFile.length())
 
             val profile = NpuHardwareManager.detectHardwareProfile()
@@ -2800,10 +2763,12 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
     private fun buildModelSamplerConfig(
         isNpu: Boolean,
-        preset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH
+        preset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
+        thinkingActive: Boolean = false
     ): SamplerConfig? {
         if (isNpu) return null
-        if (preset != GemmaPromptPreset.CUSTOM) {
+        val sampleForThinking = thinkingActive && llmChoice.needsSamplingWhileThinking
+        if (preset != GemmaPromptPreset.CUSTOM && !sampleForThinking) {
             // Pillar 5: Pure greedy argmax decoding on non-NPU built-in presets skips
             // 152K–262K-vocab top-k/top-p softmax sorting on every output token.
             return SamplerConfig(
@@ -2969,7 +2934,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             ExperimentalFlags.filterChannelContentFromKvCache = shouldFilterChannelContentFromKvCache(llmChoice)
             val config = ConversationConfig(
                 systemInstruction = Contents.of(systemInstruction),
-                samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                samplerConfig = buildModelSamplerConfig(isNpu, preset, thinkingActive = !effectiveDisableThinking),
                 automaticToolCalling = false,
                 extraContext = templateContext,
                 loraConfig = loraConfig,
@@ -3142,6 +3107,9 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 }
             (!disableThinking && !adaptiveThinking && modelSupportsThinking) && currentContextWindow < 4_096 ->
                 MAX_CHARS_PER_PASS_THINK_2K
+            // Statically compiled 2K windows (Qwen3 4B Instruct 2507) must hold the full system prompt + transcript
+            // + edited output, unlike Gemma 4 E2B's dynamic window.
+            !llmChoice.hasDynamicKvCache && currentContextWindow < 4_096 -> MAX_CHARS_PER_PASS_STATIC_2K
             else -> MAX_CHARS_PER_PASS
         }
 
@@ -3732,7 +3700,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             activeEngine.createConversation(
                 ConversationConfig(
                     systemInstruction = Contents.of(systemInstructionText),
-                    samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                    samplerConfig = buildModelSamplerConfig(isNpu, preset, thinkingActive = !effectiveDisableThinking),
                     automaticToolCalling = false,
                     extraContext = templateContext,
                     loraConfig = loraConfig,
@@ -3751,7 +3719,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 activeEngine.createConversation(
                     ConversationConfig(
                         systemInstruction = Contents.of(systemInstructionText),
-                        samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                        samplerConfig = buildModelSamplerConfig(isNpu, preset, thinkingActive = !effectiveDisableThinking),
                         automaticToolCalling = false,
                         extraContext = templateContext,
                         maxOutputToken = maxOutTokens,
@@ -4191,7 +4159,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 val conv = activeEngine.createConversation(
                     ConversationConfig(
                         systemInstruction = Contents.of(sysText),
-                        samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                        samplerConfig = buildModelSamplerConfig(isNpu, preset, thinkingActive = !effectiveDisableThinking),
                         automaticToolCalling = false,
                         extraContext = templateCtx,
                         loraConfig = loraConfig,
@@ -4337,7 +4305,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 activeEngine.createConversation(
                     ConversationConfig(
                         systemInstruction = Contents.of(systemInstructionUsed),
-                        samplerConfig = buildModelSamplerConfig(isNpu, preset),
+                        samplerConfig = buildModelSamplerConfig(isNpu, preset, thinkingActive = !effectiveDisableThinking),
                         automaticToolCalling = false,
                         extraContext = templateCtx,
                         loraConfig = loraConfig,
