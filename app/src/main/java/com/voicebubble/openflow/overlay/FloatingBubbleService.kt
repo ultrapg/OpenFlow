@@ -60,6 +60,7 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
 import com.voicebubble.openflow.core.audio.AudioRecordingController
+import com.voicebubble.openflow.core.audio.StoppedRecordingTail
 import com.voicebubble.openflow.core.database.AppDatabase
 import com.voicebubble.openflow.core.database.TranscriptionRecord
 import com.voicebubble.openflow.core.debug.DebugLogManager
@@ -1068,11 +1069,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                 if (session != null) {
                                     // Stop looking for new pauses first so the tail below is the very last piece
                                     session.stopPolling()
-                                    val tail = audioController.stopRecording()
-                                    processAudio(tail, session, cycleId)
+                                    val tailDetail = audioController.stopRecordingDetailed()
+                                    processAudio(tailDetail.samples, session, cycleId, tailDetail)
                                 } else {
                                     val samples = audioController.stopRecording()
-                                    processAudio(samples, null, cycleId)
+                                    processAudio(samples, null, cycleId, null)
                                 }
                             }
                         }
@@ -1314,7 +1315,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
     private fun processAudio(
         samples: FloatArray,
         session: StreamingDictationSession? = null,
-        cycleId: Long = recordingCycleId.get()
+        cycleId: Long = recordingCycleId.get(),
+        tailDetail: StoppedRecordingTail? = null
     ) {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -1329,7 +1331,12 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 }
 
                 val chunkText = if (session != null) {
-                    session.finish(samples).also {
+                    val finishedText = if (tailDetail != null) {
+                        session.finish(tailDetail)
+                    } else {
+                        session.finish(samples)
+                    }
+                    finishedText.also {
                         if (session.failedChunkCount > 0) {
                             if (it.isBlank()) {
                                 throw IllegalStateException("${session.failedChunkCount} audio segment(s) could not be transcribed")

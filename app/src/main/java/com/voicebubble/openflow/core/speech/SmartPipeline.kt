@@ -277,8 +277,8 @@ class SmartPipeline(
         private const val SILENCE_PAD_SAMPLES: Int = 2_560 // 160 ms @ 16 kHz
 
         // Chunking bounds to guarantee bounded Conformer memory on arbitrarily long dictations
-        const val DEFAULT_MAX_CHUNK_SAMPLES: Int = 16 * 16_000 // 16.0s @ 16 kHz
-        const val DEFAULT_MIN_CHUNK_SAMPLES: Int = 9 * 16_000  // 9.0s @ 16 kHz
+        const val DEFAULT_MAX_CHUNK_SAMPLES: Int = 18 * 16_000 // 18.0s @ 16 kHz
+        const val DEFAULT_MIN_CHUNK_SAMPLES: Int = 10 * 16_000 // 10.0s @ 16 kHz
         const val LOW_MEM_MAX_CHUNK_SAMPLES: Int = 12 * 16_000 // 12.0s @ 16 kHz
         const val LOW_MEM_MIN_CHUNK_SAMPLES: Int = 7 * 16_000  // 7.0s @ 16 kHz
         private const val MAX_EAR_WINDOW_SAMPLES: Int = 88_000 // 5.5s @ 16 kHz
@@ -1108,18 +1108,70 @@ class SmartPipeline(
         onLanguageResolved: ((String) -> Unit)? = null,
         applyPostProcessing: Boolean = true,
         keepModelsWarmForSession: Boolean = false
-    ): String = withContext(Dispatchers.Default) {
-        if (samples.isEmpty()) return@withContext ""
+    ): String = transcribeDetailed(
+        samples = samples,
+        sessionStartSample = 0L,
+        nominalCutSampleBefore = null,
+        cutKindBefore = null,
+        onStageProgress = onStageProgress,
+        languageHint = languageHint,
+        onLanguageResolved = onLanguageResolved,
+        applyPostProcessing = applyPostProcessing,
+        keepModelsWarmForSession = keepModelsWarmForSession
+    ).normalizedText
+
+    /**
+     * Timestamp-preserving transcription entry point used by both single-call [transcribe] and
+     * [StreamingDictationSession]. Projects every `Voz` word timestamp into 1-sample-exact global
+     * session coordinates (`[sessionStartSample, sessionStartSample + samples.size)`) across silence
+     * trimming, Conformer runway padding, and valley-overlap sub-chunks.
+     */
+    suspend fun transcribeDetailed(
+        samples: FloatArray,
+        sessionStartSample: Long = 0L,
+        nominalCutSampleBefore: Long? = null,
+        cutKindBefore: CutKind? = null,
+        onStageProgress: ((String) -> Unit)? = null,
+        languageHint: String? = null,
+        onLanguageResolved: ((String) -> Unit)? = null,
+        applyPostProcessing: Boolean = true,
+        keepModelsWarmForSession: Boolean = false
+    ): ChunkTranscriptionSegment = withContext(Dispatchers.Default) {
+        val outerChunkStartSec = sessionStartSample.toDouble() / SAMPLE_RATE_HZ
+        val outerChunkEndSec = (sessionStartSample + samples.size.toLong()).toDouble() / SAMPLE_RATE_HZ
+        val outerNominalCutSec = nominalCutSampleBefore?.let { it.toDouble() / SAMPLE_RATE_HZ }
+
+        if (samples.isEmpty()) {
+            return@withContext ChunkTranscriptionSegment(
+                normalizedText = "",
+                words = emptyList(),
+                chunkStartSec = outerChunkStartSec,
+                chunkEndSec = outerChunkEndSec,
+                nominalCutBeforeSec = outerNominalCutSec,
+                cutKindBefore = cutKindBefore
+            )
+        }
 
         // Fast silence trim before acquiring native sessions (uses a whisper-sensitive 0.0018f floor and 500 ms
         // margin so soft trailing fricatives/plosives at the end of a dictation are never clipped).
-        var trimmedSamplesRef: FloatArray? = trimLeadingAndTrailingSilence(
+        val trimResult = trimLeadingAndTrailingSilenceWithOffset(
             samples = samples,
             threshold = 0.0018f,
             padSamples = 8_000
         )
+        var trimmedSamplesRef: FloatArray? = trimResult.samples
+        val trimmedOriginSample = sessionStartSample + trimResult.leadingTrimmedSamples.toLong()
         val initialTrimmed = trimmedSamplesRef
-        if (initialTrimmed == null || initialTrimmed.isEmpty()) return@withContext ""
+        if (initialTrimmed == null || initialTrimmed.isEmpty()) {
+            return@withContext ChunkTranscriptionSegment(
+                normalizedText = "",
+                words = emptyList(),
+                chunkStartSec = outerChunkStartSec,
+                chunkEndSec = outerChunkEndSec,
+                nominalCutBeforeSec = outerNominalCutSec,
+                cutKindBefore = cutKindBefore
+            )
+        }
 
         val audioDurationMs = ((initialTrimmed.size.toDouble() / SAMPLE_RATE_HZ) * 1000.0).roundToLong()
 
@@ -1145,7 +1197,7 @@ class SmartPipeline(
                 )
 
                 val dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, initialMem)
-                // User-configurable chunk limit (default 20 s). With chunking switched off only the 60 s safety
+                // User-configurable chunk limit (default 18 s). With chunking switched off only the 60 s safety
                 // ceiling applies; low-memory devices are always additionally capped to protect the native models.
                 val chunkSettings = DictationChunkSettings.load(appContext)
                 val maxChunkSamples = if (initialMem.isAnyMemoryTight) {
@@ -1163,7 +1215,8 @@ class SmartPipeline(
                     samples = initialTrimmed,
                     maxChunkSamples = maxChunkSamples,
                     minChunkSamples = minChunkSamples,
-                    silenceThreshold = chunkSettings.silenceThreshold
+                    silenceThreshold = chunkSettings.silenceThreshold,
+                    overlapSamplesOnValleyCut = FORCED_CUT_OVERLAP_SAMPLES
                 )
                 val totalChunks = chunkRanges.size
 
@@ -1206,7 +1259,7 @@ class SmartPipeline(
                 // =========================================================================
                 // Stage 2..3: Process each bounded audio chunk sequentially (lazy slicing)
                 // =========================================================================
-                val segmentTranscripts = ArrayList<String>(totalChunks)
+                val segmentResults = ArrayList<ChunkTranscriptionSegment>(totalChunks)
 
                 for ((chunkIdx, range) in chunkRanges.withIndex()) {
                     val sourceSamples = trimmedSamplesRef ?: break
@@ -1224,7 +1277,7 @@ class SmartPipeline(
                     // Full Parakeet TDT Conformer padding (320 ms lead + 640 ms tail + 1.60 s minimum) ensures
                     // 8 frames of TDT right-context lookahead and full 31-frame depthwise conv support so final
                     // words and short 1–2 word utterances are never withheld or truncated.
-                    val preparedChunk = prepareChunkForInference(
+                    val preparedInfo = prepareChunkForInferenceWithOffset(
                         samples = rawChunk,
                         minLeadSilencePadSamples = 5_120,
                         minTailSilencePadSamples = 10_240,
@@ -1232,6 +1285,7 @@ class SmartPipeline(
                         edgeFadeSamples = 160,
                         silenceThreshold = 0.0018f
                     )
+                    val preparedChunk = preparedInfo.samples
                     val conditionedChunk = conditionAudioWhenClearDisabled(
                         samples = preparedChunk,
                         inPlace = preparedChunk !== rawChunk && preparedChunk !== samples
@@ -1264,33 +1318,60 @@ class SmartPipeline(
                         activeSettings = activeSettings
                     )
 
-                    // Stage 3: Text Normalization & Custom Vocabulary Biasing
-                    val segmentText = reconcileTranscript(
+                    // Stage 3: Timestamp Projection, Text Normalization & Custom Vocabulary Biasing
+                    val rangeStartGlobalSample = trimmedOriginSample + range.start.toLong()
+                    val rangeNominalBefore = if (chunkIdx == 0) {
+                        nominalCutSampleBefore
+                    } else {
+                        range.nominalSplitBeforeSample?.let { trimmedOriginSample + it.toLong() }
+                    }
+                    val rangeCutKindBefore = if (chunkIdx == 0) cutKindBefore else range.cutKindBefore
+                    val chunkSeg = buildChunkTranscriptionSegment(
                         transcription = transcription,
-                        customVocabulary = activeSettings.customVocabulary
+                        chunkStartSample = rangeStartGlobalSample,
+                        rawChunkSampleCount = rawChunk.size,
+                        prependedLeadSamples = preparedInfo.prependedLeadSamples,
+                        nominalCutSampleBefore = rangeNominalBefore,
+                        cutKindBefore = rangeCutKindBefore,
+                        customVocabulary = activeSettings.customVocabulary,
+                        sampleRateHz = SAMPLE_RATE_HZ
                     )
-                    if (segmentText.isNotBlank()) {
-                        segmentTranscripts.add(segmentText)
+                    if (chunkSeg.normalizedText.isNotBlank()) {
+                        segmentResults.add(chunkSeg)
                     }
                 }
                 trimmedSamplesRef = null
 
-                val stitchedTranscript = stitchChunkTranscripts(
-                    chunks = segmentTranscripts,
+                val mergedResult = mergeTimestampedChunkSegmentsWithTelemetry(
+                    segments = segmentResults,
                     language = resolvedLanguage,
                     customVocabulary = activeSettings.customVocabulary
                 )
+                val stitchedTranscript = mergedResult.text
+                if (totalChunks > 1) {
+                    val tel = mergedResult.telemetry
+                    DebugLogManager.logInfo(
+                        TAG,
+                        "Chunk timestamp merge • chunks=$totalChunks, nonBlank=${tel.totalSegments}, " +
+                            "anchorJoins=${tel.anchorAlignedJoins}, timeJoins=${tel.timeAlignedJoins}, pauseJoins=${tel.pauseBoundaryJoins}"
+                    )
+                }
 
                 // =========================================================================
-                // Stage 4..5: Post-Processing (`Punct` & Experimental `Gemma 4 E2B`)
+                // Stage 4..5: Post-Processing (`Punct` & On-Device LLM) + Whole-Dictation Guard
                 // =========================================================================
                 val finalTranscript = if (applyPostProcessing && stitchedTranscript.isNotBlank()) {
-                    runPostProcessingStagesLocked(
+                    val postProcessed = runPostProcessingStagesLocked(
                         text = stitchedTranscript,
                         resolvedLanguage = resolvedLanguage,
                         activeSettings = activeSettings,
                         dynamicStageRelease = dynamicStageRelease,
                         onStageProgress = onStageProgress
+                    )
+                    reconcileWholeDictationWithRawVoz(
+                        rawMergedVoz = stitchedTranscript,
+                        candidateOutput = postProcessed,
+                        preset = activeSettings.gemmaPromptPreset
                     )
                 } else {
                     stitchedTranscript
@@ -1345,7 +1426,14 @@ class SmartPipeline(
                         "(chunks=$totalChunks, chars=${finalTranscript.length}, lang=$resolvedLanguage, postProcess=$applyPostProcessing)",
                     includeMemory = true
                 )
-                finalTranscript
+                ChunkTranscriptionSegment(
+                    normalizedText = finalTranscript,
+                    words = mergedResult.words,
+                    chunkStartSec = outerChunkStartSec,
+                    chunkEndSec = outerChunkEndSec,
+                    nominalCutBeforeSec = outerNominalCutSec,
+                    cutKindBefore = cutKindBefore
+                )
             } catch (t: Throwable) {
                 DebugLogManager.logError(
                     TAG,
@@ -2118,39 +2206,65 @@ class SmartPipeline(
 
             // If the chunk is > 10s, split it at the best silence valley on retry to halve peak native & FFI memory
             if (samples.size > 10 * 16_000) {
-                val mid = findBestSplitPoint(
+                val decision = findBestSplitDecision(
                     samples = samples,
                     rangeStart = samples.size / 3,
                     rangeEndExclusive = (samples.size * 2) / 3
-                ).coerceIn(samples.size / 3, (samples.size * 2) / 3)
-                val left = prepareChunkForInference(
-                    samples = samples.copyOfRange(0, mid),
-                    minLeadSilencePadSamples = 5_120,
-                    minTailSilencePadSamples = 10_240,
-                    minTotalSamples = 25_600
                 )
-                val right = prepareChunkForInference(
-                    samples = samples.copyOfRange(mid, samples.size),
-                    minLeadSilencePadSamples = 5_120,
-                    minTailSilencePadSamples = 10_240,
-                    minTotalSamples = 25_600
-                )
-                val t1 = retryVoz.transcribeWithContext(left, SAMPLE_RATE_HZ, language, customVocabulary)
-                System.gc()
-                val t2 = retryVoz.transcribeWithContext(right, SAMPLE_RATE_HZ, language, customVocabulary)
-                val leftDurationSec = left.size.toDouble() / SAMPLE_RATE_HZ
-                val shiftedRightWords = t2.words.map { w ->
-                    Word(w.text, w.start + leftDurationSec, w.end + leftDurationSec)
+                val mid = decision.sampleIndex.coerceIn(samples.size / 3, (samples.size * 2) / 3)
+                val halfOverlap = if (decision.cutKind == CutKind.VALLEY_OVERLAP) {
+                    min(FORCED_CUT_OVERLAP_SAMPLES / 2, samples.size / 8)
+                } else {
+                    0
                 }
+                val leftEnd = min(samples.size, mid + halfOverlap)
+                val rightStart = max(0, mid - halfOverlap)
+                val leftRaw = samples.copyOfRange(0, leftEnd)
+                val rightRaw = samples.copyOfRange(rightStart, samples.size)
+                val leftPrep = prepareChunkForInferenceWithOffset(
+                    samples = leftRaw,
+                    minLeadSilencePadSamples = 5_120,
+                    minTailSilencePadSamples = 10_240,
+                    minTotalSamples = 25_600
+                )
+                val rightPrep = prepareChunkForInferenceWithOffset(
+                    samples = rightRaw,
+                    minLeadSilencePadSamples = 5_120,
+                    minTailSilencePadSamples = 10_240,
+                    minTotalSamples = 25_600
+                )
+                val t1 = retryVoz.transcribeWithContext(leftPrep.samples, SAMPLE_RATE_HZ, language, customVocabulary)
+                System.gc()
+                val t2 = retryVoz.transcribeWithContext(rightPrep.samples, SAMPLE_RATE_HZ, language, customVocabulary)
+                val seg1 = buildChunkTranscriptionSegment(
+                    transcription = t1,
+                    chunkStartSample = 0L,
+                    rawChunkSampleCount = leftRaw.size,
+                    prependedLeadSamples = leftPrep.prependedLeadSamples,
+                    customVocabulary = customVocabulary,
+                    sampleRateHz = SAMPLE_RATE_HZ
+                )
+                val seg2 = buildChunkTranscriptionSegment(
+                    transcription = t2,
+                    chunkStartSample = rightStart.toLong(),
+                    rawChunkSampleCount = rightRaw.size,
+                    prependedLeadSamples = rightPrep.prependedLeadSamples,
+                    nominalCutSampleBefore = mid.toLong(),
+                    cutKindBefore = decision.cutKind,
+                    customVocabulary = customVocabulary,
+                    sampleRateHz = SAMPLE_RATE_HZ
+                )
+                val merged = mergeTimestampedChunkSegmentsWithTelemetry(
+                    segments = listOf(seg1, seg2),
+                    language = language,
+                    customVocabulary = customVocabulary
+                )
+                val mergedVozWords = merged.words.map { w -> Word(w.text, w.startSec, w.endSec) }
                 vozWarmedUp = true
                 Transcription(
-                    text = stitchChunkTranscripts(
-                        chunks = listOf(t1.text, t2.text),
-                        language = language,
-                        customVocabulary = customVocabulary
-                    ),
-                    words = t1.words + shiftedRightWords,
-                    duration = t1.duration + t2.duration
+                    text = merged.text,
+                    words = mergedVozWords,
+                    duration = samples.size.toDouble() / SAMPLE_RATE_HZ
                 )
             } else {
                 retryVoz.transcribeWithContext(
@@ -2934,14 +3048,20 @@ class SmartPipeline(
     }
 }
 
-internal data class ChunkSliceRange(val start: Int, val endExclusive: Int)
+internal data class ChunkSliceRange(
+    val start: Int,
+    val endExclusive: Int,
+    val nominalSplitBeforeSample: Int? = null,
+    val cutKindBefore: CutKind? = null
+)
 
 internal fun computeSmartChunkRanges(
     samples: FloatArray,
     maxChunkSamples: Int = SmartPipeline.DEFAULT_MAX_CHUNK_SAMPLES,
     minChunkSamples: Int = SmartPipeline.DEFAULT_MIN_CHUNK_SAMPLES,
     pauseWindowSamples: Int = 1_280, // minimum pause length (80 ms @ 16 kHz)
-    silenceThreshold: Float = DEFAULT_SILENCE_RMS
+    silenceThreshold: Float = DEFAULT_SILENCE_RMS,
+    overlapSamplesOnValleyCut: Int = 0
 ): List<ChunkSliceRange> {
     if (samples.isEmpty()) return emptyList()
     val safeMax = max(3_200, maxChunkSamples)
@@ -2949,30 +3069,56 @@ internal fun computeSmartChunkRanges(
 
     val safeMin = minChunkSamples.coerceIn(1_600, (safeMax * 3) / 4)
     val minPauseFrames = max(2, pauseWindowSamples.coerceIn(320, 16_000) / CHUNK_FRAME_SAMPLES)
-    // Never leave a sub-second orphan tail: a few hundred samples fed to Clear/Voz yields hallucinated or empty text.
+    // Never leave a sub-second orphan tail: a few hundred samples fed to Voz yields hallucinated or empty text.
     // Bounded by (safeMax - safeMin) so the split range below can never become empty.
     val minTailSamples = min(8_000, safeMax - safeMin)
+    val maxHalfOverlap = max(0, min(overlapSamplesOnValleyCut / 2, (safeMin - 800).coerceAtLeast(0) / 2))
     val ranges = ArrayList<ChunkSliceRange>((samples.size / safeMin) + 2)
 
     var cursor = 0
+    var pendingNominalSplit: Int? = null
+    var pendingCutKind: CutKind? = null
     while (cursor < samples.size) {
         val remaining = samples.size - cursor
         if (remaining <= safeMax) {
-            ranges.add(ChunkSliceRange(cursor, samples.size))
+            ranges.add(ChunkSliceRange(cursor, samples.size, pendingNominalSplit, pendingCutKind))
             break
         }
 
         val searchStart = cursor + safeMin
-        val latestSplit = min(cursor + safeMax, samples.size - minTailSamples)
-        val bestSplitIndex = if (searchStart < latestSplit) {
-            findBestSplitPoint(samples, searchStart, latestSplit, silenceThreshold, minPauseFrames)
+        val overlapAdjustedCap = if (maxHalfOverlap > 0 && cursor + safeMin < cursor + safeMax - maxHalfOverlap) {
+            cursor + safeMax - maxHalfOverlap
         } else {
-            latestSplit
+            cursor + safeMax
+        }
+        val latestSplit = min(overlapAdjustedCap, samples.size - minTailSamples)
+        val decision = if (searchStart < latestSplit) {
+            findBestSplitDecision(
+                samples = samples,
+                rangeStart = searchStart,
+                rangeEndExclusive = latestSplit,
+                silenceThreshold = silenceThreshold,
+                minPauseFrames = minPauseFrames,
+                preferTrailingValleySamples = if (maxHalfOverlap > 0) VALLEY_TRAILING_WINDOW_SAMPLES else 0
+            )
+        } else {
+            SplitPointDecision(latestSplit, CutKind.VALLEY_OVERLAP)
         }
 
-        val splitAt = bestSplitIndex.coerceIn(cursor + safeMin, latestSplit)
-        ranges.add(ChunkSliceRange(cursor, splitAt))
-        cursor = splitAt
+        val splitAt = decision.sampleIndex.coerceIn(cursor + safeMin, latestSplit)
+        if (decision.cutKind == CutKind.VALLEY_OVERLAP && maxHalfOverlap > 0) {
+            val endWithRightContext = min(samples.size, min(cursor + safeMax, splitAt + maxHalfOverlap))
+            val nextStartWithLeftContext = max(cursor + max(800, safeMin / 2), splitAt - maxHalfOverlap)
+            ranges.add(ChunkSliceRange(cursor, endWithRightContext, pendingNominalSplit, pendingCutKind))
+            pendingNominalSplit = (nextStartWithLeftContext + endWithRightContext) / 2
+            pendingCutKind = CutKind.VALLEY_OVERLAP
+            cursor = nextStartWithLeftContext
+        } else {
+            ranges.add(ChunkSliceRange(cursor, splitAt, pendingNominalSplit, pendingCutKind))
+            pendingNominalSplit = splitAt
+            pendingCutKind = decision.cutKind
+            cursor = splitAt
+        }
     }
 
     return ranges
@@ -3060,8 +3206,24 @@ fun prepareChunkForInference(
     minTotalSamples: Int = 0,
     edgeFadeSamples: Int = 160,
     silenceThreshold: Float = 0.0020f
-): FloatArray {
-    if (samples.isEmpty()) return samples
+): FloatArray = prepareChunkForInferenceWithOffset(
+    samples = samples,
+    minLeadSilencePadSamples = minLeadSilencePadSamples,
+    minTailSilencePadSamples = minTailSilencePadSamples,
+    minTotalSamples = minTotalSamples,
+    edgeFadeSamples = edgeFadeSamples,
+    silenceThreshold = silenceThreshold
+).samples
+
+fun prepareChunkForInferenceWithOffset(
+    samples: FloatArray,
+    minLeadSilencePadSamples: Int,
+    minTailSilencePadSamples: Int,
+    minTotalSamples: Int = 0,
+    edgeFadeSamples: Int = 160,
+    silenceThreshold: Float = 0.0020f
+): PreparedAudioChunk {
+    if (samples.isEmpty()) return PreparedAudioChunk(samples, 0)
     val safeLeadPad = minLeadSilencePadSamples.coerceAtLeast(0)
     val safeTailPad = minTailSilencePadSamples.coerceAtLeast(0)
     val safeFade = min(edgeFadeSamples.coerceAtLeast(0), samples.size / 4)
@@ -3073,7 +3235,7 @@ fun prepareChunkForInference(
             break
         }
     }
-    if (firstVoice == -1) return samples
+    if (firstVoice == -1) return PreparedAudioChunk(samples, 0)
 
     var lastVoice = firstVoice
     for (i in samples.lastIndex downTo firstVoice) {
@@ -3092,7 +3254,7 @@ fun prepareChunkForInference(
     val extraTail = baseExtraTail + extraMinLenTail
 
     if (extraLead == 0 && extraTail == 0 && safeFade == 0) {
-        return samples
+        return PreparedAudioChunk(samples, 0)
     }
 
     val out = FloatArray(extraLead + samples.size + extraTail)
@@ -3106,7 +3268,7 @@ fun prepareChunkForInference(
         }
     }
 
-    return out
+    return PreparedAudioChunk(out, extraLead)
 }
 
 /**
@@ -3285,6 +3447,11 @@ private fun softLimitSample(x: Float): Float {
     return if (x >= 0f) compressed else -compressed
 }
 
+internal data class TrimmedSilenceBuffer(
+    val samples: FloatArray,
+    val leadingTrimmedSamples: Int
+)
+
 /**
  * Trims leading and trailing dead silence below [threshold] while preserving up to [padSamples]
  * of natural speech margin on both ends. Returns an empty array if the entire buffer is silence.
@@ -3293,8 +3460,14 @@ fun trimLeadingAndTrailingSilence(
     samples: FloatArray,
     threshold: Float = 0.0035f,
     padSamples: Int = 2_560
-): FloatArray {
-    if (samples.isEmpty()) return samples
+): FloatArray = trimLeadingAndTrailingSilenceWithOffset(samples, threshold, padSamples).samples
+
+internal fun trimLeadingAndTrailingSilenceWithOffset(
+    samples: FloatArray,
+    threshold: Float = 0.0035f,
+    padSamples: Int = 2_560
+): TrimmedSilenceBuffer {
+    if (samples.isEmpty()) return TrimmedSilenceBuffer(samples, 0)
     var firstVoice = -1
     for (i in samples.indices) {
         if (abs(samples[i]) >= threshold) {
@@ -3302,7 +3475,7 @@ fun trimLeadingAndTrailingSilence(
             break
         }
     }
-    if (firstVoice == -1) return FloatArray(0)
+    if (firstVoice == -1) return TrimmedSilenceBuffer(FloatArray(0), 0)
 
     var lastVoice = firstVoice
     for (i in samples.lastIndex downTo firstVoice) {
@@ -3315,9 +3488,9 @@ fun trimLeadingAndTrailingSilence(
     val start = max(0, firstVoice - padSamples)
     val endExclusive = min(samples.size, lastVoice + padSamples + 1)
     if (start == 0 && endExclusive == samples.size) {
-        return samples
+        return TrimmedSilenceBuffer(samples, 0)
     }
-    return samples.copyOfRange(start, endExclusive)
+    return TrimmedSilenceBuffer(samples.copyOfRange(start, endExclusive), start)
 }
 
 /**
@@ -3813,7 +3986,7 @@ private val PROPER_NOUNS_KEEP_CAPITALIZED = setOf(
     "google", "android", "apple", "microsoft", "windows", "linux", "github", "openflow", "voz", "litert", "qualcomm", "snapdragon", "samsung", "pixel"
 )
 
-private fun shouldLowercaseMidSentenceToken(
+internal fun shouldLowercaseMidSentenceToken(
     firstToken: String,
     secondToken: String?,
     lastPrevWord: String,
@@ -3858,7 +4031,7 @@ private fun shouldLowercaseMidSentenceToken(
     return false
 }
 
-private fun lowercaseFirstLetterOfToken(token: String): String {
+internal fun lowercaseFirstLetterOfToken(token: String): String {
     val idx = token.indexOfFirst { it.isLetter() }
     if (idx < 0 || !token[idx].isUpperCase()) return token
     return token.substring(0, idx) + token[idx].lowercaseChar() + token.substring(idx + 1)
@@ -3923,7 +4096,7 @@ fun stitchChunkTranscripts(
     return applyCustomVocabulary(finalNormalized, customVocabulary)
 }
 
-private fun mergeTwoChunkTranscripts(
+internal fun mergeTwoChunkTranscripts(
     prev: String,
     next: String,
     isGerman: Boolean,

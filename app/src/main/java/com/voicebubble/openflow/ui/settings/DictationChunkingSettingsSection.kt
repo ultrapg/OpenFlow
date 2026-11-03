@@ -50,8 +50,8 @@ fun DictationChunkingSettingsSection(
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            "Long dictations are split at natural pauses. With live transcription each finished chunk is " +
-                "transcribed while you keep talking, so after you stop only the last chunk is left.",
+            "Long dictations split at natural clause pauses (or overlap across low-energy valleys during " +
+                "non-stop speech) and align word timestamps so boundaries never drop or duplicate words.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

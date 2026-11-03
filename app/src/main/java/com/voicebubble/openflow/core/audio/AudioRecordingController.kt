@@ -7,6 +7,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import com.voicebubble.openflow.core.debug.DebugLogManager
+import com.voicebubble.openflow.core.speech.CutKind
 import com.voicebubble.openflow.core.speech.findStreamingCut
 import com.voicebubble.openflow.settings.DictationChunkSettings
 import kotlinx.coroutines.CoroutineScope
@@ -109,6 +110,9 @@ class AudioRecordingController {
     private var pcmBuffer: FloatArray? = null
     @Volatile
     private var pcmSize: Int = 0
+    private var streamBaseSampleOffset: Long = 0L
+    private var lastPendingNominalCutSample: Long? = null
+    private var lastPendingCutKind: CutKind? = null
 
     /**
      * Lock-free snapshot of the number of unread PCM samples currently buffered in [pcmBuffer].
@@ -169,6 +173,9 @@ class AudioRecordingController {
         synchronized(bufferLock) {
             pcmBuffer = null
             pcmSize = 0
+            streamBaseSampleOffset = 0L
+            lastPendingNominalCutSample = null
+            lastPendingCutKind = null
         }
         releaseInternal()
     }
@@ -218,6 +225,9 @@ class AudioRecordingController {
             audioRecord = record
             val bufferAllocated = synchronized(bufferLock) {
                 pcmSize = 0
+                streamBaseSampleOffset = 0L
+                lastPendingNominalCutSample = null
+                lastPendingCutKind = null
                 pcmBuffer = try {
                     FloatArray(INITIAL_CAPACITY_SAMPLES)
                 } catch (_: OutOfMemoryError) {
@@ -256,6 +266,9 @@ class AudioRecordingController {
                     synchronized(bufferLock) {
                         pcmBuffer = null
                         pcmSize = 0
+                        streamBaseSampleOffset = 0L
+                        lastPendingNominalCutSample = null
+                        lastPendingCutKind = null
                     }
                     releaseInternal()
                     return@withLock false
@@ -265,6 +278,9 @@ class AudioRecordingController {
                 synchronized(bufferLock) {
                     pcmBuffer = null
                     pcmSize = 0
+                    streamBaseSampleOffset = 0L
+                    lastPendingNominalCutSample = null
+                    lastPendingCutKind = null
                 }
                 releaseInternal()
                 return@withLock false
@@ -368,12 +384,11 @@ class AudioRecordingController {
 
     /**
      * Live "transcribe while recording" support: asks the pause detector whether the audio captured so far
-     * contains a finished chunk (see [findStreamingCut]). If so, the chunk `[0, cut.index)` is returned and
-     * the live buffer advances to `cut.resumeIndex` (which keeps natural leading silence inside the pause for
-     * the next chunk without duplicating any speech samples). Chunks without usable speech (long leading
-     * silence) are discarded and `null` is returned.
+     * contains a finished chunk (see [findStreamingCut]) and returns both the PCM slice and its exact
+     * global session sample coordinates (`[startSampleInSession, endSampleInSession)`) for timestamp-aligned
+     * overlap merging.
      */
-    fun extractStreamingChunk(config: DictationChunkSettings): FloatArray? {
+    fun extractStreamingChunkDetailed(config: DictationChunkSettings): ExtractedStreamingChunk? {
         synchronized(bufferLock) {
             val buf = pcmBuffer ?: return null
             val size = pcmSize
@@ -381,6 +396,12 @@ class AudioRecordingController {
             val index = cut.index.coerceIn(0, size)
             if (index <= 0) return null
             val resumeAt = cut.resumeIndex.coerceIn(1, index)
+            val chunkStartSample = streamBaseSampleOffset
+            val chunkEndSample = chunkStartSample + index.toLong()
+            val prevNominalCut = lastPendingNominalCutSample
+            val prevCutKind = lastPendingCutKind
+            val nominalCutAtEnd = chunkStartSample + cut.nominalSplitSample.coerceIn(0, index).toLong()
+
             val chunk = if (cut.hasSpeech) {
                 if (jvmFreeHeadroomBytes() < index.toLong() * 4L + (12L * 1024L * 1024L)) {
                     // Leave audio in the single contiguous live buffer until JVM heap headroom recovers
@@ -395,6 +416,13 @@ class AudioRecordingController {
             } else {
                 null
             }
+
+            streamBaseSampleOffset += resumeAt.toLong()
+            if (chunk != null) {
+                lastPendingNominalCutSample = nominalCutAtEnd
+                lastPendingCutKind = cut.cutKind
+            }
+
             val remaining = size - resumeAt
             // If an earlier long stretch grew pcmBuffer well past INITIAL_CAPACITY_SAMPLES, compact back down once drained
             if (buf.size > INITIAL_CAPACITY_SAMPLES * 2 &&
@@ -408,17 +436,42 @@ class AudioRecordingController {
                     }
                     pcmBuffer = compacted
                     pcmSize = remaining
-                    return chunk
+                    return chunk?.let {
+                        ExtractedStreamingChunk(
+                            samples = it,
+                            startSampleInSession = chunkStartSample,
+                            endSampleInSession = chunkEndSample,
+                            nominalCutSampleAfterPrev = prevNominalCut,
+                            cutKindAfterPrev = prevCutKind,
+                            cutKindAtEnd = cut.cutKind,
+                            nominalCutSampleAtEnd = nominalCutAtEnd
+                        )
+                    }
                 } catch (_: OutOfMemoryError) {
                 }
             }
             System.arraycopy(buf, resumeAt, buf, 0, remaining)
             pcmSize = remaining
-            return chunk
+            return chunk?.let {
+                ExtractedStreamingChunk(
+                    samples = it,
+                    startSampleInSession = chunkStartSample,
+                    endSampleInSession = chunkEndSample,
+                    nominalCutSampleAfterPrev = prevNominalCut,
+                    cutKindAfterPrev = prevCutKind,
+                    cutKindAtEnd = cut.cutKind,
+                    nominalCutSampleAtEnd = nominalCutAtEnd
+                )
+            }
         }
     }
 
-    suspend fun stopRecording(): FloatArray = withContext(Dispatchers.IO) {
+    fun extractStreamingChunk(config: DictationChunkSettings): FloatArray? =
+        extractStreamingChunkDetailed(config)?.samples
+
+    suspend fun stopRecording(): FloatArray = stopRecordingDetailed().samples
+
+    suspend fun stopRecordingDetailed(): StoppedRecordingTail = withContext(Dispatchers.IO) {
         controllerMutex.withLock {
             isRecording = false
             val activeRecord = audioRecord
@@ -462,9 +515,15 @@ class AudioRecordingController {
             synchronized(bufferLock) {
                 val buf = pcmBuffer
                 val size = pcmSize
+                val tailStart = streamBaseSampleOffset
+                val prevNominal = lastPendingNominalCutSample
+                val prevKind = lastPendingCutKind
                 pcmBuffer = null
                 pcmSize = 0
-                if (buf == null || size <= 0) {
+                streamBaseSampleOffset = 0L
+                lastPendingNominalCutSample = null
+                lastPendingCutKind = null
+                val tailSamples = if (buf == null || size <= 0) {
                     FloatArray(0)
                 } else if (size == buf.size) {
                     buf
@@ -476,6 +535,13 @@ class AudioRecordingController {
                         buf
                     }
                 }
+                StoppedRecordingTail(
+                    samples = tailSamples,
+                    startSampleInSession = tailStart,
+                    endSampleInSession = tailStart + tailSamples.size.toLong(),
+                    nominalCutSampleAfterPrev = prevNominal,
+                    cutKindAfterPrev = prevKind
+                )
             }
         }
     }
@@ -501,3 +567,31 @@ class AudioRecordingController {
         audioRecord = null
     }
 }
+
+/**
+ * Live audio chunk extracted while recording, tagged with exact global session sample coordinates
+ * (`[startSampleInSession, endSampleInSession)`) and cut metadata so [com.voicebubble.openflow.core.speech.SmartPipeline]
+ * and [com.voicebubble.openflow.core.speech.StreamingDictationSession] can project `Voz` word timestamps
+ * into global dictation time for zero-drop, zero-duplicate overlap merging.
+ */
+data class ExtractedStreamingChunk(
+    val samples: FloatArray,
+    val startSampleInSession: Long,
+    val endSampleInSession: Long,
+    val nominalCutSampleAfterPrev: Long?,
+    val cutKindAfterPrev: CutKind?,
+    val cutKindAtEnd: CutKind,
+    val nominalCutSampleAtEnd: Long
+)
+
+/**
+ * Remaining microphone tail drained when recording stops, tagged with its global session sample coordinates
+ * and the boundary metadata left by the preceding live cut (if any).
+ */
+data class StoppedRecordingTail(
+    val samples: FloatArray,
+    val startSampleInSession: Long,
+    val endSampleInSession: Long,
+    val nominalCutSampleAfterPrev: Long?,
+    val cutKindAfterPrev: CutKind?
+)

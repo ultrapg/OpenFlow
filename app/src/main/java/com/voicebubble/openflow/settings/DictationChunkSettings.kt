@@ -77,22 +77,28 @@ data class DictationChunkSettings(
         const val KEY_DEFAULTS_VERSION = "chunk_defaults_version"
 
         /** Bumped whenever the shipped defaults change; see [migrateDefaults]. */
-        const val DEFAULTS_VERSION = 4
+        const val DEFAULTS_VERSION = 5
 
         const val DEFAULT_CHUNKING_ENABLED = true
         const val DEFAULT_LIVE_ENABLED = true
 
         /**
-         * 550 ms: safely above brief mid-clause hesitations and word gaps (200-400 ms) while catching
-         * natural breath and clause boundaries promptly so live transcription starts earlier while recording.
+         * 650 ms: safely above mid-sentence hesitation breaths and inter-word pauses (200-450 ms) so
+         * live chunks cut cleanly at genuine clause/sentence boundaries without fragmenting syntax.
          */
-        const val DEFAULT_PAUSE_MS = 550
+        const val DEFAULT_PAUSE_MS = 650
 
-        /** 4 s: starts live transcription ~20% sooner on the first sentence while giving Voz full phrase context. */
-        const val DEFAULT_MIN_LIVE_CHUNK_SECONDS = 4f
+        /**
+         * 6 s: keeps short dictations (< 6-8 s) in a single unchunked pass and ensures every live chunk
+         * gives Voz full multi-word acoustic & linguistic context.
+         */
+        const val DEFAULT_MIN_LIVE_CHUNK_SECONDS = 6f
 
-        /** 16 s: keeps Conformer attention in its linear-fast sweet spot on multi-minute continuous dictations. */
-        const val DEFAULT_MAX_CHUNK_SECONDS = 16f
+        /**
+         * 18 s: keeps Conformer attention in its linear-fast sweet spot while giving continuous speakers
+         * enough runway to reach natural clause boundaries before valley-overlap splitting kicks in.
+         */
+        const val DEFAULT_MAX_CHUNK_SECONDS = 18f
         const val DEFAULT_SILENCE_THRESHOLD = 0.008f
         const val DEFAULT_REUSE_LANGUAGE = true
         const val DEFAULT_ADAPTIVE_PAUSE = true
@@ -105,6 +111,9 @@ data class DictationChunkSettings(
         private const val V3_PAUSE_MS = 650
         private const val V3_MIN_LIVE_CHUNK_SECONDS = 5f
         private const val V3_MAX_CHUNK_SECONDS = 20f
+        private const val V4_PAUSE_MS = 550
+        private const val V4_MIN_LIVE_CHUNK_SECONDS = 4f
+        private const val V4_MAX_CHUNK_SECONDS = 16f
 
         const val MIN_PAUSE_MS = 250
         const val MAX_PAUSE_MS = 2_000
@@ -128,7 +137,11 @@ data class DictationChunkSettings(
                 val editor = prefs.edit()
                 if (prefs.contains(KEY_PAUSE_MS)) {
                     val storedPause = prefs.getInt(KEY_PAUSE_MS, -1)
-                    if (storedPause == V1_PAUSE_MS || storedPause == V2_PAUSE_MS || storedPause == V3_PAUSE_MS) {
+                    if (storedPause == V1_PAUSE_MS ||
+                        storedPause == V2_PAUSE_MS ||
+                        storedPause == V3_PAUSE_MS ||
+                        storedPause == V4_PAUSE_MS
+                    ) {
                         editor.remove(KEY_PAUSE_MS)
                     }
                 }
@@ -136,14 +149,15 @@ data class DictationChunkSettings(
                     val storedMinLive = prefs.getFloat(KEY_MIN_LIVE_CHUNK_SECONDS, -1f)
                     if (storedMinLive == V1_MIN_LIVE_CHUNK_SECONDS ||
                         storedMinLive == V2_MIN_LIVE_CHUNK_SECONDS ||
-                        storedMinLive == V3_MIN_LIVE_CHUNK_SECONDS
+                        storedMinLive == V3_MIN_LIVE_CHUNK_SECONDS ||
+                        storedMinLive == V4_MIN_LIVE_CHUNK_SECONDS
                     ) {
                         editor.remove(KEY_MIN_LIVE_CHUNK_SECONDS)
                     }
                 }
                 if (prefs.contains(KEY_MAX_CHUNK_SECONDS)) {
                     val storedMax = prefs.getFloat(KEY_MAX_CHUNK_SECONDS, -1f)
-                    if (storedMax == V3_MAX_CHUNK_SECONDS) {
+                    if (storedMax == V3_MAX_CHUNK_SECONDS || storedMax == V4_MAX_CHUNK_SECONDS) {
                         editor.remove(KEY_MAX_CHUNK_SECONDS)
                     }
                 }

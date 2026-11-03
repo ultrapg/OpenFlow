@@ -2963,8 +2963,8 @@ class SmartPipelineTest {
         val longPause600ms = FloatArray(16_000) { idx -> if (idx < 6_400) 0.08f else 0.001f }
         assertEquals(0L, com.voicebubble.openflow.core.audio.AudioRecordingController.computeStopFlushGraceMs(longPause600ms, longPause600ms.size))
 
-        // 4. Forced non-pause live cut retains 150ms micro-overlap & quiet 4-frame (80ms) tail speech is preserved
-        val nonStopSpeech = FloatArray(16 * 16_000 + 3_200) { 0.05f }
+        // 4. Forced non-pause live cut retains 1.20s bilateral overlap & quiet 4-frame (80ms) tail speech is preserved
+        val nonStopSpeech = FloatArray(18 * 16_000 + 3_200) { 0.05f }
         val cfg = com.voicebubble.openflow.settings.DictationChunkSettings()
         val forcedCut = com.voicebubble.openflow.core.speech.findStreamingCut(nonStopSpeech, nonStopSpeech.size, cfg)
         assertTrue(forcedCut != null && forcedCut.hasSpeech)
@@ -3145,5 +3145,322 @@ class SmartPipelineTest {
         } finally {
             cacheDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `buildChunkTranscriptionSegment projects exact global timestamps across silence trim and lead padding`() {
+        // Chunk starts at global sample 160,000 (10.00s) and has 16,000 samples (1.00s) of leading silence
+        // before speech starts at +1.00s (global 11.00s).
+        val rawSamples = FloatArray(48_000) { idx -> if (idx >= 16_000) 0.12f else 0.0002f }
+        val trimmed = com.voicebubble.openflow.core.speech.trimLeadingAndTrailingSilenceWithOffset(
+            samples = rawSamples,
+            threshold = 0.0018f,
+            padSamples = 8_000
+        )
+        // 8,000 samples (0.50s) were trimmed off the front -> trimmed starts at global 10.50s (sample 168,000)
+        assertEquals(8_000, trimmed.leadingTrimmedSamples)
+
+        val prep = com.voicebubble.openflow.core.speech.prepareChunkForInferenceWithOffset(
+            samples = trimmed.samples,
+            minLeadSilencePadSamples = 5_120,
+            minTailSilencePadSamples = 10_240,
+            minTotalSamples = 25_600,
+            silenceThreshold = 0.0018f
+        )
+        // Trimmed already had 8,000 samples of lead silence (>= 5,120), so prependedLeadSamples == 0
+        assertEquals(0, prep.prependedLeadSamples)
+
+        // Word spoken at +0.50s..+0.90s inside `prep.samples` == global 11.00s..11.40s; final word "now." omitted from words list
+        val vozOut = Transcription(
+            text = "Ship the update now.",
+            words = listOf(
+                Word("Ship", 0.50, 0.72),
+                Word("the", 0.72, 0.84),
+                Word("update", 0.84, 1.18)
+            ),
+            duration = 2.0
+        )
+        val seg = com.voicebubble.openflow.core.speech.buildChunkTranscriptionSegment(
+            transcription = vozOut,
+            chunkStartSample = 160_000L + trimmed.leadingTrimmedSamples.toLong(),
+            rawChunkSampleCount = trimmed.samples.size,
+            prependedLeadSamples = prep.prependedLeadSamples
+        )
+        assertEquals("Ship the update now.", seg.normalizedText)
+        assertEquals(4, seg.words.size)
+        assertEquals("Ship", seg.words[0].text)
+        assertEquals(11.00, seg.words[0].startSec, 0.005)
+        assertEquals("now.", seg.words[3].text)
+        assertTrue("Interpolated omitted final word must follow previous word timestamp", seg.words[3].startSec >= 11.18)
+    }
+
+    @Test
+    fun `mergeTimestampedChunkSegments aligns 1_2s valley overlaps via lexical anchors without duplicates or false periods`() {
+        // Chunk 0 covers [0.0s .. 18.0s]; Voz tacked a synthetic period onto the chunk-final word "architecture."
+        val seg0 = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "Our engineering team shipped the new architecture.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Our", 14.20, 14.45),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("engineering", 14.48, 15.05),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("team", 15.08, 15.38),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("shipped", 15.42, 15.88),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("the", 16.85, 17.02),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("new", 17.05, 17.30),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("architecture.", 17.32, 17.92)
+            ),
+            chunkStartSec = 0.0,
+            chunkEndSec = 18.0
+        )
+
+        // Chunk 1 rewound 1.20s to [16.8s .. 26.0s] with nominal cut at 17.4s; Voz capitalized chunk-initial "The"
+        // but decoded "architecture across every Android device in production." with full right-hand context (no false period!).
+        val seg1 = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "The new architecture across every Android device in production.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("The", 16.86, 17.03),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("new", 17.06, 17.31),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("architecture", 17.33, 17.94),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("across", 17.98, 18.35),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("every", 18.38, 18.68),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Android", 18.70, 19.15),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("device", 19.18, 19.60),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("in", 19.62, 19.76),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("production.", 19.78, 20.45)
+            ),
+            chunkStartSec = 16.8,
+            chunkEndSec = 26.0,
+            nominalCutBeforeSec = 17.4,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.VALLEY_OVERLAP
+        )
+
+        val merged = com.voicebubble.openflow.core.speech.mergeTimestampedChunkSegmentsWithTelemetry(
+            segments = listOf(seg0, seg1),
+            language = "en"
+        )
+        assertEquals(1, merged.telemetry.anchorAlignedJoins)
+        assertEquals(
+            "Our engineering team shipped the new architecture across every Android device in production.",
+            merged.text
+        )
+    }
+
+    @Test
+    fun `mergeTimestampedChunkSegments revisable tail uses acoustic gap to distinguish continuous speech from real sentence pauses`() {
+        // Continuous mid-sentence speech across cut (acousticGap = 0.14s < 0.38s): strips synthetic "." and lowercases "Across"
+        val leftContinuous = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "Our team deployed the update.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Our", 1.0, 1.3),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("team", 1.3, 1.6),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("deployed", 1.6, 2.1),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("the", 2.1, 2.25),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("update.", 2.25, 2.70)
+            ),
+            chunkStartSec = 0.0,
+            chunkEndSec = 2.80
+        )
+        val rightContinuous = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "Across every production region.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Across", 2.84, 3.20),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("every", 3.22, 3.50),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("production", 3.52, 4.05),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("region.", 4.08, 4.55)
+            ),
+            chunkStartSec = 2.80,
+            chunkEndSec = 5.0,
+            nominalCutBeforeSec = 2.80,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.VALLEY_OVERLAP
+        )
+        assertEquals(
+            "Our team deployed the update across every production region.",
+            com.voicebubble.openflow.core.speech.mergeTimestampedChunkSegments(
+                segments = listOf(leftContinuous, rightContinuous),
+                language = "en"
+            )
+        )
+
+        // Genuine 0.95s sentence pause: preserves period and capital "Across"
+        val rightAfterRealPause = rightContinuous.copy(
+            normalizedText = "Across the street the lights turned on.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Across", 3.65, 4.00),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("the", 4.02, 4.15),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("street", 4.18, 4.55),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("the", 4.58, 4.70),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("lights", 4.72, 5.05),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("turned", 5.08, 5.40),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("on.", 5.42, 5.75)
+            ),
+            chunkStartSec = 3.50,
+            chunkEndSec = 6.00,
+            nominalCutBeforeSec = 3.15,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.CONFIDENT_PAUSE
+        )
+        assertEquals(
+            "Our team deployed the update. Across the street the lights turned on.",
+            com.voicebubble.openflow.core.speech.mergeTimestampedChunkSegments(
+                segments = listOf(leftContinuous, rightAfterRealPause),
+                language = "en"
+            )
+        )
+
+        // German continuous speech (0.15s gap): strips synthetic "." and lowercases "ohne" while keeping "Server" capitalized
+        val deLeft = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "Wir aktualisieren das System.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Wir", 0.5, 0.7),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("aktualisieren", 0.72, 1.45),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("das", 1.48, 1.68),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("System.", 1.70, 2.20)
+            ),
+            chunkStartSec = 0.0,
+            chunkEndSec = 2.28
+        )
+        val deRight = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "Ohne den Server neu zu starten.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Ohne", 2.35, 2.65),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("den", 2.68, 2.85),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("Server", 2.88, 3.30),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("neu", 3.32, 3.55),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("zu", 3.58, 3.72),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("starten.", 3.75, 4.25)
+            ),
+            chunkStartSec = 2.28,
+            chunkEndSec = 4.50,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.VALLEY_OVERLAP
+        )
+        assertEquals(
+            "Wir aktualisieren das System ohne den Server neu zu starten.",
+            com.voicebubble.openflow.core.speech.mergeTimestampedChunkSegments(
+                segments = listOf(deLeft, deRight),
+                language = "de"
+            )
+        )
+    }
+
+    @Test
+    fun `planStreamingOverlapCommit holds valley cuts and unclosed clauses while committing closed sentence groups`() {
+        val closedSeg0 = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "We finished testing the new audio chunking architecture.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("We", 0.5, 0.7),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("finished", 0.72, 1.1),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("testing", 1.12, 1.5),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("the", 1.52, 1.65),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("new", 1.68, 1.9),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("audio", 1.92, 2.25),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("chunking", 2.28, 2.7),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("architecture.", 2.72, 3.40)
+            ),
+            chunkStartSec = 0.0,
+            chunkEndSec = 3.70
+        )
+        val unclosedSeg1 = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "When we roll this update out to",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("When", 4.20, 4.45),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("we", 4.48, 4.62),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("roll", 4.65, 4.90),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("this", 4.92, 5.12),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("update", 5.15, 5.55),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("out", 5.58, 5.78),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("to", 5.80, 5.95)
+            ),
+            chunkStartSec = 3.85,
+            chunkEndSec = 6.00,
+            nominalCutBeforeSec = 3.78,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.CONFIDENT_PAUSE
+        )
+        val closingSeg2 = com.voicebubble.openflow.core.speech.ChunkTranscriptionSegment(
+            normalizedText = "every user tomorrow morning.",
+            words = listOf(
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("every", 6.05, 6.35),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("user", 6.38, 6.70),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("tomorrow", 6.72, 7.15),
+                com.voicebubble.openflow.core.speech.GlobalTimedWord("morning.", 7.18, 7.65)
+            ),
+            chunkStartSec = 5.40,
+            chunkEndSec = 7.90,
+            nominalCutBeforeSec = 6.00,
+            cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.VALLEY_OVERLAP
+        )
+
+        // Across [closedSeg0, unclosedSeg1, closingSeg2]: holds [unclosedSeg1 + closingSeg2] together and commits ONLY closedSeg0!
+        val plan = com.voicebubble.openflow.core.speech.planStreamingOverlapCommit(
+            uncleanedSegments = listOf(closedSeg0, unclosedSeg1, closingSeg2),
+            language = "en"
+        )
+        assertTrue(plan != null)
+        assertEquals(1, plan!!.commitRelativeEndExclusive)
+        assertEquals("We finished testing the new audio chunking architecture.", plan.prefixTextToClean)
+
+        // If the boundary after closedSeg0 was a VALLEY_OVERLAP cut instead of CONFIDENT_PAUSE, must NOT commit!
+        val valleyAfterSeg0 = unclosedSeg1.copy(cutKindBefore = com.voicebubble.openflow.core.speech.CutKind.VALLEY_OVERLAP)
+        assertEquals(
+            null,
+            com.voicebubble.openflow.core.speech.planStreamingOverlapCommit(
+                uncleanedSegments = listOf(closedSeg0, valleyAfterSeg0),
+                language = "en"
+            )
+        )
+
+        // Email body paragraph continuity: greeting newline in segment 0 must NOT force a spurious \n\n inside the body paragraph!
+        val joinedEmail = com.voicebubble.openflow.core.speech.StreamingDictationSession.joinStreamingCleanedSegments(
+            segments = listOf(
+                "Hi Sarah,\n\nI just reviewed the latest benchmark telemetry.",
+                "Latency stayed flat across all six language models.",
+                "Best,\nAlex"
+            ),
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+        )
+        assertEquals(
+            "Hi Sarah,\n\nI just reviewed the latest benchmark telemetry. Latency stayed flat across all six language models.\n\nBest,\nAlex",
+            joinedEmail
+        )
+    }
+
+    @Test
+    fun `reconcileWholeDictationWithRawVoz recovers dropped multi-chunk prefix or tail sentences while allowing backtracks`() {
+        val fullRaw = "First we validated the microphone noise floor calibration in noisy rooms. " +
+            "Second we verified that overlapping word timestamps eliminate every boundary glitch. " +
+            "Finally we packaged the release build for production deployment."
+
+        // Dropped tail sentence -> recovers full pre-normalized transcript
+        val droppedTail = "First we validated the microphone noise floor calibration in noisy rooms. " +
+            "Second we verified that overlapping word timestamps eliminate every boundary glitch."
+        assertEquals(
+            fullRaw,
+            com.voicebubble.openflow.core.speech.reconcileWholeDictationWithRawVoz(
+                rawMergedVoz = fullRaw,
+                candidateOutput = droppedTail,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Dropped opening prefix sentence -> recovers full pre-normalized transcript
+        val droppedPrefix = "Second we verified that overlapping word timestamps eliminate every boundary glitch. " +
+            "Finally we packaged the release build for production deployment."
+        assertEquals(
+            fullRaw,
+            com.voicebubble.openflow.core.speech.reconcileWholeDictationWithRawVoz(
+                rawMergedVoz = fullRaw,
+                candidateOutput = droppedPrefix,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // Legitimate spoken backtrack deleting earlier clause -> preserved cleanly!
+        val rawWithBacktrack = "Let's schedule the release review for Tuesday morning, scratch that, let's do Thursday afternoon at three."
+        val cleanedBacktrack = "Let's schedule the release review for Thursday afternoon at 3:00."
+        assertEquals(
+            cleanedBacktrack,
+            com.voicebubble.openflow.core.speech.reconcileWholeDictationWithRawVoz(
+                rawMergedVoz = rawWithBacktrack,
+                candidateOutput = cleanedBacktrack,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
     }
 }

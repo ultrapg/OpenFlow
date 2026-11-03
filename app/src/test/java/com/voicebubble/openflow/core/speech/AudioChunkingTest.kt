@@ -228,17 +228,17 @@ class AudioChunkingTest {
         val d = DictationChunkSettings()
         assertTrue(d.chunkingEnabled)
         assertTrue(d.liveActive)
-        assertEquals(550, d.pauseMs)
-        assertEquals(4f, d.minLiveChunkSeconds, 0.0001f)
-        assertEquals(16f, d.maxChunkSeconds, 0.0001f)
+        assertEquals(650, d.pauseMs)
+        assertEquals(6f, d.minLiveChunkSeconds, 0.0001f)
+        assertEquals(18f, d.maxChunkSeconds, 0.0001f)
         assertTrue(d.adaptivePause)
         assertEquals(d, d.sanitized())
 
         val off = d.copy(chunkingEnabled = false)
         assertFalse("live transcription needs chunking", off.liveActive)
         assertEquals("one piece up to the 60 s safety ceiling", 60 * sr, off.effectiveMaxChunkSamples)
-        assertEquals(16 * sr, off.maxChunkSamples)
-        assertEquals(16 * sr, d.effectiveMaxChunkSamples)
+        assertEquals(18 * sr, off.maxChunkSamples)
+        assertEquals(18 * sr, d.effectiveMaxChunkSamples)
     }
 
     @Test
@@ -338,5 +338,141 @@ class AudioChunkingTest {
         // 90 ms quiet spoken final word ("it", "on", "ok") -> accepted so end of dictation is never dropped
         val quietFinalWord = concat(tone(0.1, silence), tone(0.09, 0.005f), tone(0.15, silence))
         assertTrue(hasAnyTailSpeech(quietFinalWord))
+    }
+
+    @Test
+    fun `early 300ms ambient noise calibration rescues silence detection during non-stop noisy speech`() {
+        val fanNoise = 0.014f
+        val loudSpeech = 0.28f
+        // Only ~5.5% of the buffer is fan noise (0.32s lead + 0.72s pause vs 16.5s loud speech),
+        // which would push a naive percentile dangerously close to speech without early 300ms calibration.
+        val audio = concat(
+            tone(0.32, fanNoise),
+            tone(8.0, loudSpeech),
+            tone(0.75, fanNoise),
+            tone(8.5, loudSpeech)
+        )
+        val rms = computeFrameRms(audio, 0, audio.size)
+        val calibratedFloor = calibrateAmbientNoiseFloor(rms)
+        assertTrue(
+            "Expected calibrated noise floor ($calibratedFloor) near 0.014f, well below speech",
+            calibratedFloor in 0.010f..0.020f
+        )
+        val cut = findStreamingCut(audio, audio.size, DictationChunkSettings())
+        assertNotNull(cut)
+        assertEquals(CutKind.CONFIDENT_PAUSE, cut!!.cutKind)
+        val pauseStart = ((0.32 + 8.0) * sr).toInt()
+        val pauseEnd = pauseStart + (0.75 * sr).toInt()
+        assertTrue("Pause cut ${cut.index} must land inside the 0.75s noisy pause", cut.index in pauseStart..pauseEnd)
+    }
+
+    @Test
+    fun `rapid syllable cadence bonus protects fast talkers from brief mid-clause catch-breath cuts`() {
+        val defaultCfg = DictationChunkSettings() // min=6s, max=18s, pause=650ms
+        // Build 9.0s of rapid 6.25-syllables/sec modulated speech (8 frames peak @ 0.24f, 4 frames dip @ 0.06f -> 12 frames = 240ms? Let's use 5 frames peak + 3 frames dip = 160ms = 6.25 Hz!)
+        val fastSyllableFrames = 450 // 9.0 s @ 20 ms/frame
+        val fastSpeech = FloatArray(fastSyllableFrames * CHUNK_FRAME_SAMPLES)
+        for (f in 0 until fastSyllableFrames) {
+            val phase = f % 8
+            val amp = if (phase in 1..4) 0.24f else 0.05f
+            val base = f * CHUNK_FRAME_SAMPLES
+            for (i in 0 until CHUNK_FRAME_SAMPLES) {
+                fastSpeech[base + i] = if (i % 2 == 0) amp else -amp
+            }
+        }
+        val rmsFast = computeFrameRms(fastSpeech, 0, fastSpeech.size)
+        val maskFast = buildSilenceMask(rmsFast, adaptiveSilenceThreshold(rmsFast, defaultCfg.silenceThreshold))
+        assertTrue(
+            "Fast 6.25 Hz syllable modulation must earn a positive pause-margin bonus",
+            estimateRapidCadencePauseBonusFrames(rmsFast, maskFast, rmsFast.size) > 0
+        )
+
+        // At 9.0s, requiredPauseFrames is ~27 frames (540 ms), + 3 cadence bonus = 30 frames (600 ms).
+        // A brief 540 ms catch-breath must NOT chop the fast speaker mid-clause, while a full 680 ms pause DOES cut.
+        val withBriefCatchBreath = concat(fastSpeech, tone(0.54, silence), tone(1.0, speech))
+        assertNull(
+            "540 ms catch-breath during rapid-cadence speech at 9s should be held intact",
+            findStreamingCut(withBriefCatchBreath, withBriefCatchBreath.size, defaultCfg)
+        )
+
+        val withFullClausePause = concat(fastSpeech, tone(0.68, silence), tone(1.0, speech))
+        val cleanCut = findStreamingCut(withFullClausePause, withFullClausePause.size, defaultCfg)
+        assertNotNull(cleanCut)
+        assertEquals(CutKind.CONFIDENT_PAUSE, cleanCut!!.cutKind)
+    }
+
+    @Test
+    fun `valley search prefers smooth inter-word prosodic valley over steep stop-consonant cliff and retains 1_2s overlap`() {
+        val cfg = DictationChunkSettings() // max = 18s (288,000 samples)
+        val totalFrames = 920 // 18.4 s -> triggers forced VALLEY_OVERLAP cut
+        // Base continuous voiced energy (0.24f) everywhere — zero silent frames!
+        val frameAmps = FloatArray(totalFrames) { 0.24f }
+
+        // Place a sharp mid-word stop-consonant cliff at 15.6s (frame 780..785: 0.32f wall -> 0.045f -> 0.32f wall)
+        for (f in 777..779) frameAmps[f] = 0.32f
+        for (f in 780..785) frameAmps[f] = 0.045f
+        for (f in 786..788) frameAmps[f] = 0.32f
+
+        // Place a smooth, gradual inter-word prosodic valley at 16.8s (frames 837..848: gentle taper into 0.045f)
+        frameAmps[837] = 0.14f
+        frameAmps[838] = 0.10f
+        frameAmps[839] = 0.07f
+        for (f in 840..845) frameAmps[f] = 0.045f
+        frameAmps[846] = 0.07f
+        frameAmps[847] = 0.10f
+        frameAmps[848] = 0.14f
+
+        val samples = FloatArray(totalFrames * CHUNK_FRAME_SAMPLES)
+        for (f in 0 until totalFrames) {
+            val amp = frameAmps[f]
+            val base = f * CHUNK_FRAME_SAMPLES
+            for (i in 0 until CHUNK_FRAME_SAMPLES) {
+                samples[base + i] = if (i % 2 == 0) amp else -amp
+            }
+        }
+
+        val cut = findStreamingCut(samples, samples.size, cfg)
+        assertNotNull(cut)
+        assertEquals(CutKind.VALLEY_OVERLAP, cut!!.cutKind)
+        assertEquals(FORCED_CUT_OVERLAP_SAMPLES, cut.index - cut.resumeIndex)
+        val valleyStartSample = 839 * CHUNK_FRAME_SAMPLES
+        val valleyEndSample = 847 * CHUNK_FRAME_SAMPLES
+        assertTrue(
+            "Expected valley cut (${cut.index}) inside smooth inter-word valley [$valleyStartSample..$valleyEndSample], avoiding sharp plosive cliff",
+            cut.index in valleyStartSample..valleyEndSample
+        )
+    }
+
+    @Test
+    fun `short dictations under 6 seconds stay single-pass and offline valley cuts retain bilateral overlap`() {
+        val defaultCfg = DictationChunkSettings()
+        val short5s = concat(tone(4.8, speech), tone(0.9, silence))
+        assertNull("Short < 6s dictation must never split live", findStreamingCut(short5s, short5s.size, defaultCfg))
+
+        val singlePass17s = tone(17.5, speech)
+        val singleRanges = computeSmartChunkRanges(
+            samples = singlePass17s,
+            maxChunkSamples = defaultCfg.effectiveMaxChunkSamples,
+            minChunkSamples = defaultCfg.effectiveOfflineMinChunkSamples,
+            overlapSamplesOnValleyCut = FORCED_CUT_OVERLAP_SAMPLES
+        )
+        assertEquals(1, singleRanges.size)
+
+        // 32s of non-stop speech -> offline computeSmartChunkRanges produces 2 chunks with 1.20s bilateral overlap
+        val nonStop32s = tone(32.0, speech)
+        val overlapRanges = computeSmartChunkRanges(
+            samples = nonStop32s,
+            maxChunkSamples = defaultCfg.effectiveMaxChunkSamples,
+            minChunkSamples = defaultCfg.effectiveOfflineMinChunkSamples,
+            overlapSamplesOnValleyCut = FORCED_CUT_OVERLAP_SAMPLES
+        )
+        assertEquals(2, overlapRanges.size)
+        assertEquals(CutKind.VALLEY_OVERLAP, overlapRanges[1].cutKindBefore)
+        val overlapSamples = overlapRanges[0].endExclusive - overlapRanges[1].start
+        assertTrue(
+            "Offline valley cut must retain >= 0.9s bilateral overlap (got $overlapSamples samples)",
+            overlapSamples >= 14_400
+        )
+        assertTrue(overlapRanges.all { (it.endExclusive - it.start) <= defaultCfg.effectiveMaxChunkSamples })
     }
 }

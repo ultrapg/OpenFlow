@@ -1256,6 +1256,10 @@ class GemmaTextProcessor(
          * drops spoken sentences on non-summarizing presets ([GemmaPromptPreset.CLEAN_AND_POLISH] /
          * [GemmaPromptPreset.STRICT_CLEANUP]) when the speaker did NOT utter any self-correction / backtrack cue.
          */
+        internal fun containsSpokenBacktrackCue(text: String): Boolean {
+            return text.isNotBlank() && BACKTRACK_TRIGGER_REGEX.containsMatchIn(text)
+        }
+
         internal fun isSuspiciouslyTruncatedOutput(
             output: String,
             fallbackInput: String,

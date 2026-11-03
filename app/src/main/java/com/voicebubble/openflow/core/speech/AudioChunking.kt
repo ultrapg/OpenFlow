@@ -1,6 +1,7 @@
 package com.voicebubble.openflow.core.speech
 
 import com.voicebubble.openflow.settings.DictationChunkSettings
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -9,8 +10,27 @@ import kotlin.math.sqrt
 
 /**
  * Pure (Android-free) audio chunking helpers shared by the offline auto-chunker
- * ([splitAudioIntoSmartChunks]) and the live "transcribe while recording" detector ([findStreamingCut]).
+ * ([splitAudioIntoSmartChunks] / [computeSmartChunkRanges]) and the live "transcribe while recording"
+ * detector ([findStreamingCut]).
  */
+
+/**
+ * Classification of how a chunk boundary was chosen.
+ */
+enum class CutKind {
+    /** Buffer holds only pre-speech dead air; discard leading silence without invoking `Voz`. */
+    SILENCE_DISCARD,
+
+    /** Cut fell inside a verified inter-clause silence pause; zero spoken samples are duplicated. */
+    CONFIDENT_PAUSE,
+
+    /**
+     * Speaker talked continuously up to `maxChunk` without a full pause; cut fell in the best local
+     * energy valley and retains [FORCED_CUT_OVERLAP_SAMPLES] (`1.20 s`) of bilateral speech overlap
+     * for timestamp-aligned reconciliation.
+     */
+    VALLEY_OVERLAP
+}
 
 /** 20 ms analysis frame @ 16 kHz. */
 internal const val CHUNK_FRAME_SAMPLES = 320
@@ -57,17 +77,25 @@ internal const val LIVE_CUT_PAD_SAMPLES = 5_120
 internal const val LIVE_CUT_LEAD_IN_SAMPLES = 3_200
 
 /**
- * 150 ms acoustic micro-overlap retained only on forced non-pause live cuts (`usable >= maxChunk` when
- * the speaker talked non-stop without a pause) so boundary syllables are never severed mid-phoneme;
- * [stitchChunkTranscripts] automatically deduplicates any 1–2 word boundary overlap.
+ * `1.20 s` (`19,200` samples = `15` Conformer 80 ms frames) of real bilateral acoustic overlap retained
+ * on forced non-pause cuts (`usable >= maxChunk` when the speaker talked non-stop without a full pause)
+ * and offline valley cuts. Both adjacent chunks decode the boundary phrase with `>= 600 ms` of spoken
+ * acoustic context around the nominal crossover, and [mergeTimestampedChunkSegments] reconciles the
+ * overlap using `Voz` word timestamps and lexical anchors without dropping or duplicating words.
  */
-internal const val FORCED_CUT_OVERLAP_SAMPLES = 2_400
+internal const val FORCED_CUT_OVERLAP_SAMPLES = 19_200
+
+/** Trailing window (`3.5 s` = `56,000` samples) searched for an inter-word energy valley during non-stop speech. */
+internal const val VALLEY_TRAILING_WINDOW_SAMPLES = 56_000
+
+/** Initial `300 ms` (`15` frames) pre-speech ambient calibration window at the start of a buffer. */
+private const val EARLY_NOISE_CALIBRATION_FRAMES = 15
 
 /** When a live buffer holds no speech at all, only this much trailing audio (1 s) is kept as lead-in context. */
 private const val LIVE_SILENCE_KEEP_SAMPLES = 16_000
 
 /** The pause requirement never shrinks below this fraction of the configured pause length. */
-private const val ADAPTIVE_PAUSE_FLOOR_RATIO = 0.5f
+private const val ADAPTIVE_PAUSE_FLOOR_RATIO = 0.55f
 
 /** Adaptive pause reaches its floor once the pending audio is this fraction of the maximum chunk length. */
 private const val ADAPTIVE_PAUSE_FULL_AT_RATIO = 0.75f
@@ -96,20 +124,101 @@ internal fun computeFrameRms(
 }
 
 /**
+ * Estimates the recording's ambient noise floor by combining the global 5th-percentile frame RMS with
+ * an early `300 ms` pre-speech calibration window. When a speaker talks non-stop (>95% voiced frames),
+ * the 5th percentile alone can jump up to the voiced speech level; checking the initial `300 ms` room
+ * lead-in recovers the true background noise floor without inflating the threshold on clean recordings.
+ */
+internal fun calibrateAmbientNoiseFloor(frameRms: FloatArray): Float {
+    if (frameRms.isEmpty()) return 0f
+    val sorted = frameRms.copyOf()
+    sorted.sort()
+    val p05 = sorted[(sorted.size * 0.05f).toInt().coerceIn(0, sorted.size - 1)]
+    val speechLevel = sorted[(sorted.size * 0.80f).toInt().coerceIn(0, sorted.size - 1)]
+
+    if (frameRms.size >= 25) {
+        val earlyCount = min(EARLY_NOISE_CALIBRATION_FRAMES, frameRms.size)
+        val early = frameRms.copyOfRange(0, earlyCount)
+        early.sort()
+        val earlyP30 = early[(early.size * 0.30f).toInt().coerceIn(0, early.size - 1)]
+        if (earlyP30 <= speechLevel * 0.30f) {
+            return if (p05 > speechLevel * 0.35f) {
+                earlyP30
+            } else {
+                max(p05, min(sorted[(sorted.size * 0.10f).toInt().coerceIn(0, sorted.size - 1)], earlyP30))
+            }
+        }
+    }
+    return p05
+}
+
+/**
  * Silence threshold that adapts to the recording's noise floor: never below the user's [userThreshold],
- * but raised to ~3x the 5th-percentile frame level so constant background noise (fans, traffic) is not
- * mistaken for speech. Bounded by both 0.03f and 25% of the 80th-percentile speech level so quiet speakers
- * or trailing phrase declination (especially when `Clear` is disabled) are never misclassified as silence.
+ * but raised to ~3x the calibrated ambient noise floor so constant background noise (fans, traffic, AC) is
+ * not mistaken for speech. Bounded by both `0.03f` and `25%` of the 80th-percentile speech level so quiet
+ * speakers or trailing phrase declination are never misclassified as silence.
  */
 internal fun adaptiveSilenceThreshold(frameRms: FloatArray, userThreshold: Float): Float {
     if (frameRms.isEmpty()) return userThreshold
     val sorted = frameRms.copyOf()
     sorted.sort()
-    val noiseFloor = sorted[(sorted.size * 0.05f).toInt().coerceIn(0, sorted.size - 1)]
     val speechLevel = sorted[(sorted.size * 0.80f).toInt().coerceIn(0, sorted.size - 1)]
+    val noiseFloor = calibrateAmbientNoiseFloor(frameRms)
     val adaptive = noiseFloor * 3f
     val ceiling = max(userThreshold, min(0.03f, speechLevel * 0.25f))
     return max(userThreshold, adaptive).coerceAtMost(ceiling)
+}
+
+/**
+ * Estimates whether the speaker is talking at a rapid syllable cadence (`>= 5.5` envelope peaks/sec)
+ * over the recent `4.0 s` window preceding [upToFrame]. Fast talkers naturally take brief `300–420 ms`
+ * mid-clause catch-breaths that are NOT sentence boundaries; returning a small `+3` frame (`60 ms`)
+ * margin prevents chopping rapid-fire clauses prematurely while leaving normal speech and steady tones untouched.
+ */
+internal fun estimateRapidCadencePauseBonusFrames(
+    frameRms: FloatArray,
+    silent: BooleanArray,
+    upToFrame: Int
+): Int {
+    val end = min(upToFrame, min(frameRms.size, silent.size))
+    val windowFrames = 200 // 4.0 s @ 20 ms/frame
+    val start = max(0, end - windowFrames)
+    if (end - start < 75) return 0 // Need at least 1.5 s of history
+
+    var voicedFrames = 0
+    var voicedSum = 0.0
+    for (f in start until end) {
+        if (!silent[f]) {
+            voicedFrames++
+            voicedSum += frameRms[f].toDouble()
+        }
+    }
+    if (voicedFrames < 50) return 0
+    val voicedMean = (voicedSum / voicedFrames.toDouble()).toFloat()
+    val crestThreshold = voicedMean * 1.08f
+    val troughThreshold = voicedMean * 0.78f
+
+    var peaks = 0
+    var armedByTrough = true
+    var lastPeakFrame = -10
+    for (f in start until end) {
+        if (silent[f]) {
+            armedByTrough = true
+            continue
+        }
+        val r = frameRms[f]
+        if (r <= troughThreshold) {
+            armedByTrough = true
+        } else if (armedByTrough && r >= crestThreshold && f - lastPeakFrame >= 4) {
+            peaks++
+            lastPeakFrame = f
+            armedByTrough = false
+        }
+    }
+
+    val voicedSeconds = (voicedFrames * CHUNK_FRAME_SAMPLES).toFloat() / DictationChunkSettings.SAMPLE_RATE.toFloat()
+    val peaksPerSec = peaks / max(0.5f, voicedSeconds)
+    return if (peaksPerSec >= 5.5f) 3 else 0
 }
 
 /**
@@ -287,28 +396,44 @@ internal fun hasAnyTailSpeech(
 }
 
 /**
- * Picks the best place to cut inside `[rangeStart, rangeEndExclusive)`:
+ * Result of [findBestSplitDecision]: chosen sample index inside `[rangeStart, rangeEndExclusive)` and
+ * whether that split fell inside a real silence run ([CutKind.CONFIDENT_PAUSE]) or an inter-word energy
+ * valley ([CutKind.VALLEY_OVERLAP]).
+ */
+internal data class SplitPointDecision(
+    val sampleIndex: Int,
+    val cutKind: CutKind
+)
+
+/**
+ * Picks the best place to cut inside `[rangeStart, rangeEndExclusive)` and classifies the cut:
  *
  * 1. Finds every run of silent frames (adaptive threshold, click suppression, consonant hangover). Runs at
- *    least [minPauseFrames] long are pauses.
+ *    least [minPauseFrames] long qualify as genuine pauses ([CutKind.CONFIDENT_PAUSE]).
  * 2. Among pauses, accepts those within 75% of the longest one and prefers the **latest** (bigger chunks),
  *    cutting at the **centre** of the pause so no word is clipped on either side.
- * 3. If the range contains no real pause, falls back to the quietest local window (scoring a 4-frame / 80 ms
- *    core with a 2-frame halo on each side so genuine inter-word dips are preferred over brief 40 ms
- *    stop-consonant closures inside words like `p`/`t`/`k`).
- *
- * The returned index always lies inside the range.
+ * 3. If the range contains no real pause, returns [CutKind.VALLEY_OVERLAP] at the lowest-energy inter-word
+ *    valley (optionally focusing on the trailing [preferTrailingValleySamples] so continuous speech uses its
+ *    full chunk budget). Scores a 6-frame (`120 ms`) core + 6-frame (`120 ms`) bilateral halo + a transient
+ *    wall-steepness penalty so brief `40–60 ms` intra-word stop-consonant closures (`/p/`, `/t/`, `/k/`)
+ *    flanked by loud vowels are rejected in favor of smooth inter-word prosodic valleys.
  */
-internal fun findBestSplitPoint(
+internal fun findBestSplitDecision(
     samples: FloatArray,
     rangeStart: Int,
     rangeEndExclusive: Int,
     silenceThreshold: Float = DEFAULT_SILENCE_RMS,
     minPauseFrames: Int = 3,
-    frameLen: Int = CHUNK_FRAME_SAMPLES
-): Int {
+    frameLen: Int = CHUNK_FRAME_SAMPLES,
+    preferTrailingValleySamples: Int = 0
+): SplitPointDecision {
     val rms = computeFrameRms(samples, rangeStart, rangeEndExclusive, frameLen)
-    if (rms.isEmpty()) return ((rangeStart.toLong() + rangeEndExclusive) / 2).toInt()
+    if (rms.isEmpty()) {
+        return SplitPointDecision(
+            sampleIndex = ((rangeStart.toLong() + rangeEndExclusive) / 2).toInt(),
+            cutKind = CutKind.VALLEY_OVERLAP
+        )
+    }
     val n = rms.size
     val silent = buildSilenceMask(rms, adaptiveSilenceThreshold(rms, silenceThreshold))
 
@@ -345,41 +470,91 @@ internal fun findBestSplitPoint(
             }
         }
         if (bestStart >= 0) {
-            return rangeStart + (bestStart + bestLen / 2) * frameLen + frameLen / 2
+            val idx = rangeStart + (bestStart + bestLen / 2) * frameLen + frameLen / 2
+            return SplitPointDecision(
+                sampleIndex = idx.coerceIn(rangeStart, max(rangeStart, rangeEndExclusive - 1)),
+                cutKind = CutKind.CONFIDENT_PAUSE
+            )
         }
     }
 
-    // Fallback: quietest 4-frame (80 ms) core window weighted with a 2-frame halo on each side
-    val win = min(4, n)
-    var bestIdx = 0
+    // Fallback: smooth inter-word energy valley (6-frame / 120 ms core + 3-frame bilateral halo + transient penalty)
+    val win = min(6, n)
+    val valleyStartFrame = if (preferTrailingValleySamples > 0) {
+        val trailingFrames = max(win + 2, preferTrailingValleySamples / frameLen)
+        max(0, n - trailingFrames)
+    } else {
+        0
+    }
+    val maxStart = (n - win).coerceAtLeast(0)
+    val effectiveValleyStart = min(valleyStartFrame, maxStart)
+
+    var bestIdx = effectiveValleyStart
     var bestScore = Double.MAX_VALUE
-    for (start in 0..(n - win)) {
+    for (start in effectiveValleyStart..maxStart) {
         var coreEnergy = 0.0
+        var coreMean = 0.0
         for (k in start until (start + win)) {
             val r = rms[k].toDouble()
             coreEnergy += r * r
+            coreMean += r
         }
+        coreMean /= win.toDouble()
+
         var haloEnergy = 0.0
         var haloCount = 0
-        for (k in max(0, start - 2) until start) {
+        var wallPeak = 0.0
+        for (k in max(0, start - 3) until start) {
             val r = rms[k].toDouble()
             haloEnergy += r * r
+            if (r > wallPeak) wallPeak = r
             haloCount++
         }
-        for (k in (start + win) until min(n, start + win + 2)) {
+        for (k in (start + win) until min(n, start + win + 3)) {
             val r = rms[k].toDouble()
             haloEnergy += r * r
+            if (r > wallPeak) wallPeak = r
             haloCount++
         }
-        val normalizedHalo = if (haloCount > 0) (haloEnergy / haloCount) * win * 0.35 else 0.0
-        val score = coreEnergy + normalizedHalo
-        if (score < bestScore) {
-            bestScore = score
+        val normalizedHalo = if (haloCount > 0) (haloEnergy / haloCount) * win * 0.40 else 0.0
+        // Stop-closure transient penalty: a sharp cliff from a loud vowel into a brief occlusion and back up
+        // to a plosive burst has a high (wallPeak - coreMean)^2 compared to a gradual inter-word prosodic dip.
+        val transientCliff = max(0.0, wallPeak - coreMean)
+        val transientPenalty = transientCliff * transientCliff * 0.65
+        val score = coreEnergy + normalizedHalo + transientPenalty
+        if (score <= bestScore * 1.005) {
+            if (score < bestScore) {
+                bestScore = score
+            }
             bestIdx = start
         }
     }
-    return rangeStart + (bestIdx + win / 2) * frameLen
+    val idx = rangeStart + (bestIdx + win / 2) * frameLen
+    return SplitPointDecision(
+        sampleIndex = idx.coerceIn(rangeStart, max(rangeStart, rangeEndExclusive - 1)),
+        cutKind = CutKind.VALLEY_OVERLAP
+    )
 }
+
+/**
+ * Picks the best sample index to cut inside `[rangeStart, rangeEndExclusive)`.
+ * Delegates to [findBestSplitDecision] for backwards compatibility.
+ */
+internal fun findBestSplitPoint(
+    samples: FloatArray,
+    rangeStart: Int,
+    rangeEndExclusive: Int,
+    silenceThreshold: Float = DEFAULT_SILENCE_RMS,
+    minPauseFrames: Int = 3,
+    frameLen: Int = CHUNK_FRAME_SAMPLES
+): Int = findBestSplitDecision(
+    samples = samples,
+    rangeStart = rangeStart,
+    rangeEndExclusive = rangeEndExclusive,
+    silenceThreshold = silenceThreshold,
+    minPauseFrames = minPauseFrames,
+    frameLen = frameLen
+).sampleIndex
 
 /**
  * Pause length (in frames) that qualifies as a cut point when the pending audio already spans
@@ -407,14 +582,20 @@ internal fun requiredPauseFrames(pendingSamples: Int, config: DictationChunkSett
  * @property hasSpeech `false` when `[0, index)` holds no usable speech and should just be discarded
  * (long silence before the user started talking).
  * @property resumeIndex index inside the live buffer where the next chunk should start (`<= index`).
- * When cutting at a pause, `[resumeIndex, index)` lies strictly inside the silent pause so the outgoing
- * chunk gets trailing silence padding AND the remaining buffer retains leading silence padding without
- * ever duplicating a single spoken sample.
+ * - On [CutKind.CONFIDENT_PAUSE], `[resumeIndex, index)` lies strictly inside the verified silent pause so
+ *   both chunks receive natural silence padding without duplicating a single spoken sample.
+ * - On [CutKind.VALLEY_OVERLAP], `resumeIndex` rewinds by [FORCED_CUT_OVERLAP_SAMPLES] (`1.20 s`) so both
+ *   chunks decode the boundary phrase with bilateral Conformer context for timestamp-aligned merging.
+ * @property cutKind classification of this cut for telemetry and boundary-aware post-processing.
+ * @property nominalSplitSample ideal splice point inside `[resumeIndex, index]` (`(resumeIndex + index) / 2`)
+ * used as the timestamp crossover point when merging adjacent chunks.
  */
 internal data class StreamingCut(
     val index: Int,
     val hasSpeech: Boolean,
-    val resumeIndex: Int = index
+    val resumeIndex: Int = index,
+    val cutKind: CutKind = if (hasSpeech) CutKind.CONFIDENT_PAUSE else CutKind.SILENCE_DISCARD,
+    val nominalSplitSample: Int = (resumeIndex + index) / 2
 )
 
 /**
@@ -423,14 +604,14 @@ internal data class StreamingCut(
  * Looks at the not-yet-transcribed audio `samples[0, size)` and returns where a *finished* chunk ends, or
  * `null` if nothing should be cut yet:
  *
- * - **Pause cut:** finds qualifying silence runs (see [requiredPauseFrames]) that end at or after
- *   `config.minLiveChunkSeconds`. When multiple qualifying pauses already exist in the buffer, prefers the
- *   latest comparable pause so complete thoughts stay together in one chunk. Both the outgoing chunk and
- *   the remaining live buffer receive natural silence padding from inside the pause.
- * - **Forced cut:** once the buffer reaches `config.maxChunkSeconds` without a pause, cut at the best
- *   split point (longest pause / quietest window) in `[minLive, size)`.
- * - **Silence discard:** a buffer with no speech at all is dropped (keeping 1 s of lead-in) so waiting before
- *   speaking never builds a giant silent chunk.
+ * - **Confident pause cut ([CutKind.CONFIDENT_PAUSE]):** finds qualifying silence runs (see [requiredPauseFrames]
+ *   plus speaking-rate protection via [estimateRapidCadencePauseBonusFrames]) that end at or after
+ *   `config.minLiveChunkSeconds`. Prefers the latest comparable pause so complete thoughts stay together.
+ * - **Valley-overlap cut ([CutKind.VALLEY_OVERLAP]):** once the buffer reaches `config.maxChunkSeconds`
+ *   without a full pause, cuts at the best local pause or inter-word valley in the trailing window and
+ *   retains [FORCED_CUT_OVERLAP_SAMPLES] (`1.20 s`) of real speech overlap for timestamp-aligned stitching.
+ * - **Silence discard ([CutKind.SILENCE_DISCARD]):** a buffer with no speech at all is dropped (keeping 1 s
+ *   of lead-in) so waiting before speaking never builds a giant silent chunk.
  */
 internal fun findStreamingCut(
     samples: FloatArray,
@@ -452,7 +633,17 @@ internal fun findStreamingCut(
     for (s in silent) if (!s) totalSpeech++
     if (totalSpeech < MIN_SPEECH_FRAMES) {
         val index = usable - LIVE_SILENCE_KEEP_SAMPLES
-        return if (index >= frame) StreamingCut(index, hasSpeech = false, resumeIndex = index) else null
+        return if (index >= frame) {
+            StreamingCut(
+                index = index,
+                hasSpeech = false,
+                resumeIndex = index,
+                cutKind = CutKind.SILENCE_DISCARD,
+                nominalSplitSample = index
+            )
+        } else {
+            null
+        }
     }
 
     data class CandidatePause(val startFrame: Int, val endFrame: Int, val cutSample: Int, val hasSpeechBefore: Boolean) {
@@ -461,6 +652,7 @@ internal fun findStreamingCut(
 
     val candidates = ArrayList<CandidatePause>()
     val searchFrames = min(n, maxChunk / frame)
+    val rapidGuardCutoffSamples = (maxChunk * ADAPTIVE_PAUSE_FULL_AT_RATIO).toInt()
     var i = 0
     while (i < searchFrames) {
         if (!silent[i]) {
@@ -470,7 +662,14 @@ internal fun findStreamingCut(
         var j = i
         while (j < n && silent[j]) j++
         val runLen = j - i
-        if (i > 0 && runLen >= requiredPauseFrames(i * frame, config)) {
+        val pendingAtPause = i * frame
+        val cadenceBonus = if (pendingAtPause < rapidGuardCutoffSamples) {
+            estimateRapidCadencePauseBonusFrames(rms, silent, i)
+        } else {
+            0
+        }
+        val neededFrames = requiredPauseFrames(pendingAtPause, config) + cadenceBonus
+        if (i > 0 && runLen >= neededFrames) {
             val cut = i * frame + min((runLen * frame * 2) / 3, LIVE_CUT_PAD_SAMPLES)
             if (cut >= minChunk && cut <= usable) {
                 var speechBefore = 0
@@ -503,15 +702,38 @@ internal fun findStreamingCut(
         } else {
             cut
         }
-        return StreamingCut(index = cut, hasSpeech = chosen.hasSpeechBefore, resumeIndex = resumeIndex)
+        val kind = if (chosen.hasSpeechBefore) CutKind.CONFIDENT_PAUSE else CutKind.SILENCE_DISCARD
+        return StreamingCut(
+            index = cut,
+            hasSpeech = chosen.hasSpeechBefore,
+            resumeIndex = resumeIndex,
+            cutKind = kind,
+            nominalSplitSample = (pauseStartSamples + pauseEndSamples) / 2
+        )
     }
 
     if (usable >= maxChunk) {
-        val minPauseFrames = max(2, requiredPauseFrames(usable, config) / 2)
-        val idx = findBestSplitPoint(samples, minChunk, usable, config.silenceThreshold, minPauseFrames, frame)
-        val clamped = idx.coerceIn(minChunk, usable)
+        val searchEnd = min(usable, maxChunk).coerceAtLeast(minChunk + frame)
+        val safeSearchEnd = min(usable, searchEnd)
+        val minPauseFrames = max(3, requiredPauseFrames(safeSearchEnd, config) / 2)
+        val decision = findBestSplitDecision(
+            samples = samples,
+            rangeStart = minChunk,
+            rangeEndExclusive = safeSearchEnd,
+            silenceThreshold = config.silenceThreshold,
+            minPauseFrames = minPauseFrames,
+            frameLen = frame,
+            preferTrailingValleySamples = VALLEY_TRAILING_WINDOW_SAMPLES
+        )
+        val clamped = decision.sampleIndex.coerceIn(minChunk, safeSearchEnd)
         val resumeAt = (clamped - FORCED_CUT_OVERLAP_SAMPLES).coerceIn(1, clamped)
-        return StreamingCut(clamped, hasSpeech = true, resumeIndex = resumeAt)
+        return StreamingCut(
+            index = clamped,
+            hasSpeech = true,
+            resumeIndex = resumeAt,
+            cutKind = CutKind.VALLEY_OVERLAP,
+            nominalSplitSample = (resumeAt + clamped) / 2
+        )
     }
     return null
 }
