@@ -16,6 +16,9 @@
 
 package com.voicebubble.openflow.core.speech
 
+import com.voicebubble.openflow.core.format.FormatContext
+import com.voicebubble.openflow.core.format.FormattingEngine
+
 import ai.desertant.ear.Ear
 import ai.desertant.voz.Transcription
 import ai.desertant.voz.Voz
@@ -2533,7 +2536,16 @@ class SmartPipeline(
             if (punctRestorer != null) {
                 closePunctLocked()
             }
+            var engineResolved = false
+            if (activeSettings.formattingEngineEnabled) {
+                val fr = FormattingEngine.format(current, FormatContext(languageCode = resolvedLanguage))
+                if (fr.text.isNotBlank()) {
+                    current = fr.text
+                    engineResolved = !fr.needsLlm
+                }
+            }
             val (llmResult, llmSucceeded) = runGemmaLocked(
+                engineResolved = engineResolved,
                 text = current,
                 language = resolvedLanguage,
                 activeSettings = activeSettings,
@@ -2559,6 +2571,13 @@ class SmartPipeline(
                 }
             }
             return current
+        }
+
+        // Deterministic formatting engine on the raw text (numbers, lists, fillers, corrections)
+        // so Punct receives already-normalized words. Runs in < 1 ms with no model.
+        if (activeSettings.formattingEngineEnabled) {
+            val fr = FormattingEngine.format(current, FormatContext(languageCode = resolvedLanguage))
+            if (fr.text.isNotBlank()) current = fr.text
         }
 
         // Stage 4: Neural Punctuation & Casing Restoration (`Punct` — only when no LLM is active)
@@ -2621,6 +2640,7 @@ class SmartPipeline(
     }
 
     private suspend fun runGemmaLocked(
+        engineResolved: Boolean = false,
         text: String,
         language: String,
         activeSettings: ModelSettings,
@@ -2660,7 +2680,7 @@ class SmartPipeline(
         } else {
             rootFieldCtx
         }
-        if (GemmaTextProcessor.canBypassLlmFastPath(trimmed, activeSettings.gemmaPromptPreset, fastPathFieldCtx)) {
+        if (GemmaTextProcessor.canBypassLlmFastPath(trimmed, activeSettings.gemmaPromptPreset, fastPathFieldCtx, engineResolved)) {
             val bypassed = GemmaTextProcessor.applyDeterministicFastPathCleanup(
                 text = trimmed,
                 preset = activeSettings.gemmaPromptPreset,

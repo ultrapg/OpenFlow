@@ -1609,7 +1609,8 @@ class GemmaTextProcessor(
         fun canBypassLlmFastPath(
             text: String,
             preset: GemmaPromptPreset,
-            fieldContext: FlowFieldContext = FlowFieldContext.NONE
+            fieldContext: FlowFieldContext = FlowFieldContext.NONE,
+            engineResolved: Boolean = false
         ): Boolean {
             if (preset != GemmaPromptPreset.CLEAN_AND_POLISH && preset != GemmaPromptPreset.STRICT_CLEANUP) {
                 return false
@@ -1649,6 +1650,13 @@ class GemmaTextProcessor(
                 return false
             }
 
+            if (engineResolved) {
+                // The deterministic FormattingEngine already handled numbers, lists, stutters,
+                // spoken layout and self-corrections; only contextual fillers and broken pause
+                // periods still warrant an LLM.
+                return !FAST_PATH_DISFLUENCY_REGEX.containsMatchIn(trimmed) &&
+                    !BROKEN_PAUSE_PERIOD_REGEX.containsMatchIn(trimmed)
+            }
             return !hasTranscriptEditTriggers(trimmed)
         }
 

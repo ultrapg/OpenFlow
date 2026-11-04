@@ -2,6 +2,23 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.18.0] - 2026-11-04
+
+### Added
+- **Instant Formatting Engine (no AI) — `core/format/FormattingEngine`:** A deterministic, rule-based Inverse Text Normalization and disfluency engine that runs in under 1 ms with no model and no extra RAM. It works with the LLM off (after/alongside Punct) and as a pre-pass before the LLM. Every pass is isolated in a try/catch and either applies an unambiguous rule or leaves the text untouched.
+  - **Numbers (EN + DE):** cardinals, German compounds (`dreiundzwanzig`), decimals (`point` / `komma`), percentages, currency (`$1,500`, `€49.99`, `49,99 €`), units (`6 GB`, `380 ms`, `101°C`), clock times (`3:30 PM`, `15:30 Uhr`), dates (`November 24, 2026`, `24. November 2026`), years, ordinals (`21st`) and versions (`2.17`). Stand-alone `one`–`nine` stay spelled out in prose; ambiguous runs (`one two three`) are left alone.
+  - **Disfluencies:** `um`/`uh`/`äh`/`ähm`/`hmm`, exact word and phrase stutters (with an allowlist for `very very`, `had had`), and comma-flanked `like` / `you know` / `sozusagen`.
+  - **Lists:** `first … second …`, `number one … number two …`, `erstens … zweitens …`, `bullet point …` become vertical lists (guards keep `I came in second` intact).
+  - **Self-corrections:** `scratch that` / `streich das` and same-type repairs (`Tuesday, wait no, Wednesday`, `8 GB, make that 6 GB`, `at 3:30 I mean 4:15`). Unmatched cues are left untouched and flag the text for the LLM.
+  - **Technical casing:** `API`, `NPU`, `GPU`, `GitHub`, `iOS`, …
+- **Settings toggle** "Instant Formatting Engine (no AI)" (on by default).
+
+### Changed
+- **LLM fast path:** when the engine resolved a dictation, `canBypassLlmFastPath(engineResolved = true)` no longer sends spoken numbers, lists or corrections to the LLM, so most everyday dictations finish without waking the model.
+
+### Tests
+- New `FormattingEngineTest` (golden EN/DE cases, idempotence, performance). Full suite: 106/106 passing.
+
 ## [2.17.0] - 2026-11-03
 
 ### Changed, Added & Refined

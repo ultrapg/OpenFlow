@@ -740,6 +740,39 @@ fun SpeechRecognitionSettingsSection(
                     )
                 }
 
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            persistAndReload(settings.copy(formattingEngineEnabled = !settings.formattingEngineEnabled))
+                        }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 12.dp)
+                    ) {
+                        Text(
+                            text = "Instant Formatting Engine (no AI)",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Rule-based numbers, units, times, dates, lists, fillers and simple corrections in under 1 ms. Works with or without an AI model.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.formattingEngineEnabled,
+                        onCheckedChange = { persistAndReload(settings.copy(formattingEngineEnabled = it)) }
+                    )
+                }
+
                 ModelToggleItem(
                     title = "Enable AI Post-Processing (${selectedLlm.title})",
                     subtitle = "${selectedLlm.sizeGbLabel} • Auto-unloads when idle",

@@ -508,6 +508,8 @@ data class ModelSettings(
     val earEnabled: Boolean = true,
     val punctEnabled: Boolean = false,
     val gemmaEnabled: Boolean = false,
+    /** Deterministic non-AI formatting engine (numbers, lists, fillers, corrections). Works with or without an LLM. */
+    val formattingEngineEnabled: Boolean = true,
     val selectedLlmModel: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
     val gemmaDisableThinking: Boolean = selectedLlmModel.defaultDisableThinking,
     val gemmaAdaptiveThinking: Boolean = true,
@@ -588,6 +590,7 @@ data class ModelSettings(
         const val KEY_EAR_ENABLED = "ear_enabled"
         const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
+        const val KEY_FORMATTING_ENGINE_ENABLED = "formatting_engine_enabled"
         const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
@@ -693,6 +696,7 @@ data class ModelSettings(
                 earEnabled = prefs.getBoolean(KEY_EAR_ENABLED, true),
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = gemmaEnabled,
+                formattingEngineEnabled = prefs.getBoolean(KEY_FORMATTING_ENGINE_ENABLED, true),
                 selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = resolvedDisableThinking,
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
@@ -725,6 +729,7 @@ data class ModelSettings(
                 .putBoolean(KEY_EAR_ENABLED, settings.earEnabled)
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
+                .putBoolean(KEY_FORMATTING_ENGINE_ENABLED, settings.formattingEngineEnabled)
                 .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)
