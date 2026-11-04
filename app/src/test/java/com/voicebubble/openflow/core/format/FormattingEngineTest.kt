@@ -47,6 +47,10 @@ class FormattingEngineTest {
         "She finished in the twenty first place." to "She finished in the 21st place.",
         "It reached one hundred and one degrees Celsius." to "It reached 101°C.",
         "twenty twenty is a good year" to "twenty twenty is a good year",
+        "It costs a hundred dollars." to "It costs $100.",
+        "We shipped a thousand units." to "We shipped 1,000 units.",
+        "Call five five five one two three four." to "Call 5551234.",
+        "Count one two three four five six go." to "Count one two three four five six go.",
     ))
 
     @Test fun germanNumbers() = check("de", listOf(

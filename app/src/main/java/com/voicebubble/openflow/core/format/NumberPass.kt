@@ -22,7 +22,7 @@ internal class NumberPass(private val g: NumberGrammar) {
         private set
 
     fun apply(input: List<FormatChunk>): MutableList<FormatChunk> {
-        val chunks = expandHyphenated(input)
+        val chunks = expandArticleScale(expandHyphenated(input))
         val out = ArrayList<FormatChunk>(chunks.size)
         var i = 0
         while (i < chunks.size) {
@@ -38,6 +38,21 @@ internal class NumberPass(private val g: NumberGrammar) {
             }
         }
         return out
+    }
+
+    /** EN: `a hundred` / `a thousand` -> `one hundred` / `one thousand` so the grammar parses them. */
+    private fun expandArticleScale(chunks: List<FormatChunk>): List<FormatChunk> {
+        if (isGerman) return chunks
+        val scales = setOf("hundred", "thousand", "million", "billion")
+        var out: MutableList<FormatChunk>? = null
+        for (i in 0 until chunks.size - 1) {
+            val c = chunks[i]
+            if (c.lower == "a" && c.trail.isEmpty() && chunks[i + 1].lower in scales && chunks.joinable(i, i + 2)) {
+                if (out == null) out = chunks.map { it.copyChunk() }.toMutableList()
+                out[i].core = if (c.core[0].isUpperCase()) "One" else "one"
+            }
+        }
+        return out ?: chunks
     }
 
     /** `twenty-five` -> `twenty` `five` so the grammar sees separate words. */
@@ -94,6 +109,9 @@ internal class NumberPass(private val g: NumberGrammar) {
                 }
             }
         }
+
+        // ---- Spoken phone / digit strings (EN): 7+ single digit words in a row ----------------
+        if (!isGerman) spokenDigitString(chunks, i)?.let { return it }
 
         // ---- Ordinals >= 10 ("the twenty fourth") ------------------------------------------
         g.parseOrdinal(chunks, i)?.let { (v, end) ->
@@ -199,6 +217,22 @@ internal class NumberPass(private val g: NumberGrammar) {
         val forceDigits = measure || identifier || versionLike || fractionDigits != null || np.value >= 10
         if (!forceDigits) return null
         return merged(c, end - 1, chunks, numberText()) to end
+    }
+
+    private fun spokenDigitString(chunks: List<FormatChunk>, i: Int): Pair<FormatChunk, Int>? {
+        fun digit(k: Int): Int? {
+            val l = chunks.lowerAt(k)
+            return if (l == "oh") 0 else g.digitWord(l)
+        }
+        if (digit(i) == null) return null
+        var k = i
+        val sb = StringBuilder()
+        while (k < chunks.size && digit(k) != null && (k == i || chunks.joinable(k - 1, k + 1) || chunks[k - 1].trail == ",")) {
+            sb.append(digit(k)); k++
+            if (chunks[k - 1].trail.isNotEmpty() && chunks[k - 1].trail != ",") break
+        }
+        if (sb.length < 7) return null
+        return merged(chunks[i], k - 1, chunks, sb.toString()) to k
     }
 
     private fun verbatimRun(chunks: List<FormatChunk>, from: Int, to: Int): Pair<FormatChunk, Int> {

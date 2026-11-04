@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.19.0] - 2026-11-04
+
+### Changed
+- **Instant Formatting Engine is now OFF by default.** It is opt-in via Settings -> "Instant Formatting Engine (no AI)". The setting uses a new preference key, so everyone (including users who saved the 2.18.0 default) starts with it off.
+
+### Improved
+- `a hundred` / `a thousand` / `a million` are now parsed (`a hundred dollars` -> `$100`, `a thousand units` -> `1,000 units`).
+- Spoken phone / digit strings of 7+ single digits become digit strings (`five five five one two three four` -> `5551234`); shorter digit runs such as `one two three` are still left untouched.
+- Added regression cases to `FormattingEngineTest`.
+
 ## [2.18.0] - 2026-11-04
 
 ### Added
@@ -11,7 +21,7 @@ All notable changes to the **OpenFlow** project are documented in this file.
   - **Lists:** `first … second …`, `number one … number two …`, `erstens … zweitens …`, `bullet point …` become vertical lists (guards keep `I came in second` intact).
   - **Self-corrections:** `scratch that` / `streich das` and same-type repairs (`Tuesday, wait no, Wednesday`, `8 GB, make that 6 GB`, `at 3:30 I mean 4:15`). Unmatched cues are left untouched and flag the text for the LLM.
   - **Technical casing:** `API`, `NPU`, `GPU`, `GitHub`, `iOS`, …
-- **Settings toggle** "Instant Formatting Engine (no AI)" (on by default).
+- **Settings toggle** "Instant Formatting Engine (no AI)".
 
 ### Changed
 - **LLM fast path:** when the engine resolved a dictation, `canBypassLlmFastPath(engineResolved = true)` no longer sends spoken numbers, lists or corrections to the LLM, so most everyday dictations finish without waking the model.
