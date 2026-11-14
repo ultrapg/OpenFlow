@@ -3490,4 +3490,73 @@ class SmartPipelineTest {
         // Other presets may legitimately rephrase and are never checked
         assertFalse(proc.introducesUnspokenContent(inventedAnswer, spokenQuestion, com.voicebubble.openflow.settings.GemmaPromptPreset.CONCISE_DIRECT))
     }
+
+    @Test
+    fun `ModelSettings keeps local and API LLMs disabled by default and OpenAI API uses zero local LLM footprint`() {
+        val defaults = ModelSettings()
+        assertFalse(defaults.gemmaEnabled)
+        assertFalse(defaults.isLocalLlmEnabled)
+        assertFalse(defaults.isOpenAiApiEnabled)
+        assertEquals(com.voicebubble.openflow.settings.LlmProviderMode.LOCAL, defaults.llmProvider)
+        assertEquals("Off", defaults.aiSectionSummaryLabel)
+
+        val engineOnly = defaults.copy(formattingEngineEnabled = true)
+        assertEquals("Instant Engine", engineOnly.aiSectionSummaryLabel)
+
+        // OpenAI API disabled by default even if provider is switched to OPENAI_API
+        val apiProviderDisabled = defaults.copy(llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API)
+        assertFalse(apiProviderDisabled.isOpenAiApiEnabled)
+        assertEquals("Off", apiProviderDisabled.aiSectionSummaryLabel)
+
+        // OpenAI API active reserves 0 MB extra local disk and 0 MB local LLM / Punct RAM
+        val apiActive = defaults.copy(
+            gemmaEnabled = true,
+            punctEnabled = true,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API,
+            openAiBaseUrl = "https://api.openai.com/v1",
+            openAiModel = "gpt-4o-mini"
+        )
+        assertTrue(apiActive.isOpenAiApiEnabled)
+        assertFalse(apiActive.isLocalLlmEnabled)
+        assertEquals("API · gpt-4o-mini", apiActive.aiSectionSummaryLabel)
+        assertEquals(
+            com.voicebubble.openflow.settings.DesertAntModel.VOZ.sizeMb +
+                com.voicebubble.openflow.settings.DesertAntModel.EAR.sizeMb +
+                com.voicebubble.openflow.settings.DesertAntModel.PUNCT.sizeMb,
+            apiActive.activeDiskFootprintMb
+        )
+        assertEquals(1450, apiActive.estimatedPeakRamMb)
+        assertTrue(apiActive.enabledModels().none { it.isLlmModel })
+
+        // Missing model or URL shows Setup needed
+        val apiMissingModel = apiActive.copy(openAiModel = "")
+        assertFalse(apiMissingModel.isOpenAiApiEnabled)
+        assertEquals("API · Setup needed", apiMissingModel.aiSectionSummaryLabel)
+    }
+
+    @Test
+    fun `ProcessingProgress computes chunked fraction and minimalistic display strings`() {
+        val chunked = com.voicebubble.openflow.core.speech.ProcessingProgress(
+            label = "Transcribing",
+            detail = "EN",
+            stage = com.voicebubble.openflow.core.speech.ProcessingStageKind.TRANSCRIBING,
+            chunkCurrent = 11,
+            chunkTotal = 13
+        )
+        assertTrue(chunked.hasChunkProgress)
+        assertEquals(11f / 13f, chunked.chunkFraction!!, 1e-4f)
+        assertEquals("Transcribing · EN (11/13)", chunked.toDisplayString())
+
+        val single = com.voicebubble.openflow.core.speech.ProcessingProgress(
+            label = "Formatting",
+            detail = "API",
+            stage = com.voicebubble.openflow.core.speech.ProcessingStageKind.FORMATTING,
+            chunkCurrent = 1,
+            chunkTotal = 1,
+            isRemoteAi = true
+        )
+        assertFalse(single.hasChunkProgress)
+        assertEquals(null, single.chunkFraction)
+        assertEquals("Formatting · API", single.toDisplayString())
+    }
 }

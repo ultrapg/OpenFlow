@@ -502,6 +502,20 @@ enum class HardwareAccelerator(
 }
 
 /**
+ * Execution provider backend for AI Post-Processing.
+ */
+enum class LlmProviderMode(val id: String, val title: String) {
+    LOCAL("local", "Local Offline Model"),
+    OPENAI_API("openai_api", "OpenAI-Compatible API");
+
+    companion object {
+        fun fromId(id: String?): LlmProviderMode {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: LOCAL
+        }
+    }
+}
+
+/**
  * Immutable snapshot of user-configurable Desert Ant model settings persisted in SharedPreferences.
  */
 data class ModelSettings(
@@ -515,6 +529,11 @@ data class ModelSettings(
     val gemmaAdaptiveThinking: Boolean = true,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
+    val llmProvider: LlmProviderMode = LlmProviderMode.LOCAL,
+    val openAiBaseUrl: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_BASE_URL,
+    val openAiApiKey: String = "",
+    val openAiModel: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_MODEL,
+    val openAiTimeoutSeconds: Int = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_TIMEOUT_SECONDS,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
@@ -524,6 +543,27 @@ data class ModelSettings(
      * `Voz` is the core STT engine and cannot be disabled.
      */
     val vozEnabled: Boolean = true
+
+    /** `true` when AI post-processing is enabled and using an on-device LiteRT-LM model. */
+    val isLocalLlmEnabled: Boolean
+        get() = gemmaEnabled && llmProvider == LlmProviderMode.LOCAL
+
+    /** `true` when AI post-processing is enabled and configured to call a remote/LAN OpenAI-compatible API. */
+    val isOpenAiApiEnabled: Boolean
+        get() = gemmaEnabled &&
+            llmProvider == LlmProviderMode.OPENAI_API &&
+            openAiBaseUrl.isNotBlank() &&
+            openAiModel.isNotBlank()
+
+    /** Concise status badge text for the collapsed AI Post-Processing card header. */
+    val aiSectionSummaryLabel: String
+        get() = when {
+            isOpenAiApiEnabled -> "API · ${openAiModel.trim()}"
+            isLocalLlmEnabled -> "Local · ${selectedLlmModel.title}"
+            gemmaEnabled && llmProvider == LlmProviderMode.OPENAI_API -> "API · Setup needed"
+            formattingEngineEnabled -> "Instant Engine"
+            else -> "Off"
+        }
 
     /**
      * Resolves the active model-optimized task instruction based on [selectedLlmModel],
@@ -538,29 +578,29 @@ data class ModelSettings(
     }
 
     /**
-     * Active disk footprint in MB based on currently enabled models (at most one selected LLM).
+     * Active disk footprint in MB based on currently enabled on-device models (0 MB extra for cloud/LAN APIs).
      */
     val activeDiskFootprintMb: Int
         get() = DesertAntModel.VOZ.sizeMb +
             (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
             (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
-            (if (gemmaEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
+            (if (isLocalLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
 
     /**
      * Estimated peak RAM in MB based on models that can ever co-reside in RAM:
      * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
      * - `Ear` (10 MB weights + runtime buffers): +50 MB
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
-     *   - Active LLM (`Granite 4.1 3B` / `Granite 4.2 3B` +850 MB, `Gemma 4 E2B` +850 MB,
+     *   - Active Local LLM (`Granite 4.1 3B` / `Granite 4.2 3B` +850 MB, `Gemma 4 E2B` +850 MB,
      *     `Qwen3 4B` / `Qwen3 4B Instruct 2507` +950 MB), OR
-     *   - `Punct` (+120 MB) when AI post-processing is disabled.
+     *   - `Punct` (+120 MB) when AI post-processing (local or OpenAI API) is disabled.
      */
     val estimatedPeakRamMb: Int
         get() = 1400 +
             (if (earEnabled) 50 else 0) +
             when {
-                gemmaEnabled -> selectedLlmModel.estimatedIncrementalRamMb
-                punctEnabled -> 120
+                isLocalLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
+                punctEnabled && !isOpenAiApiEnabled -> 120
                 else -> 0
             }
 
@@ -572,7 +612,7 @@ data class ModelSettings(
         DesertAntModel.QWEN3_4B_INSTRUCT_2507,
         DesertAntModel.GRANITE_4_2_3B,
         DesertAntModel.QWEN3_4B,
-        DesertAntModel.GEMMA_4_E2B -> gemmaEnabled && model == selectedLlmModel.desertAntModel
+        DesertAntModel.GEMMA_4_E2B -> isLocalLlmEnabled && model == selectedLlmModel.desertAntModel
     }
 
     val autoUnloadSummary: String
@@ -582,7 +622,7 @@ data class ModelSettings(
         add(DesertAntModel.VOZ)
         if (earEnabled) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (gemmaEnabled) add(selectedLlmModel.desertAntModel)
+        if (isLocalLlmEnabled) add(selectedLlmModel.desertAntModel)
     }
 
     companion object {
@@ -596,6 +636,11 @@ data class ModelSettings(
         const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
         const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
         const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
+        const val KEY_LLM_PROVIDER = "llm_provider"
+        const val KEY_OPENAI_BASE_URL = "openai_base_url"
+        const val KEY_OPENAI_API_KEY = "openai_api_key"
+        const val KEY_OPENAI_MODEL = "openai_model"
+        const val KEY_OPENAI_TIMEOUT_SECONDS = "openai_timeout_seconds"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -661,6 +706,22 @@ data class ModelSettings(
                 prefs.getString(KEY_GEMMA_PROMPT_PRESET, GemmaPromptPreset.CLEAN_AND_POLISH.id)
             )
             val customPrompt = prefs.getString(KEY_GEMMA_CUSTOM_PROMPT, "") ?: ""
+            val llmProvider = LlmProviderMode.fromId(
+                prefs.getString(KEY_LLM_PROVIDER, LlmProviderMode.LOCAL.id)
+            )
+            val openAiBaseUrl = (prefs.getString(
+                KEY_OPENAI_BASE_URL,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_BASE_URL
+            ) ?: com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_BASE_URL).trim()
+            val openAiApiKey = prefs.getString(KEY_OPENAI_API_KEY, "") ?: ""
+            val openAiModel = (prefs.getString(
+                KEY_OPENAI_MODEL,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_MODEL
+            ) ?: com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_MODEL).trim()
+            val openAiTimeoutSeconds = prefs.getInt(
+                KEY_OPENAI_TIMEOUT_SECONDS,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_TIMEOUT_SECONDS
+            ).coerceIn(5, 90)
             val rawGemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
             val rawSelectedId = prefs.getString(KEY_SELECTED_LLM_MODEL, null)
             val hasValidExplicitModel = LlmModelChoice.isSupportedId(rawSelectedId)
@@ -675,7 +736,7 @@ data class ModelSettings(
             } else {
                 selectedLlm.defaultDisableThinking
             }
-            val gemmaEnabled = if (migratedFromRemovedModel && rawGemmaEnabled) {
+            val gemmaEnabled = if (migratedFromRemovedModel && rawGemmaEnabled && llmProvider == LlmProviderMode.LOCAL) {
                 DesertAntModelStorage.isModelDownloaded(context, selectedLlm.desertAntModel)
             } else {
                 rawGemmaEnabled
@@ -702,6 +763,11 @@ data class ModelSettings(
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
+                llmProvider = llmProvider,
+                openAiBaseUrl = openAiBaseUrl,
+                openAiApiKey = openAiApiKey,
+                openAiModel = openAiModel,
+                openAiTimeoutSeconds = openAiTimeoutSeconds,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel,
@@ -735,6 +801,11 @@ data class ModelSettings(
                 .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)
                 .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
                 .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
+                .putString(KEY_LLM_PROVIDER, settings.llmProvider.id)
+                .putString(KEY_OPENAI_BASE_URL, settings.openAiBaseUrl.trim())
+                .putString(KEY_OPENAI_API_KEY, settings.openAiApiKey.trim())
+                .putString(KEY_OPENAI_MODEL, settings.openAiModel.trim())
+                .putInt(KEY_OPENAI_TIMEOUT_SECONDS, settings.openAiTimeoutSeconds.coerceIn(5, 90))
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)
@@ -869,8 +940,13 @@ object DesertAntModelStorage {
      * `assets/desert-ant-models/`, extracts any missing model files and `.dal-meta/manifest`
      * into `context.cacheDir/desert-ant-models/<id>/<revision>` automatically.
      */
-    @Synchronized
     fun ensureBundledModelsExtracted(context: Context) {
+        if (bundledExtractionChecked && legacyModelsCleanedUp) return
+        ensureBundledModelsExtractedSynchronized(context)
+    }
+
+    @Synchronized
+    private fun ensureBundledModelsExtractedSynchronized(context: Context) {
         cleanupLegacyRemovedModels(context)
         if (bundledExtractionChecked) return
         val appContext = context.applicationContext

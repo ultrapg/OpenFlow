@@ -44,17 +44,22 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -64,6 +69,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.InputChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -83,6 +89,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,10 +98,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.speech.LlmBenchmarkResult
 import com.voicebubble.openflow.core.speech.LlmSinglePassMetrics
 import com.voicebubble.openflow.core.speech.ModelLoadState
+import com.voicebubble.openflow.core.speech.OpenAiCompatibleClient
+import com.voicebubble.openflow.core.speech.OpenAiConnectionTestResult
 import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
@@ -104,12 +115,14 @@ import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.LlmBenchmarkSample
 import com.voicebubble.openflow.settings.LlmModelChoice
+import com.voicebubble.openflow.settings.LlmProviderMode
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -144,18 +157,19 @@ fun SpeechRecognitionSettingsSection(
         downloadState.isCompleted,
         downloadState.pendingAutoEnableModels
     ) {
-        val latestPersisted = ModelSettings.load(context)
+        val (latestPersisted, status) = withContext(Dispatchers.IO) {
+            val loaded = ModelSettings.load(context)
+            val diskStatus = DesertAntModel.entries.associateWith { model ->
+                DesertAntModelStorage.isModelDownloaded(context, model)
+            }
+            loaded to diskStatus
+        }
         if (latestPersisted != settings) {
             onSettingsChanged(latestPersisted)
         }
-        val status = withContext(Dispatchers.IO) {
-            DesertAntModel.entries.associateWith { model ->
-                DesertAntModelStorage.isModelDownloaded(context, model)
-            }
-        }
         downloadedStatusMap.clear()
         downloadedStatusMap.putAll(status)
-        smartPipeline.refreshStatusSnapshot()
+        smartPipeline.refreshStatusSnapshotAsync()
     }
     val downloadedCount = downloadedStatusMap.values.count { it }
 
@@ -196,6 +210,7 @@ fun SpeechRecognitionSettingsSection(
                         persistAndReload(
                             settings.copy(
                                 gemmaEnabled = true,
+                                llmProvider = LlmProviderMode.LOCAL,
                                 selectedLlmModel = llmChoice,
                                 gemmaDisableThinking = nextDisableThinking
                             )
@@ -244,12 +259,13 @@ fun SpeechRecognitionSettingsSection(
     }
 
     val handleLlmSelection: (LlmModelChoice) -> Unit = { choice ->
-        val anyLlmActiveOrPending = settings.gemmaEnabled ||
+        val anyLlmActiveOrPending = (settings.gemmaEnabled && settings.llmProvider == LlmProviderMode.LOCAL) ||
             downloadState.pendingAutoEnableModels.any { it.isLlmModel }
         if (!anyLlmActiveOrPending) {
-            if (settings.selectedLlmModel != choice) {
+            if (settings.selectedLlmModel != choice || settings.llmProvider != LlmProviderMode.LOCAL) {
                 persistAndReload(
                     settings.copy(
+                        llmProvider = LlmProviderMode.LOCAL,
                         selectedLlmModel = choice,
                         gemmaDisableThinking = choice.defaultDisableThinking
                     )
@@ -259,6 +275,27 @@ fun SpeechRecognitionSettingsSection(
             // Switching models while AI Post-Processing is enabled (or downloading):
             // immediately switch & unload any previous LLM, or download + auto-enable the newly chosen model
             handleOptionalToggle(choice.desertAntModel, true)
+        }
+    }
+
+    val handleLlmProviderChange: (LlmProviderMode) -> Unit = { targetProvider ->
+        if (settings.llmProvider != targetProvider) {
+            if (targetProvider == LlmProviderMode.OPENAI_API) {
+                ModelDownloadManager.cancelAllLlmAutoEnables()
+                persistAndReload(settings.copy(llmProvider = LlmProviderMode.OPENAI_API))
+            } else {
+                scope.launch {
+                    val localDownloaded = withContext(Dispatchers.IO) {
+                        DesertAntModelStorage.isModelDownloaded(context, settings.selectedLlmModel.desertAntModel)
+                    }
+                    persistAndReload(
+                        settings.copy(
+                            llmProvider = LlmProviderMode.LOCAL,
+                            gemmaEnabled = settings.gemmaEnabled && localDownloaded
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -673,28 +710,32 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3b. AI Post-Processing & Reformatting (5 Selectable Local LLMs • Smart Single-Model RAM)
+        // 3b. AI Post-Processing & Formatting (Collapsed by default • Instant Engine, Local AI, or OpenAI API)
+        var aiSectionExpanded by rememberSaveable { mutableStateOf(false) }
+        val isAiActive = settings.isOpenAiApiEnabled || settings.isLocalLlmEnabled
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant
             )
         ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
+            Column(modifier = Modifier.fillMaxWidth()) {
                 val selectedLlm = settings.selectedLlmModel
                 val selectedDesertModel = selectedLlm.desertAntModel
                 val anyLlmPendingAutoEnable = downloadState.pendingAutoEnableModels.any { it.isLlmModel }
 
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { aiSectionExpanded = !aiSectionExpanded }
+                        .padding(16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -704,361 +745,446 @@ fun SpeechRecognitionSettingsSection(
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "AI Post-Processing & Cleanup",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.tertiaryContainer
-                    ) {
-                        Text(
-                            text = "OFFLINE AI",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-
-                Text(
-                    text = "Removes fillers ('um', 'uh'), self-corrections, and formats numbers & lists offline via LiteRT-LM. Off by default.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                val activeGemmaBackend = pipelineStatus.activeGemmaBackendLabel
-                if (!activeGemmaBackend.isNullOrBlank()) {
-                    Text(
-                        text = "Active ${selectedLlm.title} runtime: $activeGemmaBackend",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable {
-                            persistAndReload(settings.copy(formattingEngineEnabled = !settings.formattingEngineEnabled))
-                        }
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 12.dp)
-                    ) {
-                        Text(
-                            text = "Instant Formatting Engine (no AI)",
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = "Rule-based numbers, units, times, dates, lists, fillers and simple corrections in under 1 ms. Works with or without an AI model.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = settings.formattingEngineEnabled,
-                        onCheckedChange = { persistAndReload(settings.copy(formattingEngineEnabled = it)) }
-                    )
-                }
-
-                ModelToggleItem(
-                    title = "Enable AI Post-Processing (${selectedLlm.title})",
-                    subtitle = "${selectedLlm.sizeGbLabel} • Auto-unloads when idle",
-                    loadState = pipelineStatus.modelStates[selectedDesertModel],
-                    checked = settings.gemmaEnabled || anyLlmPendingAutoEnable,
-                    enabled = !(downloadState.isRunning && downloadState.activeModel == selectedDesertModel),
-                    isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == selectedDesertModel && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
-                    onPause = { ModelDownloadManager.pauseDownloads() },
-                    onResume = { handleOptionalToggle(selectedDesertModel, true) },
-                    onCheckedChange = { handleOptionalToggle(selectedDesertModel, it) }
-                )
-
-                HorizontalDivider()
-
-                Text(
-                    text = "Choose AI Model",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    text = "Only one model is loaded on demand when you dictate.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                LlmModelChoice.entries.forEach { choice ->
-                    val modelEnum = choice.desertAntModel
-                    val isSelected = selectedLlm == choice
-                    val isDownloaded = downloadedStatusMap[modelEnum] == true
-                    val loadState = pipelineStatus.modelStates[modelEnum]
-                    val isDownloadingThis = downloadState.activeModel == modelEnum &&
-                        (downloadState.isRunning || downloadState.isPaused)
-                    LlmModelOptionCard(
-                        choice = choice,
-                        selected = isSelected,
-                        isDownloaded = isDownloaded,
-                        loadState = loadState,
-                        isDownloading = isDownloadingThis,
-                        onSelect = { handleLlmSelection(choice) }
-                    )
-                }
-
-                HorizontalDivider()
-
-                val supportsThinking = selectedLlm.supportsThinking
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(enabled = supportsThinking) {
-                            persistAndReload(settings.copy(gemmaDisableThinking = !settings.gemmaDisableThinking))
-                        }
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 12.dp)
-                    ) {
-                        Text(
-                            text = if (supportsThinking) {
-                                "Disable Model Thinking"
-                            } else {
-                                "Disable Model Thinking (Always Direct)"
-                            },
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = when {
-                                !supportsThinking ->
-                                    "${selectedLlm.title} is a direct non-thinking model."
-                                selectedLlm.defaultDisableThinking ->
-                                    "Skips ${selectedLlm.title}'s reasoning step for fast direct output. On by default."
-                                else ->
-                                    "Skips ${selectedLlm.title}'s reasoning step for direct output. Off by default."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = if (supportsThinking) settings.gemmaDisableThinking else true,
-                        enabled = supportsThinking,
-                        onCheckedChange = { disableThinking ->
-                            if (supportsThinking) {
-                                persistAndReload(settings.copy(gemmaDisableThinking = disableThinking))
-                            }
-                        }
-                    )
-                }
-
-                if (supportsThinking) {
-                    val adaptiveSwitchEnabled = !settings.gemmaDisableThinking
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable(enabled = adaptiveSwitchEnabled) {
-                                persistAndReload(settings.copy(gemmaAdaptiveThinking = !settings.gemmaAdaptiveThinking))
-                            }
-                            .padding(vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 12.dp)
-                        ) {
-                            Text(
-                                text = "Adaptive Smart Thinking",
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                text = "Uses reasoning only on self-corrections, spoken lists, or structural rewrites, and outputs directly on simple sentences. On by default.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = settings.gemmaAdaptiveThinking && !settings.gemmaDisableThinking,
-                            enabled = adaptiveSwitchEnabled,
-                            onCheckedChange = { adaptive ->
-                                persistAndReload(settings.copy(gemmaAdaptiveThinking = adaptive))
-                            }
-                        )
-                    }
-                }
-
-                HorizontalDivider()
-
-                Text(
-                    text = "System Prompt Preset",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    text = "Each preset is tuned specifically for ${selectedLlm.title}'s size and architecture, or you can write a custom system prompt.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                GemmaPromptPreset.entries.forEach { preset ->
-                    val selected = settings.gemmaPromptPreset == preset
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable {
-                                if (!selected) {
-                                    persistAndReload(settings.copy(gemmaPromptPreset = preset))
-                                }
-                            }
-                            .padding(vertical = 4.dp, horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = selected,
-                            onClick = {
-                                if (!selected) {
-                                    persistAndReload(settings.copy(gemmaPromptPreset = preset))
-                                }
-                            }
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = preset.title,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                                text = "AI Post-Processing & Formatting",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = preset.subtitle,
+                                text = "Instant Engine, offline LiteRT-LM models & OpenAI API",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
-                }
-
-                if (settings.gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
-                    OutlinedTextField(
-                        value = customPromptDraft,
-                        onValueChange = { updatedText ->
-                            customPromptDraft = updatedText
-                            persistAndReload(settings.copy(gemmaCustomPrompt = updatedText))
-                        },
-                        label = { Text("Custom System Prompt") },
-                        placeholder = { Text(GemmaPromptPreset.CUSTOM.promptForModel(selectedLlm)) },
-                        minLines = 3,
-                        maxLines = 8,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text(
-                            text = if (customPromptDraft.isBlank()) {
-                                "Using ${selectedLlm.title}'s fallback instruction until you enter custom text."
-                            } else {
-                                "Anti-chatter & Custom Vocabulary guardrails are applied automatically."
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (customPromptDraft.isNotBlank()) {
-                            Spacer(modifier = Modifier.width(8.dp))
-                            OutlinedButton(
-                                onClick = {
-                                    customPromptDraft = ""
-                                    persistAndReload(settings.copy(gemmaCustomPrompt = ""))
-                                }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.RestartAlt,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Reset")
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = when {
+                                isAiActive -> MaterialTheme.colorScheme.primaryContainer
+                                settings.formattingEngineEnabled -> MaterialTheme.colorScheme.secondaryContainer
+                                else -> MaterialTheme.colorScheme.surface
                             }
-                        }
-                    }
-                } else {
-                    val activeOptimizedPrompt = settings.gemmaPromptPreset.promptForModel(selectedLlm)
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "Active System Instruction (Optimized for ${selectedLlm.title}):",
+                                text = settings.aiSectionSummaryLabel,
                                 style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Text(
-                                text = activeOptimizedPrompt,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            OutlinedButton(
-                                onClick = {
-                                    customPromptDraft = activeOptimizedPrompt
-                                    persistAndReload(
-                                        settings.copy(
-                                            gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
-                                            gemmaCustomPrompt = activeOptimizedPrompt
-                                        )
-                                    )
+                                fontWeight = FontWeight.Bold,
+                                color = when {
+                                    isAiActive -> MaterialTheme.colorScheme.onPrimaryContainer
+                                    settings.formattingEngineEnabled -> MaterialTheme.colorScheme.onSecondaryContainer
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
                                 },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.ContentCopy,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Copy & Edit as Custom Prompt")
-                            }
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
+                        Icon(
+                            imageVector = if (aiSectionExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (aiSectionExpanded) "Collapse AI Post-Processing" else "Expand AI Post-Processing",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
 
-                val isSelectedLlmDownloaded = downloadedStatusMap[selectedDesertModel] == true
-                if (isSelectedLlmDownloaded) {
-                    HorizontalDivider()
-                    LlmSpeedBenchmarkSection(
-                        selectedLlm = selectedLlm,
-                        smartPipeline = smartPipeline,
-                        isPipelineBusy = pipelineStatus.phase == PipelinePhase.TRANSCRIBING || downloadState.isRunning
-                    )
+                AnimatedVisibility(visible = aiSectionExpanded) {
+                    Column(
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "Removes fillers ('um', 'uh'), fixes self-corrections, and formats numbers & lists via the Instant Engine, an offline LiteRT-LM model, or an OpenAI-compatible API. AI LLM is disabled by default.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    persistAndReload(settings.copy(formattingEngineEnabled = !settings.formattingEngineEnabled))
+                                }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 12.dp)
+                            ) {
+                                Text(
+                                    text = "Instant Formatting Engine (no AI)",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = "Rule-based numbers, units, times, dates, lists, fillers and simple corrections in under 1 ms. Works with or without an AI model.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = settings.formattingEngineEnabled,
+                                onCheckedChange = { persistAndReload(settings.copy(formattingEngineEnabled = it)) }
+                            )
+                        }
+
+                        HorizontalDivider()
+
+                        Text(
+                            text = "AI Backend",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            FilterChip(
+                                selected = settings.llmProvider == LlmProviderMode.LOCAL,
+                                onClick = { handleLlmProviderChange(LlmProviderMode.LOCAL) },
+                                label = { Text("Local Offline Model") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Memory,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            )
+                            FilterChip(
+                                selected = settings.llmProvider == LlmProviderMode.OPENAI_API,
+                                onClick = { handleLlmProviderChange(LlmProviderMode.OPENAI_API) },
+                                label = { Text("OpenAI-Compatible API") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Cloud,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            )
+                        }
+
+                        if (settings.llmProvider == LlmProviderMode.LOCAL) {
+                            val activeGemmaBackend = pipelineStatus.activeGemmaBackendLabel
+                            if (!activeGemmaBackend.isNullOrBlank()) {
+                                Text(
+                                    text = "Active ${selectedLlm.title} runtime: $activeGemmaBackend",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            ModelToggleItem(
+                                title = "Enable AI Post-Processing (${selectedLlm.title})",
+                                subtitle = "${selectedLlm.sizeGbLabel} • Auto-unloads when idle",
+                                loadState = pipelineStatus.modelStates[selectedDesertModel],
+                                checked = (settings.gemmaEnabled && settings.llmProvider == LlmProviderMode.LOCAL) || anyLlmPendingAutoEnable,
+                                enabled = !(downloadState.isRunning && downloadState.activeModel == selectedDesertModel),
+                                isLocked = false,
+                                activeDownloadState = if (downloadState.activeModel == selectedDesertModel && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                                onPause = { ModelDownloadManager.pauseDownloads() },
+                                onResume = { handleOptionalToggle(selectedDesertModel, true) },
+                                onCheckedChange = { handleOptionalToggle(selectedDesertModel, it) }
+                            )
+
+                            HorizontalDivider()
+
+                            Text(
+                                text = "Choose AI Model",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Only one model is loaded on demand when you dictate.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            LlmModelChoice.entries.forEach { choice ->
+                                val modelEnum = choice.desertAntModel
+                                val isSelected = selectedLlm == choice
+                                val isDownloaded = downloadedStatusMap[modelEnum] == true
+                                val loadState = pipelineStatus.modelStates[modelEnum]
+                                val isDownloadingThis = downloadState.activeModel == modelEnum &&
+                                    (downloadState.isRunning || downloadState.isPaused)
+                                LlmModelOptionCard(
+                                    choice = choice,
+                                    selected = isSelected,
+                                    isDownloaded = isDownloaded,
+                                    loadState = loadState,
+                                    isDownloading = isDownloadingThis,
+                                    onSelect = { handleLlmSelection(choice) }
+                                )
+                            }
+
+                            HorizontalDivider()
+
+                            val supportsThinking = selectedLlm.supportsThinking
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable(enabled = supportsThinking) {
+                                        persistAndReload(settings.copy(gemmaDisableThinking = !settings.gemmaDisableThinking))
+                                    }
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 12.dp)
+                                ) {
+                                    Text(
+                                        text = if (supportsThinking) {
+                                            "Disable Model Thinking"
+                                        } else {
+                                            "Disable Model Thinking (Always Direct)"
+                                        },
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = when {
+                                            !supportsThinking ->
+                                                "${selectedLlm.title} is a direct non-thinking model."
+                                            selectedLlm.defaultDisableThinking ->
+                                                "Skips ${selectedLlm.title}'s reasoning step for fast direct output. On by default."
+                                            else ->
+                                                "Skips ${selectedLlm.title}'s reasoning step for direct output. Off by default."
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Switch(
+                                    checked = if (supportsThinking) settings.gemmaDisableThinking else true,
+                                    enabled = supportsThinking,
+                                    onCheckedChange = { disableThinking ->
+                                        if (supportsThinking) {
+                                            persistAndReload(settings.copy(gemmaDisableThinking = disableThinking))
+                                        }
+                                    }
+                                )
+                            }
+
+                            if (supportsThinking) {
+                                val adaptiveSwitchEnabled = !settings.gemmaDisableThinking
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable(enabled = adaptiveSwitchEnabled) {
+                                            persistAndReload(settings.copy(gemmaAdaptiveThinking = !settings.gemmaAdaptiveThinking))
+                                        }
+                                        .padding(vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(end = 12.dp)
+                                    ) {
+                                        Text(
+                                            text = "Adaptive Smart Thinking",
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Text(
+                                            text = "Uses reasoning only on self-corrections, spoken lists, or structural rewrites, and outputs directly on simple sentences. On by default.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Switch(
+                                        checked = settings.gemmaAdaptiveThinking && !settings.gemmaDisableThinking,
+                                        enabled = adaptiveSwitchEnabled,
+                                        onCheckedChange = { adaptive ->
+                                            persistAndReload(settings.copy(gemmaAdaptiveThinking = adaptive))
+                                        }
+                                    )
+                                }
+                            }
+                        } else {
+                            OpenAiApiEndpointSection(
+                                settings = settings,
+                                onPersistSettings = persistAndReload
+                            )
+                        }
+
+                        HorizontalDivider()
+
+                        Text(
+                            text = "System Prompt Preset",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = if (settings.llmProvider == LlmProviderMode.OPENAI_API) {
+                                "Sent as the system instruction to your OpenAI-compatible endpoint alongside Custom Vocabulary and anti-chatter guardrails."
+                            } else {
+                                "Each preset is tuned specifically for ${selectedLlm.title}'s size and architecture, or you can write a custom system prompt."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        GemmaPromptPreset.entries.forEach { preset ->
+                            val selected = settings.gemmaPromptPreset == preset
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        if (!selected) {
+                                            persistAndReload(settings.copy(gemmaPromptPreset = preset))
+                                        }
+                                    }
+                                    .padding(vertical = 4.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = selected,
+                                    onClick = {
+                                        if (!selected) {
+                                            persistAndReload(settings.copy(gemmaPromptPreset = preset))
+                                        }
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = preset.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                                    )
+                                    Text(
+                                        text = preset.subtitle,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+
+                        if (settings.gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
+                            OutlinedTextField(
+                                value = customPromptDraft,
+                                onValueChange = { updatedText ->
+                                    customPromptDraft = updatedText
+                                    persistAndReload(settings.copy(gemmaCustomPrompt = updatedText))
+                                },
+                                label = { Text("Custom System Prompt") },
+                                placeholder = { Text(GemmaPromptPreset.CUSTOM.promptForModel(selectedLlm)) },
+                                minLines = 3,
+                                maxLines = 8,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (customPromptDraft.isBlank()) {
+                                        "Using fallback instruction until you enter custom text."
+                                    } else {
+                                        "Anti-chatter & Custom Vocabulary guardrails are applied automatically."
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (customPromptDraft.isNotBlank()) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OutlinedButton(
+                                        onClick = {
+                                            customPromptDraft = ""
+                                            persistAndReload(settings.copy(gemmaCustomPrompt = ""))
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.RestartAlt,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Reset")
+                                    }
+                                }
+                            }
+                        } else {
+                            val activeOptimizedPrompt = settings.gemmaPromptPreset.promptForModel(selectedLlm)
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = if (settings.llmProvider == LlmProviderMode.OPENAI_API) {
+                                            "Active System Instruction:"
+                                        } else {
+                                            "Active System Instruction (Optimized for ${selectedLlm.title}):"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = activeOptimizedPrompt,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    OutlinedButton(
+                                        onClick = {
+                                            customPromptDraft = activeOptimizedPrompt
+                                            persistAndReload(
+                                                settings.copy(
+                                                    gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
+                                                    gemmaCustomPrompt = activeOptimizedPrompt
+                                                )
+                                            )
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Copy & Edit as Custom Prompt")
+                                    }
+                                }
+                            }
+                        }
+
+                        val isSelectedLlmDownloaded = downloadedStatusMap[selectedDesertModel] == true
+                        if (settings.llmProvider == LlmProviderMode.LOCAL && isSelectedLlmDownloaded) {
+                            HorizontalDivider()
+                            LlmSpeedBenchmarkSection(
+                                selectedLlm = selectedLlm,
+                                smartPipeline = smartPipeline,
+                                isPipelineBusy = pipelineStatus.phase == PipelinePhase.TRANSCRIBING || downloadState.isRunning
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -2118,6 +2244,424 @@ private fun BenchmarkMetricPassCard(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun OpenAiApiEndpointSection(
+    settings: ModelSettings,
+    onPersistSettings: (ModelSettings) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var urlDraft by rememberSaveable { mutableStateOf(settings.openAiBaseUrl) }
+    var apiKeyDraft by rememberSaveable { mutableStateOf(settings.openAiApiKey) }
+    var modelDraft by rememberSaveable { mutableStateOf(settings.openAiModel) }
+    var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
+
+    var fetchedModels by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showModelMenu by remember { mutableStateOf(false) }
+    var isFetchingModels by remember { mutableStateOf(false) }
+    var fetchError by remember { mutableStateOf<String?>(null) }
+
+    var isTestingConnection by remember { mutableStateOf(false) }
+    var connectionResult by remember { mutableStateOf<OpenAiConnectionTestResult?>(null) }
+
+    LaunchedEffect(settings.openAiBaseUrl) {
+        if (urlDraft.trim() != settings.openAiBaseUrl) {
+            urlDraft = settings.openAiBaseUrl
+        }
+    }
+    LaunchedEffect(settings.openAiApiKey) {
+        if (apiKeyDraft.trim() != settings.openAiApiKey) {
+            apiKeyDraft = settings.openAiApiKey
+        }
+    }
+    LaunchedEffect(settings.openAiModel) {
+        if (modelDraft.trim() != settings.openAiModel) {
+            modelDraft = settings.openAiModel
+        }
+    }
+
+    LaunchedEffect(urlDraft, apiKeyDraft, modelDraft) {
+        val cleanUrl = urlDraft.trim()
+        val cleanKey = apiKeyDraft.trim()
+        val cleanModel = modelDraft.trim()
+        if (cleanUrl == settings.openAiBaseUrl &&
+            cleanKey == settings.openAiApiKey &&
+            cleanModel == settings.openAiModel
+        ) {
+            return@LaunchedEffect
+        }
+        delay(350)
+        onPersistSettings(
+            settings.copy(
+                llmProvider = LlmProviderMode.OPENAI_API,
+                openAiBaseUrl = cleanUrl,
+                openAiApiKey = cleanKey,
+                openAiModel = cleanModel
+            )
+        )
+    }
+
+    fun flushedSettings(
+        gemmaEnabledOverride: Boolean = settings.gemmaEnabled,
+        timeoutOverride: Int = settings.openAiTimeoutSeconds
+    ): ModelSettings {
+        return settings.copy(
+            llmProvider = LlmProviderMode.OPENAI_API,
+            gemmaEnabled = gemmaEnabledOverride,
+            openAiBaseUrl = urlDraft.trim(),
+            openAiApiKey = apiKeyDraft.trim(),
+            openAiModel = modelDraft.trim(),
+            openAiTimeoutSeconds = timeoutOverride
+        )
+    }
+
+    val urlValid = OpenAiCompatibleClient.isValidHttpUrl(urlDraft)
+    val modelReady = modelDraft.trim().isNotEmpty()
+    val resolvedChatUrl = remember(urlDraft) {
+        if (urlDraft.isBlank()) "" else OpenAiCompatibleClient.resolveChatCompletionsUrl(urlDraft)
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .clickable {
+                    onPersistSettings(flushedSettings(gemmaEnabledOverride = !settings.gemmaEnabled))
+                }
+                .padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 12.dp)
+            ) {
+                Text(
+                    text = "Enable AI Post-Processing (OpenAI API)",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = when {
+                        urlDraft.isBlank() || !modelReady -> "Enter a valid Base URL & Model ID below."
+                        settings.gemmaEnabled -> "Active · ${modelDraft.trim()} (${settings.openAiTimeoutSeconds}s timeout)"
+                        else -> "Configured · Toggle on to format transcripts remotely."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = settings.gemmaEnabled && settings.llmProvider == LlmProviderMode.OPENAI_API,
+                onCheckedChange = { enabled ->
+                    onPersistSettings(flushedSettings(gemmaEnabledOverride = enabled))
+                }
+            )
+        }
+
+        Surface(
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Quick Endpoint Presets",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    OpenAiCompatibleClient.PRESETS.forEach { preset ->
+                        val isSelectedPreset = urlDraft.trim().trimEnd('/').equals(
+                            preset.baseUrl.trimEnd('/'),
+                            ignoreCase = true
+                        )
+                        FilterChip(
+                            selected = isSelectedPreset,
+                            onClick = {
+                                urlDraft = preset.baseUrl
+                                modelDraft = preset.defaultModel
+                                fetchedModels = emptyList()
+                                fetchError = null
+                                connectionResult = null
+                                onPersistSettings(
+                                    settings.copy(
+                                        llmProvider = LlmProviderMode.OPENAI_API,
+                                        openAiBaseUrl = preset.baseUrl,
+                                        openAiApiKey = apiKeyDraft.trim(),
+                                        openAiModel = preset.defaultModel
+                                    )
+                                )
+                            },
+                            label = { Text(preset.label) }
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = urlDraft,
+                    onValueChange = {
+                        urlDraft = it
+                        fetchedModels = emptyList()
+                        connectionResult = null
+                    },
+                    label = { Text("Base URL") },
+                    placeholder = { Text("https://api.openai.com/v1") },
+                    isError = urlDraft.isNotBlank() && !urlValid,
+                    supportingText = {
+                        Text(
+                            text = when {
+                                urlDraft.isBlank() -> "Accepts base URL, host:port (LAN Ollama/LM Studio), or /chat/completions."
+                                !urlValid -> "Enter a valid http:// or https:// URL."
+                                else -> "Endpoint: $resolvedChatUrl"
+                            },
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = apiKeyDraft,
+                    onValueChange = {
+                        apiKeyDraft = it
+                        fetchedModels = emptyList()
+                        connectionResult = null
+                    },
+                    label = { Text("API Key (optional for local servers)") },
+                    placeholder = { Text("sk-...") },
+                    visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                            Icon(
+                                imageVector = if (apiKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (apiKeyVisible) "Hide API Key" else "Show API Key"
+                            )
+                        }
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = modelDraft,
+                        onValueChange = {
+                            modelDraft = it
+                            connectionResult = null
+                        },
+                        label = { Text("Model ID") },
+                        placeholder = { Text("gpt-4o-mini") },
+                        trailingIcon = if (fetchedModels.isNotEmpty()) {
+                            {
+                                IconButton(onClick = { showModelMenu = true }) {
+                                    Icon(
+                                        imageVector = Icons.Default.ArrowDropDown,
+                                        contentDescription = "Choose fetched model"
+                                    )
+                                }
+                            }
+                        } else {
+                            null
+                        },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    Box(modifier = Modifier.padding(top = 6.dp)) {
+                        OutlinedButton(
+                            enabled = urlValid && !isFetchingModels,
+                            onClick = {
+                                isFetchingModels = true
+                                fetchError = null
+                                val flushed = flushedSettings()
+                                onPersistSettings(flushed)
+                                scope.launch {
+                                    val res = OpenAiCompatibleClient.fetchAvailableModels(
+                                        baseUrl = flushed.openAiBaseUrl,
+                                        apiKey = flushed.openAiApiKey,
+                                        timeoutSeconds = flushed.openAiTimeoutSeconds
+                                    )
+                                    isFetchingModels = false
+                                    res.onSuccess { list ->
+                                        fetchedModels = list
+                                        if (modelDraft.isBlank() && list.isNotEmpty()) {
+                                            modelDraft = list.first()
+                                            onPersistSettings(flushedSettings())
+                                        }
+                                        showModelMenu = true
+                                    }.onFailure { err ->
+                                        fetchError = err.message ?: "Failed to fetch models"
+                                    }
+                                }
+                            }
+                        ) {
+                            if (isFetchingModels) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Fetch")
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showModelMenu && fetchedModels.isNotEmpty(),
+                            onDismissRequest = { showModelMenu = false }
+                        ) {
+                            fetchedModels.take(40).forEach { candidateModel ->
+                                DropdownMenuItem(
+                                    text = { Text(candidateModel) },
+                                    onClick = {
+                                        modelDraft = candidateModel
+                                        showModelMenu = false
+                                        connectionResult = null
+                                        onPersistSettings(flushedSettings())
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (!fetchError.isNullOrBlank()) {
+                    Text(
+                        text = fetchError.orEmpty(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Timeout:",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    listOf(10, 20, 30, 45).forEach { seconds ->
+                        FilterChip(
+                            selected = settings.openAiTimeoutSeconds == seconds,
+                            onClick = {
+                                onPersistSettings(flushedSettings(timeoutOverride = seconds))
+                            },
+                            label = { Text("${seconds}s") }
+                        )
+                    }
+                }
+
+                Button(
+                    enabled = urlValid && modelReady && !isTestingConnection,
+                    onClick = {
+                        isTestingConnection = true
+                        connectionResult = null
+                        fetchError = null
+                        val flushed = flushedSettings()
+                        onPersistSettings(flushed)
+                        scope.launch {
+                            val result = OpenAiCompatibleClient.testConnection(
+                                baseUrl = flushed.openAiBaseUrl,
+                                apiKey = flushed.openAiApiKey,
+                                model = flushed.openAiModel,
+                                timeoutSeconds = flushed.openAiTimeoutSeconds
+                            )
+                            connectionResult = result
+                            isTestingConnection = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (isTestingConnection) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Testing API Connection...")
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Bolt,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Test Connection")
+                    }
+                }
+
+                connectionResult?.let { result ->
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (result.success) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                        } else {
+                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (result.success) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
+                                contentDescription = null,
+                                tint = if (result.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = result.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (result.success) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                }
+                            )
+                        }
+                    }
+                }
+
+                if (urlValid && modelReady) {
+                    Text(
+                        text = "Tip: Voice audio is always transcribed offline on your device first; only the final transcript text is sent for formatting.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
     }
 }

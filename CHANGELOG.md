@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.20.0] - 2026-11-14
+
+### Added
+- **OpenAI-Compatible API Post-Processing Backend (`core/speech/OpenAiCompatibleClient`):** Process offline voice transcripts with any OpenAI-compatible cloud or LAN `/chat/completions` endpoint (presets for **OpenAI**, **OpenRouter**, **Groq**, **Gemini**, and **Ollama / Local**, plus custom Base URL, masked API key, `/models` model discovery via **Fetch**, configurable request timeout, and live **Test Connection** with latency & formatted preview).
+  - Supports HTTP LAN endpoints (`ollama`, LM Studio, vLLM) via `usesCleartextTraffic="true"` alongside HTTPS cloud APIs.
+  - Reuses OpenFlow's `GemmaTextProcessor` system instructions, custom vocabulary biasing, cursor continuation casing, fast-path bypass, `<think>`/chatter stripping, and anti-unspoken-content guards, with automatic compatibility retry (without `temperature`/`max_tokens` for reasoning models) and safe transcript fallback on network errors.
+- **Minimalistic Floating Pill & Chunked Progress Indicator (`ProcessingProgress` & `BubbleOverlayComponent`):**
+  - Smoother spring morphs, hairline Material 3 border, 4-bar audio equalizer + live dot while recording, vertical-slide stage transitions, concise tonal badge (`EN`, `API`, `Gemma 4`), and overshoot checkmark completion.
+  - Compact chunked transcription progress (`11/13` tabular counter, determinate micro ring, and thin bottom hairline bar) while processing multi-chunk recordings.
+
+### Changed
+- **AI Post-Processing UI is now collapsible and collapsed by default:** The *AI Post-Processing & Formatting* Settings section starts collapsed with a live status pill (`Off`, `Instant Engine`, `Local · <model>`, or `API · <model>`). Both local LiteRT-LM and OpenAI API LLMs remain **disabled by default**.
+- **Faster Cold Startup (when LLM formatting is disabled):** Moved `NpuHardwareManager` vendor library probing, directory setup, `ModelSettings.load`, and settings disk status checks off the Main Thread onto background `Dispatchers.IO`, skipped disk verification for disabled models in `computeModelStatesSnapshot()`, and gated live recording overlap jobs strictly to active local native post-processors.
+
 ## [2.19.0] - 2026-11-04
 
 ### Changed

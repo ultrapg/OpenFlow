@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
             val context = LocalContext.current
             val prefs = remember { getSharedPreferences("openflow_settings", Context.MODE_PRIVATE) }
 
-            var modelSettings by remember { mutableStateOf(ModelSettings.load(context)) }
+            var modelSettings by remember { mutableStateOf(ModelSettings()) }
             var isCheckingModels by remember { mutableStateOf(true) }
             var requiresOnboarding by remember { mutableStateOf(false) }
 
@@ -88,13 +88,16 @@ class MainActivity : ComponentActivity() {
             val isAccessibilityConnected by TextInjectionAccessibilityService.isServiceConnected.collectAsState()
 
             LaunchedEffect(Unit) {
-                val allReady = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    DesertAntModelStorage.areAllEnabledModelsDownloaded(context, modelSettings)
+                val (loadedSettings, allReady) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val loaded = ModelSettings.load(context)
+                    val ready = DesertAntModelStorage.areAllEnabledModelsDownloaded(context, loaded)
+                    loaded to ready
                 }
+                modelSettings = loadedSettings
                 requiresOnboarding = !allReady
                 isCheckingModels = false
                 if (allReady) {
-                    SmartPipeline.getInstance(context).refreshStatusSnapshot()
+                    SmartPipeline.getInstance(context).refreshStatusSnapshotAsync()
                     FloatingBubbleService.ensureRunningIfEnabled(context, reason = "main_activity_launch")
                 }
             }

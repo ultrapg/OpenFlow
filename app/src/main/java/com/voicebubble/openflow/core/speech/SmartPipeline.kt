@@ -35,6 +35,7 @@ import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DictationChunkSettings
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.LlmModelChoice
+import com.voicebubble.openflow.settings.LlmProviderMode
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
 import kotlinx.coroutines.CancellationException
@@ -223,7 +224,7 @@ data class PipelineStatus(
     val configuredAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
     val activeAcceleratorLabel: String = "Auto (NPU / GPU / CPU)",
     val activeGemmaBackendLabel: String? = null,
-    val detectedNpuSummary: String = NpuHardwareManager.detectHardwareProfile().summaryLabel,
+    val detectedNpuSummary: String = NpuHardwareManager.cachedHardwareSummaryOrQuick(),
     val dynamicLoadingMode: String = "Adaptive Stage Management",
     val modelStates: Map<DesertAntModel, ModelLoadState> = DesertAntModel.entries.associateWith { model ->
         when (model) {
@@ -359,8 +360,8 @@ class SmartPipeline(
     private var appliedLowMemoryMode: Boolean? = null
     private var appliedSettingsSnapshot: ModelSettings? = null
     private var lastForcedGcAtMs: Long = 0L
-    private var activeAcceleratorDescription: String =
-        NpuHardwareManager.configureNativeRuntime(appContext, initialSettings.hardwareAccelerator, false)
+    @Volatile
+    private var activeAcceleratorDescription: String = initialSettings.hardwareAccelerator.displayName
 
     @Volatile
     private var voz: Voz? = null
@@ -400,14 +401,38 @@ class SmartPipeline(
         PipelineStatus(
             configuredAccelerator = initialSettings.hardwareAccelerator,
             activeAcceleratorLabel = activeAcceleratorDescription,
-            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
+            detectedNpuSummary = NpuHardwareManager.cachedHardwareSummaryOrQuick(),
             enabledCount = initialSettings.enabledModels().size
         )
     )
     val pipelineStatus: StateFlow<PipelineStatus> = _pipelineStatus.asStateFlow()
 
     /**
-     * Refreshes on-disk vs loaded model states without acquiring native locks if idle.
+     * Performs native runtime env configuration, NPU vendor library discovery, and legacy model cleanup
+     * asynchronously off the Main thread so `SmartPipeline.getInstance()` returns in `<1 ms`.
+     */
+    private val startupPrepJob: Job = idleScope.launch(Dispatchers.IO) {
+        try {
+            val snap = settings
+            val configuredLabel = NpuHardwareManager.configureNativeRuntime(
+                context = appContext,
+                requested = snap.hardwareAccelerator,
+                lowMemoryPressure = false
+            )
+            val npuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel
+            DesertAntModelStorage.cleanupLegacyRemovedModels(appContext)
+            activeAcceleratorDescription = configuredLabel
+            _pipelineStatus.value = _pipelineStatus.value.copy(
+                activeAcceleratorLabel = configuredLabel,
+                detectedNpuSummary = npuSummary
+            )
+            refreshStatusSnapshot()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Refreshes on-disk vs loaded model states without blocking the caller's thread if desired.
      */
     fun refreshStatusSnapshot() {
         val snap = settings
@@ -416,6 +441,15 @@ class SmartPipeline(
             phaseOverride = null,
             messageOverride = null
         )
+    }
+
+    /**
+     * Dispatches [refreshStatusSnapshot] onto `Dispatchers.IO` so Main-thread UI & service creation stay instant.
+     */
+    fun refreshStatusSnapshotAsync() {
+        idleScope.launch(Dispatchers.IO) {
+            refreshStatusSnapshot()
+        }
     }
 
     /**
@@ -445,6 +479,9 @@ class SmartPipeline(
             }
 
             val startMs = SystemClock.elapsedRealtime()
+            if (startupPrepJob.isActive) {
+                startupPrepJob.join()
+            }
             val memReport = evaluateMemoryPressure()
             applyHardwareAcceleratorSettingsLocked(currentSettings.hardwareAccelerator, memReport.isAnyMemoryTight)
 
@@ -551,6 +588,9 @@ class SmartPipeline(
         recordingWarmupJob = idleScope.launch {
             var shouldPreparePostProcessor = false
             var targetPostProcOverlapMs = DEFERRED_POST_PROC_OVERLAP_MS
+            if (startupPrepJob.isActive) {
+                startupPrepJob.join()
+            }
             // Phase 1: Load speech recognition models (`Ear` + `Voz`) immediately at t = 0 ms while the user speaks,
             // then release pipelineMutex right away so live streaming chunks or a quick Stop-tap never wait.
             pipelineMutex.withLock {
@@ -625,8 +665,9 @@ class SmartPipeline(
                     messageOverride = "$readyCount/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                 )
 
-                val needsLlm = activeSnap.gemmaEnabled && isActiveLlmReadyOnDisk(activeSnap)
+                val needsLlm = activeSnap.isLocalLlmEnabled && isActiveLlmReadyOnDisk(activeSnap)
                 val needsPunct = !needsLlm &&
+                    !activeSnap.isOpenAiApiEnabled &&
                     activeSnap.punctEnabled &&
                     DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
                 val postProcAlreadyLoaded = (needsLlm && gemmaProcessor != null && loadedLlmChoice == activeSnap.selectedLlmModel) ||
@@ -658,6 +699,10 @@ class SmartPipeline(
      */
     fun preparePostProcessorWhileRecordingAsync(initialDelayMs: Long = 0L) {
         if (!isRecordingActive || hasPendingOrActiveInference) return
+        val quickSettings = settings
+        val needsNativePostProc = quickSettings.isLocalLlmEnabled ||
+            (!quickSettings.isOpenAiApiEnabled && quickSettings.punctEnabled)
+        if (!needsNativePostProc) return
         if (postProcOverlapJob?.isActive == true) return
         postProcOverlapJob = idleScope.launch {
             if (initialDelayMs > 0L) {
@@ -670,7 +715,7 @@ class SmartPipeline(
                 try {
                     if (isRecordingActive && !hasPendingOrActiveInference) {
                         val activeSnap = settings
-                        val activeLlmReady = activeSnap.gemmaEnabled && isActiveLlmReadyOnDisk(activeSnap)
+                        val activeLlmReady = activeSnap.isLocalLlmEnabled && isActiveLlmReadyOnDisk(activeSnap)
                         if (activeLlmReady) {
                             val selectedLlm = activeSnap.selectedLlmModel
                             if (loadedLlmChoice != null && loadedLlmChoice != selectedLlm) {
@@ -718,7 +763,8 @@ class SmartPipeline(
                                     messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
                                 )
                             }
-                        } else if (activeSnap.punctEnabled &&
+                        } else if (!activeSnap.isOpenAiApiEnabled &&
+                            activeSnap.punctEnabled &&
                             punctRestorer == null &&
                             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
                         ) {
@@ -744,7 +790,7 @@ class SmartPipeline(
                     throw ce
                 } catch (t: Throwable) {
                     DebugLogManager.logWarn(TAG, "Deferred post-processor overlap load during recording: ${t.message}")
-                    if (settings.gemmaEnabled) closeGemmaLocked() else closePunctLocked()
+                    if (settings.isLocalLlmEnabled) closeGemmaLocked() else closePunctLocked()
                 } finally {
                     pipelineMutex.unlock()
                 }
@@ -758,7 +804,7 @@ class SmartPipeline(
                     if (isRecordingActive && !hasPendingOrActiveInference) {
                         val activeSnap = settings
                         val gemma = gemmaProcessor
-                        if (activeSnap.gemmaEnabled && gemma != null && loadedLlmChoice == activeSnap.selectedLlmModel) {
+                        if (activeSnap.isLocalLlmEnabled && gemma != null && loadedLlmChoice == activeSnap.selectedLlmModel) {
                             val memAfterLoad = evaluateMemoryPressure()
                             if (memAfterLoad.canPrewarmLlmPromptCache(activeSnap.selectedLlmModel)) {
                                 gemma.prewarmSystemPrompt(
@@ -908,7 +954,7 @@ class SmartPipeline(
 
     private fun schedulePostDictationPromptPrewarm() {
         val snap = settings
-        if (!snap.gemmaEnabled || snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return
+        if (!snap.isLocalLlmEnabled || snap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return
         promptPrewarmJob?.cancel()
         promptPrewarmJob = idleScope.launch {
             delay(40L)
@@ -918,7 +964,7 @@ class SmartPipeline(
                 val activeSnap = settings
                 if (activeSnap.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY) return@launch
                 val gemma = gemmaProcessor ?: return@launch
-                if (!activeSnap.gemmaEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
+                if (!activeSnap.isLocalLlmEnabled || loadedLlmChoice != activeSnap.selectedLlmModel) return@launch
                 val selectedLlm = activeSnap.selectedLlmModel
                 val mem = evaluateMemoryPressure()
                 val minPostDictationAvailMb = when (selectedLlm) {
@@ -961,6 +1007,9 @@ class SmartPipeline(
     suspend fun reloadSettings(newSettings: ModelSettings) = withContext(Dispatchers.Default) {
         settings = newSettings
         pipelineMutex.withLock {
+            if (startupPrepJob.isActive) {
+                startupPrepJob.join()
+            }
             val snapshot = settings
             val memReport = evaluateMemoryPressure()
 
@@ -993,6 +1042,7 @@ class SmartPipeline(
                 appliedSettingsSnapshot?.earEnabled == snapshot.earEnabled &&
                 appliedSettingsSnapshot?.punctEnabled == snapshot.punctEnabled &&
                 appliedSettingsSnapshot?.gemmaEnabled == snapshot.gemmaEnabled &&
+                appliedSettingsSnapshot?.llmProvider == snapshot.llmProvider &&
                 appliedSettingsSnapshot?.selectedLlmModel == snapshot.selectedLlmModel &&
                 appliedSettingsSnapshot?.hardwareAccelerator == snapshot.hardwareAccelerator
             if (!accelChanged &&
@@ -1002,7 +1052,7 @@ class SmartPipeline(
             ) {
                 appliedSettingsSnapshot = snapshot
                 val currentGemma = gemmaProcessor
-                if (snapshot.gemmaEnabled && currentGemma != null && loadedLlmChoice == snapshot.selectedLlmModel) {
+                if (snapshot.isLocalLlmEnabled && currentGemma != null && loadedLlmChoice == snapshot.selectedLlmModel) {
                     val mem = evaluateMemoryPressure()
                     if (mem.canPrewarmLlmPromptCache(snapshot.selectedLlmModel)) {
                         currentGemma.prewarmSystemPrompt(
@@ -1043,8 +1093,12 @@ class SmartPipeline(
                 System.gc()
             } else {
                 if (!snapshot.earEnabled) closeEarLocked()
-                if (!snapshot.punctEnabled || isActiveLlmReadyOnDisk(snapshot)) closePunctLocked()
-                if (!snapshot.gemmaEnabled || (loadedLlmChoice != null && loadedLlmChoice != snapshot.selectedLlmModel)) {
+                if (!snapshot.punctEnabled || isActiveLlmReadyOnDisk(snapshot) || snapshot.isOpenAiApiEnabled) {
+                    closePunctLocked()
+                }
+                val shouldCloseLocalGemma = !snapshot.isLocalLlmEnabled ||
+                    (loadedLlmChoice != null && loadedLlmChoice != snapshot.selectedLlmModel)
+                if (shouldCloseLocalGemma && gemmaProcessor != null) {
                     closeGemmaLocked()
                     System.gc()
                 }
@@ -1094,6 +1148,7 @@ class SmartPipeline(
     suspend fun transcribe(
         samples: FloatArray,
         onStageProgress: ((String) -> Unit)? = null,
+        onProgress: ((ProcessingProgress) -> Unit)? = null,
         languageHint: String? = null,
         onLanguageResolved: ((String) -> Unit)? = null,
         applyPostProcessing: Boolean = true,
@@ -1104,6 +1159,7 @@ class SmartPipeline(
         nominalCutSampleBefore = null,
         cutKindBefore = null,
         onStageProgress = onStageProgress,
+        onProgress = onProgress,
         languageHint = languageHint,
         onLanguageResolved = onLanguageResolved,
         applyPostProcessing = applyPostProcessing,
@@ -1122,6 +1178,7 @@ class SmartPipeline(
         nominalCutSampleBefore: Long? = null,
         cutKindBefore: CutKind? = null,
         onStageProgress: ((String) -> Unit)? = null,
+        onProgress: ((ProcessingProgress) -> Unit)? = null,
         languageHint: String? = null,
         onLanguageResolved: ((String) -> Unit)? = null,
         applyPostProcessing: Boolean = true,
@@ -1179,6 +1236,9 @@ class SmartPipeline(
                 isTranscribing = true
                 val inferenceStartMs = SystemClock.elapsedRealtime()
             try {
+                if (startupPrepJob.isActive) {
+                    startupPrepJob.join()
+                }
                 val activeSettings = settings
                 val initialMem = evaluateMemoryPressure()
                 applyHardwareAcceleratorSettingsLocked(
@@ -1237,7 +1297,8 @@ class SmartPipeline(
                         resolveLanguageLocked(
                             samples = earSlice,
                             activeSettings = activeSettings,
-                            onStageProgress = onStageProgress
+                            onStageProgress = onStageProgress,
+                            onProgress = onProgress
                         )
                     }
                 onLanguageResolved?.invoke(resolvedLanguage)
@@ -1263,7 +1324,9 @@ class SmartPipeline(
                         trimmedSamplesRef = null
                     }
 
-                    val chunkSuffix = if (totalChunks > 1) " (${chunkIdx + 1}/$totalChunks)" else ""
+                    val chunkNumber = chunkIdx + 1
+                    val chunkSuffix = if (totalChunks > 1) " ($chunkNumber/$totalChunks)" else ""
+                    val langDetail = resolvedLanguage.uppercase(Locale.ROOT)
                     // Full Parakeet TDT Conformer padding (320 ms lead + 640 ms tail + 1.60 s minimum) ensures
                     // 8 frames of TDT right-context lookahead and full 31-frame depthwise conv support so final
                     // words and short 1–2 word utterances are never withheld or truncated.
@@ -1291,6 +1354,15 @@ class SmartPipeline(
                             message = "Loading Voz speech engine ($activeAcceleratorDescription)..."
                         )
                         onStageProgress?.invoke("Loading Voz...")
+                        onProgress?.invoke(
+                            ProcessingProgress(
+                                label = "Loading Voz",
+                                detail = langDetail,
+                                stage = ProcessingStageKind.LOADING_MODEL,
+                                chunkCurrent = if (totalChunks > 1) chunkNumber else null,
+                                chunkTotal = if (totalChunks > 1) totalChunks else null
+                            )
+                        )
                         ensureVozLocked(activeSettings, warmUp = false)
                     }
                     setModelActiveStatusLocked(
@@ -1299,6 +1371,15 @@ class SmartPipeline(
                         "Transcribing with Voz ($resolvedLanguage)$chunkSuffix..."
                     )
                     onStageProgress?.invoke("Voz ($resolvedLanguage)$chunkSuffix")
+                    onProgress?.invoke(
+                        ProcessingProgress(
+                            label = "Transcribing",
+                            detail = langDetail,
+                            stage = ProcessingStageKind.TRANSCRIBING,
+                            chunkCurrent = if (totalChunks > 1) chunkNumber else null,
+                            chunkTotal = if (totalChunks > 1) totalChunks else null
+                        )
+                    )
                     DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)$chunkSuffix")
 
                     val transcription = runVozWithRetryLocked(
@@ -1348,7 +1429,7 @@ class SmartPipeline(
                 }
 
                 // =========================================================================
-                // Stage 4..5: Post-Processing (`Punct` & On-Device LLM) + Whole-Dictation Guard
+                // Stage 4..5: Post-Processing (`Punct` & LLM/API) + Whole-Dictation Guard
                 // =========================================================================
                 val finalTranscript = if (applyPostProcessing && stitchedTranscript.isNotBlank()) {
                     val postProcessed = runPostProcessingStagesLocked(
@@ -1356,7 +1437,8 @@ class SmartPipeline(
                         resolvedLanguage = resolvedLanguage,
                         activeSettings = activeSettings,
                         dynamicStageRelease = dynamicStageRelease,
-                        onStageProgress = onStageProgress
+                        onStageProgress = onStageProgress,
+                        onProgress = onProgress
                     )
                     reconcileWholeDictationWithRawVoz(
                         rawMergedVoz = stitchedTranscript,
@@ -1400,7 +1482,7 @@ class SmartPipeline(
                             preloadLlmIfCoResident = false
                         )
                     }
-                    if (applyPostProcessing && activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                    if (applyPostProcessing && activeSettings.isLocalLlmEnabled && gemmaProcessor != null) {
                         schedulePostDictationPromptPrewarm()
                     }
                 }
@@ -1473,7 +1555,10 @@ class SmartPipeline(
                 llmAlreadyLoaded = gemmaProcessor != null && loadedLlmChoice == snap.selectedLlmModel
             )
         }
-        if (snap.punctEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)) {
+        if (!snap.isOpenAiApiEnabled &&
+            snap.punctEnabled &&
+            DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
+        ) {
             return !mem.isAnyMemoryTight
         }
         return false
@@ -1493,6 +1578,7 @@ class SmartPipeline(
         val snapSettings = settings
         val useLlm = isActiveLlmReadyOnDisk(snapSettings)
         val usePunct = !useLlm &&
+            !snapSettings.isOpenAiApiEnabled &&
             snapSettings.punctEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
         if (!useLlm && !usePunct) return@withContext null
@@ -1503,6 +1589,7 @@ class SmartPipeline(
                 val activeSettings = settings
                 val activeLlm = isActiveLlmReadyOnDisk(activeSettings)
                 val activePunct = !activeLlm &&
+                    !activeSettings.isOpenAiApiEnabled &&
                     activeSettings.punctEnabled &&
                     DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
                 if (!activeLlm && !activePunct) return@withLock null
@@ -1575,15 +1662,19 @@ class SmartPipeline(
         text: String,
         languageHint: String? = null,
         onStageProgress: ((String) -> Unit)? = null,
+        onProgress: ((ProcessingProgress) -> Unit)? = null,
         precedingCleanedTail: String? = null,
         applyLeadingCursorContinuation: Boolean = true
     ): String = withContext(Dispatchers.Default) {
         if (text.isBlank()) return@withContext text
         val snapSettings = settings
-        val needsPunct = snapSettings.punctEnabled &&
+        val needsEngine = snapSettings.formattingEngineEnabled
+        val needsPunct = !snapSettings.isOpenAiApiEnabled &&
+            snapSettings.punctEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
-        val needsGemma = isActiveLlmReadyOnDisk(snapSettings)
-        if (!needsPunct && !needsGemma) return@withContext text
+        val needsLocalLlm = isActiveLlmReadyOnDisk(snapSettings)
+        val needsRemoteLlm = isActiveRemoteLlmConfigured(snapSettings)
+        if (!needsEngine && !needsPunct && !needsLocalLlm && !needsRemoteLlm) return@withContext text
 
         pendingInferenceRequests.incrementAndGet()
         try {
@@ -1606,6 +1697,7 @@ class SmartPipeline(
                         activeSettings = activeSettings,
                         dynamicStageRelease = shouldStageAuxiliaryModelsDynamically(activeSettings, mem),
                         onStageProgress = onStageProgress,
+                        onProgress = onProgress,
                         precedingCleanedTail = precedingCleanedTail,
                         applyLeadingCursorContinuation = applyLeadingCursorContinuation
                     )
@@ -1631,7 +1723,7 @@ class SmartPipeline(
                             }
                             ensureVozLocked(activeSettings, warmUp = false)
                         }
-                        if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                        if (activeSettings.isLocalLlmEnabled && gemmaProcessor != null) {
                             schedulePostDictationPromptPrewarm()
                         }
                     }
@@ -1693,7 +1785,7 @@ class SmartPipeline(
                     closeGemmaLocked()
                     System.gc()
                 }
-                if (punctRestorer != null && activeSettings.gemmaEnabled) {
+                if (punctRestorer != null && (activeSettings.isLocalLlmEnabled || activeSettings.isOpenAiApiEnabled)) {
                     closePunctLocked()
                 }
 
@@ -1775,11 +1867,11 @@ class SmartPipeline(
                         LlmModelChoice.GEMMA_4_E2B -> 950L
                         else -> 850L
                     }
-                    if (!activeSettings.gemmaEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
+                    if (!activeSettings.isLocalLlmEnabled || postMem.systemAvailMb < minPostPassAvailMb || cannotKeepWithVoz) {
                         closeGemmaLocked()
                         System.gc()
                     }
-                    if (activeSettings.gemmaEnabled && gemmaProcessor != null) {
+                    if (activeSettings.isLocalLlmEnabled && gemmaProcessor != null) {
                         schedulePostDictationPromptPrewarm()
                     }
                 }
@@ -2047,18 +2139,23 @@ class SmartPipeline(
     }
 
     private fun isActiveLlmReadyOnDisk(activeSettings: ModelSettings): Boolean {
-        return activeSettings.gemmaEnabled &&
+        return activeSettings.isLocalLlmEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, activeSettings.selectedLlmModel.desertAntModel)
+    }
+
+    private fun isActiveRemoteLlmConfigured(activeSettings: ModelSettings): Boolean {
+        return activeSettings.isOpenAiApiEnabled &&
+            OpenAiCompatibleClient.isValidHttpUrl(activeSettings.openAiBaseUrl)
     }
 
     private fun areEnabledModelsReadyOrStandbyLocked(activeSettings: ModelSettings): Boolean {
         if (voz == null) return false
-        if (!activeSettings.gemmaEnabled && gemmaProcessor != null) return false
-        if (activeSettings.gemmaEnabled && loadedLlmChoice != null && loadedLlmChoice != activeSettings.selectedLlmModel) {
+        if (!activeSettings.isLocalLlmEnabled && gemmaProcessor != null) return false
+        if (activeSettings.isLocalLlmEnabled && loadedLlmChoice != null && loadedLlmChoice != activeSettings.selectedLlmModel) {
             return false
         }
-        val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
-        if (activeLlmOnDisk && punctRestorer != null) return false
+        val activeLlmBypass = isActiveLlmReadyOnDisk(activeSettings) || isActiveRemoteLlmConfigured(activeSettings)
+        if (activeLlmBypass && punctRestorer != null) return false
 
         val mem = evaluateMemoryPressure()
         if (!mem.isCriticalPressure) {
@@ -2069,7 +2166,8 @@ class SmartPipeline(
                 return false
             }
             if (activeSettings.punctEnabled &&
-                !activeLlmOnDisk &&
+                !activeLlmBypass &&
+                !activeSettings.isOpenAiApiEnabled &&
                 DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT) &&
                 punctRestorer == null
             ) {
@@ -2082,7 +2180,8 @@ class SmartPipeline(
     private suspend fun resolveLanguageLocked(
         samples: FloatArray,
         activeSettings: ModelSettings,
-        onStageProgress: ((String) -> Unit)?
+        onStageProgress: ((String) -> Unit)?,
+        onProgress: ((ProcessingProgress) -> Unit)? = null
     ): String {
         val fallbackLanguage = if (activeSettings.preferredLanguage in Voz.supportedLanguages) {
             activeSettings.preferredLanguage
@@ -2120,6 +2219,13 @@ class SmartPipeline(
 
         return try {
             setModelActiveStatusLocked(activeSettings, DesertAntModel.EAR, "Detecting language with Ear...")
+            onProgress?.invoke(
+                ProcessingProgress(
+                    label = "Detecting language",
+                    detail = "Ear",
+                    stage = ProcessingStageKind.DETECTING_LANGUAGE
+                )
+            )
             onStageProgress?.invoke("Ear")
             val rawEarInput = if (samples.size > MAX_EAR_WINDOW_SAMPLES) {
                 samples.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
@@ -2330,6 +2436,7 @@ class SmartPipeline(
     ) {
         val mem = evaluateMemoryPressure()
         val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
+        val activeLlmBypass = activeLlmOnDisk || isActiveRemoteLlmConfigured(activeSettings) || activeSettings.isOpenAiApiEnabled
 
         if (mem.isCriticalPressure) {
             DebugLogManager.logInfo(
@@ -2385,10 +2492,10 @@ class SmartPipeline(
         }
 
         // Punct (Neural Punctuation & Casing Restoration on NPU/XNNPACK)
-        // Never keep Punct loaded in RAM when an on-device LLM is enabled & downloaded (LLM handles punctuation in one pass)
-        if (activeLlmOnDisk) {
+        // Never keep Punct loaded in RAM when an AI post-processor (local LLM or OpenAI API) is active
+        if (activeLlmBypass) {
             if (punctRestorer != null) {
-                DebugLogManager.logInfo(TAG, "Unloading Punct because ${activeSettings.selectedLlmModel.title} handles punctuation & formatting")
+                DebugLogManager.logInfo(TAG, "Unloading Punct because AI post-processing handles punctuation & formatting")
                 closePunctLocked()
             }
         } else if (activeSettings.punctEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)) {
@@ -2439,7 +2546,7 @@ class SmartPipeline(
         // Single Selected On-Device LLM (LiteRT-LM on NPU / GPU / CPU)
         // Strict single-model rule: immediately unload any previously loaded LLM before considering the selected one.
         val selectedLlm = activeSettings.selectedLlmModel
-        if (!activeSettings.gemmaEnabled || (loadedLlmChoice != null && loadedLlmChoice != selectedLlm)) {
+        if (!activeSettings.isLocalLlmEnabled || (loadedLlmChoice != null && loadedLlmChoice != selectedLlm)) {
             closeGemmaLocked()
         }
 
@@ -2523,16 +2630,18 @@ class SmartPipeline(
         activeSettings: ModelSettings,
         dynamicStageRelease: Boolean,
         onStageProgress: ((String) -> Unit)?,
+        onProgress: ((ProcessingProgress) -> Unit)? = null,
         precedingCleanedTail: String? = null,
         applyLeadingCursorContinuation: Boolean = true
     ): String {
         if (text.isBlank()) return text
         var current = text
-        val activeLlmOnDisk = isActiveLlmReadyOnDisk(activeSettings)
+        val activeLocalLlm = isActiveLlmReadyOnDisk(activeSettings)
+        val activeRemoteLlm = !activeLocalLlm && isActiveRemoteLlmConfigured(activeSettings)
 
-        // When the selected LLM is enabled & downloaded, never load or run Punct alongside it
-        // (the LLM restores punctuation, casing, numbers, and formatting in a single pass).
-        if (activeLlmOnDisk) {
+        // When AI post-processing (remote OpenAI-compatible API or on-device LLM) is active,
+        // never load or run Punct alongside it (the LLM handles punctuation & formatting in one pass).
+        if (activeRemoteLlm || activeLocalLlm) {
             if (punctRestorer != null) {
                 closePunctLocked()
             }
@@ -2544,17 +2653,31 @@ class SmartPipeline(
                     engineResolved = !fr.needsLlm
                 }
             }
-            val (llmResult, llmSucceeded) = runGemmaLocked(
-                engineResolved = engineResolved,
-                text = current,
-                language = resolvedLanguage,
-                activeSettings = activeSettings,
-                dynamicStageRelease = dynamicStageRelease,
-                onStageProgress = onStageProgress,
-                precedingCleanedTail = precedingCleanedTail,
-                applyLeadingCursorContinuation = applyLeadingCursorContinuation,
-                keepWarmForStreamingOverlap = false
-            )
+            val (llmResult, llmSucceeded) = if (activeRemoteLlm) {
+                runRemoteOpenAiLlmLocked(
+                    engineResolved = engineResolved,
+                    text = current,
+                    language = resolvedLanguage,
+                    activeSettings = activeSettings,
+                    onStageProgress = onStageProgress,
+                    onProgress = onProgress,
+                    precedingCleanedTail = precedingCleanedTail,
+                    applyLeadingCursorContinuation = applyLeadingCursorContinuation
+                )
+            } else {
+                runGemmaLocked(
+                    engineResolved = engineResolved,
+                    text = current,
+                    language = resolvedLanguage,
+                    activeSettings = activeSettings,
+                    dynamicStageRelease = dynamicStageRelease,
+                    onStageProgress = onStageProgress,
+                    onProgress = onProgress,
+                    precedingCleanedTail = precedingCleanedTail,
+                    applyLeadingCursorContinuation = applyLeadingCursorContinuation,
+                    keepWarmForStreamingOverlap = false
+                )
+            }
             current = llmResult
             if (!llmSucceeded &&
                 activeSettings.punctEnabled &&
@@ -2564,7 +2687,8 @@ class SmartPipeline(
                     text = current,
                     language = resolvedLanguage,
                     activeSettings = activeSettings,
-                    onStageProgress = onStageProgress
+                    onStageProgress = onStageProgress,
+                    onProgress = onProgress
                 )
                 if (dynamicStageRelease && punctRestorer != null) {
                     closePunctLocked()
@@ -2580,15 +2704,17 @@ class SmartPipeline(
             if (fr.text.isNotBlank()) current = fr.text
         }
 
-        // Stage 4: Neural Punctuation & Casing Restoration (`Punct` — only when no LLM is active)
-        if (activeSettings.punctEnabled &&
+        // Stage 4: Neural Punctuation & Casing Restoration (`Punct` — only when no AI LLM is active)
+        if (!activeSettings.isOpenAiApiEnabled &&
+            activeSettings.punctEnabled &&
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.PUNCT)
         ) {
             current = runPunctLocked(
                 text = current,
                 language = resolvedLanguage,
                 activeSettings = activeSettings,
-                onStageProgress = onStageProgress
+                onStageProgress = onStageProgress,
+                onProgress = onProgress
             )
             if (dynamicStageRelease && punctRestorer != null) {
                 closePunctLocked()
@@ -2598,11 +2724,94 @@ class SmartPipeline(
         return current
     }
 
+    private suspend fun runRemoteOpenAiLlmLocked(
+        engineResolved: Boolean,
+        text: String,
+        language: String,
+        activeSettings: ModelSettings,
+        onStageProgress: ((String) -> Unit)?,
+        onProgress: ((ProcessingProgress) -> Unit)?,
+        precedingCleanedTail: String? = null,
+        applyLeadingCursorContinuation: Boolean = true
+    ): Pair<String, Boolean> {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return text to true
+
+        val rawFieldCtx = GemmaTextProcessor.inspectActiveFieldContextStatic(appContext)
+        val rootFieldCtx = if (applyLeadingCursorContinuation) {
+            rawFieldCtx
+        } else {
+            rawFieldCtx.copy(
+                isMidSentenceContinuation = false,
+                continuingNumberedListFrom = null,
+                isContinuingBulletList = false
+            )
+        }
+        val fastPathFieldCtx = if (precedingCleanedTail != null && rootFieldCtx.appCategory == AppContextCategory.EMAIL) {
+            rootFieldCtx.copy(appCategory = AppContextCategory.GENERAL)
+        } else {
+            rootFieldCtx
+        }
+        if (GemmaTextProcessor.canBypassLlmFastPath(trimmed, activeSettings.gemmaPromptPreset, fastPathFieldCtx, engineResolved)) {
+            val bypassed = GemmaTextProcessor.applyDeterministicFastPathCleanup(
+                text = trimmed,
+                preset = activeSettings.gemmaPromptPreset,
+                languageCode = language,
+                customVocabulary = activeSettings.customVocabulary,
+                fieldContext = rootFieldCtx
+            )
+            DebugLogManager.logInfo(
+                TAG,
+                "Zero-LLM fast-path bypassed OpenAI API in <1ms (${trimmed.length} chars)"
+            )
+            return bypassed to true
+        }
+
+        val apiModel = activeSettings.openAiModel.trim()
+        onProgress?.invoke(
+            ProcessingProgress(
+                label = "Formatting",
+                detail = "API",
+                stage = ProcessingStageKind.FORMATTING,
+                isRemoteAi = true
+            )
+        )
+        onStageProgress?.invoke("API · $apiModel")
+
+        val outcome = OpenAiCompatibleClient.processTranscript(
+            text = trimmed,
+            baseUrl = activeSettings.openAiBaseUrl,
+            apiKey = activeSettings.openAiApiKey,
+            model = apiModel,
+            preset = activeSettings.gemmaPromptPreset,
+            customPrompt = activeSettings.gemmaCustomPrompt,
+            languageCode = language,
+            customVocabulary = activeSettings.customVocabulary,
+            fieldContext = rootFieldCtx,
+            timeoutSeconds = activeSettings.openAiTimeoutSeconds,
+            engineResolved = engineResolved
+        )
+        return if (outcome.succeeded) {
+            DebugLogManager.logInfo(
+                TAG,
+                "OpenAI-compatible API ($apiModel) formatted ${trimmed.length} -> ${outcome.text.length} chars in ${outcome.latencyMs}ms"
+            )
+            outcome.text to true
+        } else {
+            DebugLogManager.logWarn(
+                TAG,
+                "OpenAI-compatible API ($apiModel) failed (${outcome.errorSummary}), keeping transcript"
+            )
+            text to false
+        }
+    }
+
     private fun runPunctLocked(
         text: String,
         language: String,
         activeSettings: ModelSettings,
-        onStageProgress: ((String) -> Unit)?
+        onStageProgress: ((String) -> Unit)?,
+        onProgress: ((ProcessingProgress) -> Unit)? = null
     ): String {
         val mem = evaluateMemoryPressure()
         val instance = punctRestorer ?: run {
@@ -2622,6 +2831,13 @@ class SmartPipeline(
 
         return try {
             setModelActiveStatusLocked(activeSettings, DesertAntModel.PUNCT, "Cleaning punctuation & casing with Punct...")
+            onProgress?.invoke(
+                ProcessingProgress(
+                    label = "Formatting",
+                    detail = "Punct",
+                    stage = ProcessingStageKind.FORMATTING
+                )
+            )
             onStageProgress?.invoke("Punct")
             val restored = instance.restore(
                 text = text,
@@ -2646,6 +2862,7 @@ class SmartPipeline(
         activeSettings: ModelSettings,
         dynamicStageRelease: Boolean,
         onStageProgress: ((String) -> Unit)?,
+        onProgress: ((ProcessingProgress) -> Unit)? = null,
         precedingCleanedTail: String? = null,
         applyLeadingCursorContinuation: Boolean = true,
         keepWarmForStreamingOverlap: Boolean = false
@@ -2733,6 +2950,12 @@ class SmartPipeline(
                     state = ModelLoadState.LOADING,
                     message = "Loading ${selectedLlm.title} on LiteRT-LM..."
                 )
+                onProgress?.invoke(
+                    ProcessingProgress(
+                        label = "Loading ${selectedLlm.shortLabel}",
+                        stage = ProcessingStageKind.LOADING_MODEL
+                    )
+                )
                 onStageProgress?.invoke("Loading ${selectedLlm.shortLabel}")
                 GemmaTextProcessor(
                     context = appContext,
@@ -2765,6 +2988,13 @@ class SmartPipeline(
                 activeSettings,
                 selectedLlm.desertAntModel,
                 "Cleaning with ${selectedLlm.title} ($presetLabel • $thinkingLabel • ${instance.activeBackendSummary})..."
+            )
+            onProgress?.invoke(
+                ProcessingProgress(
+                    label = "Formatting",
+                    detail = selectedLlm.shortLabel,
+                    stage = ProcessingStageKind.FORMATTING
+                )
             )
             onStageProgress?.invoke(selectedLlm.shortLabel)
             val processed = instance.process(
@@ -2818,7 +3048,7 @@ class SmartPipeline(
         if (voz != null) count++
         if (activeSettings.earEnabled && ear != null) count++
         if (activeSettings.punctEnabled && punctRestorer != null) count++
-        if (activeSettings.gemmaEnabled && gemmaProcessor != null && loadedLlmChoice == activeSettings.selectedLlmModel) {
+        if (activeSettings.isLocalLlmEnabled && gemmaProcessor != null && loadedLlmChoice == activeSettings.selectedLlmModel) {
             count++
         }
         return count
@@ -2832,6 +3062,10 @@ class SmartPipeline(
         val result = linkedMapOf<DesertAntModel, ModelLoadState>()
         for (model in DesertAntModel.entries) {
             val enabled = activeSettings.isModelEnabled(model)
+            if (!enabled) {
+                result[model] = ModelLoadState.DISABLED
+                continue
+            }
             val downloaded = try {
                 DesertAntModelStorage.isModelDownloaded(appContext, model)
             } catch (_: Throwable) {
@@ -2845,7 +3079,6 @@ class SmartPipeline(
                 else -> false
             }
             result[model] = when {
-                !enabled -> ModelLoadState.DISABLED
                 !downloaded -> ModelLoadState.NOT_DOWNLOADED
                 activeStageModel == model -> ModelLoadState.ACTIVE
                 loadingModel == model -> ModelLoadState.LOADING
@@ -2876,7 +3109,7 @@ class SmartPipeline(
             configuredAccelerator = activeSettings.hardwareAccelerator,
             activeAcceleratorLabel = activeAcceleratorDescription,
             activeGemmaBackendLabel = gemmaProcessor?.activeBackendSummary,
-            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
+            detectedNpuSummary = NpuHardwareManager.cachedHardwareSummaryOrQuick(),
             modelStates = map,
             statusMessage = message,
             loadedCount = countLoadedModelsLocked(activeSettings),
@@ -2959,7 +3192,7 @@ class SmartPipeline(
             configuredAccelerator = activeSettings.hardwareAccelerator,
             activeAcceleratorLabel = activeAcceleratorDescription,
             activeGemmaBackendLabel = gemmaProcessor?.activeBackendSummary,
-            detectedNpuSummary = NpuHardwareManager.detectHardwareProfile().summaryLabel,
+            detectedNpuSummary = NpuHardwareManager.cachedHardwareSummaryOrQuick(),
             modelStates = states,
             statusMessage = resolvedMsg,
             loadedCount = loaded,

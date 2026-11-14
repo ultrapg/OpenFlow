@@ -66,6 +66,8 @@ import com.voicebubble.openflow.core.database.TranscriptionRecord
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.PipelineStatus
+import com.voicebubble.openflow.core.speech.ProcessingProgress
+import com.voicebubble.openflow.core.speech.ProcessingStageKind
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.core.speech.StreamingDictationSession
 import com.voicebubble.openflow.settings.DictationChunkSettings
@@ -306,6 +308,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
     private val bubbleState = MutableStateFlow(OverlayBubbleState.IDLE)
     private val processingProgress = MutableStateFlow("")
+    private val processingProgressState = MutableStateFlow(ProcessingProgress.EMPTY)
     private val isScreenInteractive = MutableStateFlow(true)
     private val isBubbleVisibleFlow = MutableStateFlow(false)
     private val bubbleSizeFlow = MutableStateFlow(52f)
@@ -557,6 +560,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
             recordingCycleId.incrementAndGet()
             bubbleState.value = OverlayBubbleState.IDLE
             processingProgress.value = ""
+            processingProgressState.value = ProcessingProgress.EMPTY
             smartPipeline.onRecordingStopped()
             releaseDictationWakeLock()
             streamingSession?.cancel()
@@ -749,7 +753,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
      * background battery efficiency. Models are loaded lazily on demand when the bubble is tapped.
      */
     private fun prepareStandbyPipeline() {
-        smartPipeline.refreshStatusSnapshot()
+        smartPipeline.refreshStatusSnapshotAsync()
         val previousJob = initPipelineJob
         initPipelineJob = serviceScope.launch(Dispatchers.IO) {
             previousJob?.cancelAndJoin()
@@ -932,6 +936,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     val bubbleSize by bubbleSizeFlow.collectAsState()
                     val pipelineStatus by smartPipeline.pipelineStatus.collectAsState()
                     val progressText by processingProgress.collectAsState()
+                    val progressState by processingProgressState.collectAsState()
                     val settingsPrefs = androidx.compose.runtime.remember {
                         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     }
@@ -941,6 +946,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         bubbleState = currentState,
                         isInputFieldFocused = isBubbleVisible,
                         processingProgress = progressText,
+                        processingState = progressState,
                         bubbleSize = bubbleSize,
                         pipelinePhase = pipelineStatus.phase,
                         isModelLoaded = pipelineStatus.isReady,
@@ -992,6 +998,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
                             val cycleId = recordingCycleId.incrementAndGet()
                             processingProgress.value = ""
+                            processingProgressState.value = ProcessingProgress.EMPTY
                             bubbleState.value = OverlayBubbleState.RECORDING
                             if (settingsPrefs.getBoolean("haptic_feedback", true)) vibrate(20, 180)
                             acquireDictationWakeLock()
@@ -1017,7 +1024,8 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                                     audio = audioController,
                                     pipeline = smartPipeline,
                                     config = chunkSettings,
-                                    onStageProgress = { stageLabel -> processingProgress.value = stageLabel }
+                                    onStageProgress = { stageLabel -> processingProgress.value = stageLabel },
+                                    onProgress = { state -> processingProgressState.value = state }
                                 ).also {
                                     streamingSession = it
                                     it.start()
@@ -1055,10 +1063,18 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                             val cycleId = recordingCycleId.incrementAndGet()
                             smartPipeline.onRecordingStopped()
                             acquireDictationWakeLock()
-                            processingProgress.value = if (smartPipeline.isVozReady) {
-                                "Transcribing..."
+                            if (smartPipeline.isVozReady) {
+                                processingProgress.value = "Transcribing"
+                                processingProgressState.value = ProcessingProgress(
+                                    label = "Transcribing",
+                                    stage = ProcessingStageKind.TRANSCRIBING
+                                )
                             } else {
-                                "Loading Voz..."
+                                processingProgress.value = "Loading Voz"
+                                processingProgressState.value = ProcessingProgress(
+                                    label = "Loading Voz",
+                                    stage = ProcessingStageKind.LOADING_MODEL
+                                )
                             }
                             bubbleState.value = OverlayBubbleState.PROCESSING
                             // Keep the screen awake throughout Voz transcription and LLM post-processing!
@@ -1322,11 +1338,19 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
 
         serviceScope.launch {
             try {
-                if (processingProgress.value.isEmpty()) {
-                    processingProgress.value = if (smartPipeline.isVozReady) {
-                        "Transcribing..."
+                if (processingProgress.value.isEmpty() && processingProgressState.value.label.isEmpty()) {
+                    if (smartPipeline.isVozReady) {
+                        processingProgress.value = "Transcribing"
+                        processingProgressState.value = ProcessingProgress(
+                            label = "Transcribing",
+                            stage = ProcessingStageKind.TRANSCRIBING
+                        )
                     } else {
-                        "Loading Voz..."
+                        processingProgress.value = "Loading Voz"
+                        processingProgressState.value = ProcessingProgress(
+                            label = "Loading Voz",
+                            stage = ProcessingStageKind.LOADING_MODEL
+                        )
                     }
                 }
 
@@ -1355,6 +1379,9 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         samples = samples,
                         onStageProgress = { stageLabel ->
                             processingProgress.value = stageLabel
+                        },
+                        onProgress = { state ->
+                            processingProgressState.value = state
                         }
                     )
                 }
@@ -1384,6 +1411,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     )
                     if (recordingCycleId.get() == cycleId) {
                         processingProgress.value = ""
+                        processingProgressState.value = ProcessingProgress.EMPTY
                         bubbleState.value = OverlayBubbleState.IDLE
                     }
                     withContext(Dispatchers.Main) {
@@ -1425,7 +1453,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     val modelId = buildString {
                         append("desert-ant-voz-4.0.0")
                         if (activeModelSettings.punctEnabled && !activeModelSettings.gemmaEnabled) append("+punct")
-                        if (activeModelSettings.gemmaEnabled) append("+${activeModelSettings.selectedLlmModel.id}")
+                        if (activeModelSettings.isOpenAiApiEnabled) {
+                            append("+api:${activeModelSettings.openAiModel.trim()}")
+                        } else if (activeModelSettings.isLocalLlmEnabled) {
+                            append("+${activeModelSettings.selectedLlmModel.id}")
+                        }
                     }
                     val dao = AppDatabase.getDatabase(this@FloatingBubbleService).transcriptionDao()
                     dao.insert(
@@ -1446,6 +1478,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                     delay(1200)
                     if (recordingCycleId.get() == cycleId) {
                         processingProgress.value = ""
+                        processingProgressState.value = ProcessingProgress.EMPTY
                         bubbleState.value = OverlayBubbleState.IDLE
                     }
                 }
@@ -1454,6 +1487,7 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                 DebugLogManager.logError("FloatingBubbleService", "processAudio transcription error", t)
                 if (recordingCycleId.get() == cycleId) {
                     processingProgress.value = ""
+                    processingProgressState.value = ProcessingProgress.EMPTY
                     bubbleState.value = OverlayBubbleState.IDLE
                 }
                 val errorDetail = if (t is LinkageError) {

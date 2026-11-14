@@ -14,6 +14,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -43,7 +44,8 @@ class StreamingDictationSession(
     private val audio: AudioRecordingController,
     private val pipeline: SmartPipeline,
     private val config: DictationChunkSettings,
-    private val onStageProgress: (String) -> Unit
+    private val onStageProgress: (String) -> Unit,
+    private val onProgress: ((ProcessingProgress) -> Unit)? = null
 ) {
     private class PendingChunk(
         val index: Int,
@@ -101,6 +103,9 @@ class StreamingDictationSession(
         workerJob = scope.launch(Dispatchers.Default) {
             for (chunk in queue) {
                 try {
+                    if (stopRequested.get()) {
+                        emitStopPhaseChunkProgress(chunk.index)
+                    }
                     val segment = transcribeChunk(chunk, allowLanguageHint = true)
                     if (segment == null) {
                         val canRetainForRetry = !pipeline.isMemoryCriticallyTight() &&
@@ -352,6 +357,10 @@ class StreamingDictationSession(
         }
         queue.close()
         pipeline.onRecordingStopped()
+        val totalEnqueued = nextIndex.get()
+        if (totalEnqueued > 1 && results.size < totalEnqueued) {
+            emitStopPhaseChunkProgress(results.size.coerceAtMost(totalEnqueued - 1))
+        }
         try {
             workerJob?.join()
 
@@ -360,6 +369,7 @@ class StreamingDictationSession(
                 // Detach audio buffer immediately so GC can reclaim it right after retry
                 val pending = failed.remove(index) ?: continue
                 failedBufferedSamples.addAndGet(-pending.samples.size.toLong())
+                emitStopPhaseChunkProgress(pending.index)
                 val retried = transcribeChunk(pending, allowLanguageHint = false)
                 if (retried != null) {
                     results[index] = retried
@@ -402,7 +412,8 @@ class StreamingDictationSession(
                 val postProcessed = pipeline.postProcessFinalTranscript(
                     text = fullRawMerged.text,
                     languageHint = resolvedLang,
-                    onStageProgress = onStageProgress
+                    onStageProgress = onStageProgress,
+                    onProgress = onProgress
                 )
                 return reconcileWholeDictationWithRawVoz(
                     rawMergedVoz = fullRawMerged.text,
@@ -421,6 +432,7 @@ class StreamingDictationSession(
                     text = tailStitched,
                     languageHint = resolvedLang,
                     onStageProgress = onStageProgress,
+                    onProgress = onProgress,
                     precedingCleanedTail = lastCleanedTail,
                     applyLeadingCursorContinuation = false
                 )
@@ -491,6 +503,25 @@ class StreamingDictationSession(
         }
     }
 
+    private fun emitStopPhaseChunkProgress(chunkIndex: Int) {
+        val total = nextIndex.get().coerceAtLeast(1)
+        val current = (chunkIndex + 1).coerceIn(1, total)
+        val langDetail = language?.uppercase(Locale.ROOT)
+        val progress = ProcessingProgress(
+            label = if (pipeline.isVozReady) "Transcribing" else "Loading Voz",
+            detail = langDetail,
+            stage = if (pipeline.isVozReady) {
+                ProcessingStageKind.TRANSCRIBING
+            } else {
+                ProcessingStageKind.LOADING_MODEL
+            },
+            chunkCurrent = if (total > 1) current else null,
+            chunkTotal = if (total > 1) total else null
+        )
+        onProgress?.invoke(progress)
+        onStageProgress(progress.toDisplayString())
+    }
+
     /** Returns the timestamped chunk segment, or `null` if the pipeline threw (caller keeps the audio for a retry). */
     private suspend fun transcribeChunk(chunk: PendingChunk, allowLanguageHint: Boolean): ChunkTranscriptionSegment? {
         return try {
@@ -502,6 +533,22 @@ class StreamingDictationSession(
                 onStageProgress = { stage ->
                     if (stopRequested.get()) {
                         onStageProgress(stage)
+                    }
+                },
+                onProgress = { inner ->
+                    if (stopRequested.get()) {
+                        // Preserve overall session chunk indices (e.g., 11 of 13) when the streaming session has
+                        // multiple queued chunks; otherwise expose any inner sub-chunk split reported by Voz.
+                        val liveTotal = max(nextIndex.get(), chunk.index + 1)
+                        val merged = if (liveTotal > 1) {
+                            inner.copy(
+                                chunkCurrent = (chunk.index + 1).coerceIn(1, liveTotal),
+                                chunkTotal = liveTotal
+                            )
+                        } else {
+                            inner
+                        }
+                        onProgress?.invoke(merged)
                     }
                 },
                 languageHint = if (config.reuseLanguage && allowLanguageHint) language else null,

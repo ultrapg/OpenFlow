@@ -124,7 +124,7 @@ object DebugLogManager {
         } else {
             message
         }
-        Log.i(tag, fullMsg)
+        runCatching { Log.i(tag, fullMsg) }
         if (_isLoggingEnabled.value) {
             appendRawLog(isCrash = false, level = "INFO", tag = tag, message = fullMsg)
         }
@@ -135,7 +135,7 @@ object DebugLogManager {
         val mem = if (ctx != null) " | ${formatMemorySummary(ctx)}" else ""
         val trace = throwable?.let { "\n" + stackTraceToString(it) } ?: ""
         val fullMsg = "$message$mem$trace"
-        Log.w(tag, fullMsg)
+        runCatching { Log.w(tag, fullMsg) }
         if (_isLoggingEnabled.value) {
             appendRawLog(isCrash = false, level = "WARN", tag = tag, message = fullMsg)
         }
@@ -150,7 +150,7 @@ object DebugLogManager {
         val mem = if (ctx != null) " | ${formatMemorySummary(ctx)}" else ""
         val trace = throwable?.let { "\n" + stackTraceToString(it) } ?: ""
         val fullMsg = "$message$mem$trace"
-        Log.e(tag, fullMsg)
+        runCatching { Log.e(tag, fullMsg) }
         // Always record errors even if verbose logging is paused
         appendRawLog(isCrash = false, level = "ERROR", tag = tag, message = fullMsg)
     }

@@ -155,6 +155,26 @@ object NpuHardwareManager {
     @Volatile
     private var cachedProfile: NpuHardwareProfile? = null
 
+    /**
+     * Zero-I/O hardware summary suitable for immediate UI/Main-thread initialization while
+     * [detectHardwareProfile] completes the vendor shared-library scan on `Dispatchers.IO`.
+     */
+    fun cachedHardwareSummaryOrQuick(): String {
+        cachedProfile?.let { return it.summaryLabel }
+        val soc = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                listOfNotNull(
+                    Build.SOC_MODEL?.takeIf { it.isNotBlank() && it != Build.UNKNOWN },
+                    Build.HARDWARE?.takeIf { it.isNotBlank() && it != Build.UNKNOWN }
+                ).distinct().joinToString(" ")
+            } else {
+                Build.HARDWARE ?: ""
+            }
+        }.getOrDefault("")
+        val (vendor, arch) = classifySocAndVendor(socSignature = soc)
+        return "$arch (${vendor.displayName})"
+    }
+
     fun detectHardwareProfile(): NpuHardwareProfile {
         cachedProfile?.let { return it }
 
