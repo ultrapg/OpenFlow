@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.20.3] - 2026-11-14
+
+### Fixed
+- **Recording Bubble Animation (`overlay/BubbleOverlayComponent`):** Removed the blinking indicator dot (`liveDotAlpha` / `5.dp` circle) from `RecordingBarsComponent`, leaving the clean centered voice equalizer bars and stop icon intact.
+
 ## [2.20.2] - 2026-11-14
 
 ### Fixed

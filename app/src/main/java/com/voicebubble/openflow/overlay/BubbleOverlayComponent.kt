@@ -19,13 +19,9 @@ package com.voicebubble.openflow.overlay
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -591,17 +587,6 @@ fun RecordingBarsComponent(
     val maxBarHeight = (bubbleSize * 0.48f).coerceAtLeast(16f)
     val minBarHeight = (bubbleSize * 0.14f).coerceAtLeast(5f)
 
-    val pulseTransition = rememberInfiniteTransition(label = "recPulse")
-    val liveDotAlpha by pulseTransition.animateFloat(
-        initialValue = 0.45f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 700, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "recDotAlpha"
-    )
-
     val barSpring = spring<androidx.compose.ui.unit.Dp>(
         dampingRatio = Spring.DampingRatioMediumBouncy,
         stiffness = Spring.StiffnessMedium
@@ -633,13 +618,6 @@ fun RecordingBarsComponent(
         horizontalArrangement = Arrangement.Center,
         modifier = Modifier.fillMaxSize()
     ) {
-        Box(
-            modifier = Modifier
-                .size(5.dp)
-                .clip(CircleShape)
-                .background(contentColor.copy(alpha = liveDotAlpha))
-        )
-        Spacer(modifier = Modifier.width(6.dp))
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(3.dp)
