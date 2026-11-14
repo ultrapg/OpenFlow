@@ -101,6 +101,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.speech.LlmBenchmarkResult
 import com.voicebubble.openflow.core.speech.LlmSinglePassMetrics
@@ -733,46 +734,37 @@ fun SpeechRecognitionSettingsSection(
                         .fillMaxWidth()
                         .clickable { aiSectionExpanded = !aiSectionExpanded }
                         .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.AutoAwesome,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp)
+                        Text(
+                            text = "AI Post-Processing & Formatting",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "AI Post-Processing & Formatting",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "Instant Engine, offline LiteRT-LM models & OpenAI API",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
+                        Text(
+                            text = "Instant Engine, offline LiteRT-LM models & OpenAI API",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         Surface(
                             shape = RoundedCornerShape(10.dp),
                             color = when {
                                 isAiActive -> MaterialTheme.colorScheme.primaryContainer
                                 settings.formattingEngineEnabled -> MaterialTheme.colorScheme.secondaryContainer
                                 else -> MaterialTheme.colorScheme.surface
-                            }
+                            },
+                            modifier = Modifier.padding(top = 2.dp)
                         ) {
                             Text(
                                 text = settings.aiSectionSummaryLabel,
@@ -783,15 +775,17 @@ fun SpeechRecognitionSettingsSection(
                                     settings.formattingEngineEnabled -> MaterialTheme.colorScheme.onSecondaryContainer
                                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                                 },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                             )
                         }
-                        Icon(
-                            imageVector = if (aiSectionExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                            contentDescription = if (aiSectionExpanded) "Collapse AI Post-Processing" else "Expand AI Post-Processing",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
                     }
+                    Icon(
+                        imageVector = if (aiSectionExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (aiSectionExpanded) "Collapse AI Post-Processing" else "Expand AI Post-Processing",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
 
                 AnimatedVisibility(visible = aiSectionExpanded) {

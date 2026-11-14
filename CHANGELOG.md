@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.20.2] - 2026-11-14
+
+### Fixed
+- **Collapsed AI Post-Processing Card Layout Overflow (`ui/settings/SpeechRecognitionSettingsSection`):** Moved the status badge pill inside the weighted header column below the subtitle with `maxLines = 1` + `TextOverflow.Ellipsis`, preventing long OpenAI API model IDs (e.g., `Noris/vllm/release/gemma-4-31b-it`) from starving the title column to zero width and stretching the collapsed card vertically.
+
 ## [2.20.1] - 2026-11-14
 
 ### Fixed
