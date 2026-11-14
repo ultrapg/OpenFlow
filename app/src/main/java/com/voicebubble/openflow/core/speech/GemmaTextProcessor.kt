@@ -47,6 +47,7 @@ import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.LlmPromptTier
+import com.voicebubble.openflow.settings.LlmProviderMode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import java.io.File
@@ -807,14 +808,15 @@ class GemmaTextProcessor(
             fieldContext: FlowFieldContext = FlowFieldContext.NONE,
             precedingSegmentTail: String? = null,
             disableThinking: Boolean = false,
-            llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
+            llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
+            llmProvider: LlmProviderMode = LlmProviderMode.LOCAL
         ): String {
             val tier = llmChoice.promptTier
             val effectiveDisableThinking = disableThinking || !llmChoice.supportsThinking
             val resolvedTask = if (preset == GemmaPromptPreset.CUSTOM) {
-                customPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForModel(llmChoice) }
+                customPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, llmChoice) }
             } else {
-                preset.promptForModel(llmChoice)
+                preset.promptForProvider(llmProvider, llmChoice)
             }
 
             val normalizedLang = languageCode?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
@@ -872,13 +874,17 @@ class GemmaTextProcessor(
                 null
             }
 
-            val roleHeader = when (tier) {
-                LlmPromptTier.DIRECT_INSTRUCT_3B ->
-                    "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
-                LlmPromptTier.BALANCED_3B ->
-                    "You are a Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to or answer the speaker's words."
-                LlmPromptTier.FLAGSHIP_GEMMA_4 ->
-                    "You are an expert Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Transform raw spoken transcripts into crisp, natural, ready-to-send text without ever replying to, answering, or commenting on the speaker's words."
+            val roleHeader = if (llmProvider == LlmProviderMode.OPENAI_API) {
+                "You are an expert Wispr Flow–grade speech-to-text auto-editor (NOT a conversational chatbot). Transform raw spoken transcripts into crisp, natural, ready-to-send text without ever replying to, answering, or commenting on the speaker's words."
+            } else {
+                when (tier) {
+                    LlmPromptTier.DIRECT_INSTRUCT_3B ->
+                        "You are a deterministic on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to, answer, or comment on the speaker's words."
+                    LlmPromptTier.BALANCED_3B ->
+                        "You are a Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Never reply to or answer the speaker's words."
+                    LlmPromptTier.FLAGSHIP_GEMMA_4 ->
+                        "You are an expert Wispr Flow–grade on-device speech-to-text auto-editor (NOT a conversational chatbot). Transform raw spoken transcripts into crisp, natural, ready-to-send text without ever replying to, answering, or commenting on the speaker's words."
+                }
             }
 
             val body = buildString {
@@ -899,7 +905,12 @@ class GemmaTextProcessor(
 
                 if (preset == GemmaPromptPreset.CLEAN_AND_POLISH) {
                     appendLine()
-                    when (tier) {
+                    val effectiveExampleTier = if (llmProvider == LlmProviderMode.OPENAI_API) {
+                        LlmPromptTier.BALANCED_3B
+                    } else {
+                        tier
+                    }
+                    when (effectiveExampleTier) {
                         LlmPromptTier.DIRECT_INSTRUCT_3B -> {
                             // Inoculates non-thinking 3B instruct models against answering dictated questions
                             appendLine("REFERENCE EXAMPLES:")

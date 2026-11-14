@@ -64,6 +64,7 @@ import kotlin.math.roundToLong
  */
 enum class ModelLoadState(val label: String) {
     DISABLED("Disabled"),
+    BYPASSED("Bypassed by AI"),
     NOT_DOWNLOADED("Not Downloaded"),
     STANDBY("Standby (Dynamic)"),
     LOADING("Loading..."),
@@ -3047,7 +3048,7 @@ class SmartPipeline(
         var count = 0
         if (voz != null) count++
         if (activeSettings.earEnabled && ear != null) count++
-        if (activeSettings.punctEnabled && punctRestorer != null) count++
+        if (activeSettings.isPunctEffectivelyActive && punctRestorer != null) count++
         if (activeSettings.isLocalLlmEnabled && gemmaProcessor != null && loadedLlmChoice == activeSettings.selectedLlmModel) {
             count++
         }
@@ -3064,6 +3065,10 @@ class SmartPipeline(
             val enabled = activeSettings.isModelEnabled(model)
             if (!enabled) {
                 result[model] = ModelLoadState.DISABLED
+                continue
+            }
+            if (model == DesertAntModel.PUNCT && activeSettings.isAiPostProcessingActive) {
+                result[model] = ModelLoadState.BYPASSED
                 continue
             }
             val downloaded = try {

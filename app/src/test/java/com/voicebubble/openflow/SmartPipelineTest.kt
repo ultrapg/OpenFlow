@@ -3559,4 +3559,54 @@ class SmartPipelineTest {
         assertEquals(null, single.chunkFraction)
         assertEquals("Formatting · API", single.toDisplayString())
     }
+
+    @Test
+    fun `OpenAI API uses provider-neutral prompts and accurately marks Punct as bypassed`() {
+        val localModelTags = listOf("Gemma", "Qwen", "Granite", "LiteRT-LM", "Voz")
+        for (preset in com.voicebubble.openflow.settings.GemmaPromptPreset.entries) {
+            val apiTask = preset.promptForProvider(
+                provider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API,
+                llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
+            )
+            for (tag in localModelTags) {
+                assertFalse(
+                    "OpenAI API preset ${preset.id} must not leak local model reference '$tag'",
+                    apiTask.contains(tag, ignoreCase = true)
+                )
+            }
+        }
+
+        val apiSystemInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
+            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
+            disableThinking = true,
+            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API
+        )
+        assertFalse(apiSystemInstruction.contains("Gemma", ignoreCase = true))
+        assertFalse(apiSystemInstruction.contains("on-device", ignoreCase = true))
+
+        val punctWithOpenAiApi = ModelSettings(
+            punctEnabled = true,
+            gemmaEnabled = true,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API,
+            openAiBaseUrl = "https://api.openai.com/v1",
+            openAiModel = "gpt-4o-mini"
+        )
+        assertTrue(punctWithOpenAiApi.isAiPostProcessingActive)
+        assertFalse(punctWithOpenAiApi.isPunctEffectivelyActive)
+        assertEquals(
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH.defaultSystemPrompt,
+            punctWithOpenAiApi.resolvedGemmaTaskInstruction()
+        )
+
+        // Incomplete OpenAI API setup does not bypass Punct yet
+        val punctWithIncompleteApi = punctWithOpenAiApi.copy(openAiModel = "")
+        assertFalse(punctWithIncompleteApi.isAiPostProcessingActive)
+        assertTrue(punctWithIncompleteApi.isPunctEffectivelyActive)
+
+        // Punct alone with AI disabled is effectively active
+        val punctOnly = ModelSettings(punctEnabled = true, gemmaEnabled = false)
+        assertFalse(punctOnly.isAiPostProcessingActive)
+        assertTrue(punctOnly.isPunctEffectivelyActive)
+    }
 }

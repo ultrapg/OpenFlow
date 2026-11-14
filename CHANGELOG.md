@@ -2,6 +2,16 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.20.1] - 2026-11-14
+
+### Fixed
+- **Collapsible Active System Instruction Preview & OpenAI API Prompt Neutrality (`ui/settings/SpeechRecognitionSettingsSection`, `settings/ModelSettings`, `core/speech/GemmaTextProcessor`):**
+  - Made the *Active System Instruction* preview under *System Prompt Preset* collapsible and **collapsed by default** so it no longer expands into a long inline text block across Settings.
+  - Added provider-aware prompt selection (`GemmaPromptPreset.promptForProvider(...)`) so selecting **OpenAI-Compatible API** displays and sends a provider-neutral instruction without local model names (`Gemma`, `Qwen`, `Granite`, `LiteRT-LM`, `Voz`) or on-device wording.
+- **Model Storage Management Spacing & Bypassed `Punct` Status (`ui/settings/SpeechRecognitionSettingsSection`, `core/speech/SmartPipeline`):**
+  - Added horizontal spacing (`12.dp`) and compact button padding between model status text and the **Delete** button in *Model Storage Management* so status strings no longer touch the button border.
+  - Added `ModelLoadState.BYPASSED` and updated *Model Storage Management*, *Desert Ant Audio Models*, and live status pills to accurately display `Punct` as **Bypassed by OpenAI API** / **Bypassed by AI** (instead of `Active`) when AI post-processing handles formatting.
+
 ## [2.20.0] - 2026-11-14
 
 ### Added

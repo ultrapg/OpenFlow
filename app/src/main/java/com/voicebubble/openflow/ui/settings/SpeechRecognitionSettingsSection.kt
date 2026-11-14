@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -655,10 +656,13 @@ fun SpeechRecognitionSettingsSection(
                 HorizontalDivider()
 
                 // Punct (Off by default)
-                val punctSubtitle = if (settings.gemmaEnabled) {
-                    "Automatically bypassed & kept out of RAM while ${settings.selectedLlmModel.shortLabel} is active"
-                } else {
-                    DesertAntModel.PUNCT.roleSummary
+                val punctSubtitle = when {
+                    settings.isOpenAiApiEnabled ->
+                        "Automatically bypassed & kept out of RAM while OpenAI API (${settings.openAiModel.trim()}) is active"
+                    settings.isLocalLlmEnabled ->
+                        "Automatically bypassed & kept out of RAM while ${settings.selectedLlmModel.shortLabel} is active"
+                    else ->
+                        DesertAntModel.PUNCT.roleSummary
                 }
                 ModelToggleItem(
                     title = "Punct — Text & Punctuation Cleanup (${DesertAntModel.PUNCT.sizeMb} MB)",
@@ -712,7 +716,7 @@ fun SpeechRecognitionSettingsSection(
 
         // 3b. AI Post-Processing & Formatting (Collapsed by default • Instant Engine, Local AI, or OpenAI API)
         var aiSectionExpanded by rememberSaveable { mutableStateOf(false) }
-        val isAiActive = settings.isOpenAiApiEnabled || settings.isLocalLlmEnabled
+        val isAiActive = settings.isAiPostProcessingActive
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -1086,7 +1090,7 @@ fun SpeechRecognitionSettingsSection(
                                     persistAndReload(settings.copy(gemmaCustomPrompt = updatedText))
                                 },
                                 label = { Text("Custom System Prompt") },
-                                placeholder = { Text(GemmaPromptPreset.CUSTOM.promptForModel(selectedLlm)) },
+                                placeholder = { Text(GemmaPromptPreset.CUSTOM.promptForProvider(settings.llmProvider, selectedLlm)) },
                                 minLines = 3,
                                 maxLines = 8,
                                 modifier = Modifier.fillMaxWidth()
@@ -1126,50 +1130,86 @@ fun SpeechRecognitionSettingsSection(
                                 }
                             }
                         } else {
-                            val activeOptimizedPrompt = settings.gemmaPromptPreset.promptForModel(selectedLlm)
+                            val activeOptimizedPrompt = settings.gemmaPromptPreset.promptForProvider(
+                                settings.llmProvider,
+                                selectedLlm
+                            )
+                            var instructionPreviewExpanded by rememberSaveable { mutableStateOf(false) }
+                            val instructionHeaderTitle = if (settings.llmProvider == LlmProviderMode.OPENAI_API) {
+                                "Active System Instruction (${settings.gemmaPromptPreset.shortLabel})"
+                            } else {
+                                "Active System Instruction (${selectedLlm.title})"
+                            }
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
                                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Column(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Text(
-                                        text = if (settings.llmProvider == LlmProviderMode.OPENAI_API) {
-                                            "Active System Instruction:"
-                                        } else {
-                                            "Active System Instruction (Optimized for ${selectedLlm.title}):"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                    Text(
-                                        text = activeOptimizedPrompt,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    OutlinedButton(
-                                        onClick = {
-                                            customPromptDraft = activeOptimizedPrompt
-                                            persistAndReload(
-                                                settings.copy(
-                                                    gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
-                                                    gemmaCustomPrompt = activeOptimizedPrompt
-                                                )
-                                            )
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { instructionPreviewExpanded = !instructionPreviewExpanded }
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .padding(end = 8.dp)
+                                        ) {
+                                            Text(
+                                                text = instructionHeaderTitle,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                            if (!instructionPreviewExpanded) {
+                                                Text(
+                                                    text = "Tap to view or copy active prompt",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
                                         Icon(
-                                            imageVector = Icons.Default.ContentCopy,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(16.dp)
+                                            imageVector = if (instructionPreviewExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                            contentDescription = if (instructionPreviewExpanded) "Collapse system instruction" else "Expand system instruction",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("Copy & Edit as Custom Prompt")
+                                    }
+                                    AnimatedVisibility(visible = instructionPreviewExpanded) {
+                                        Column(
+                                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = activeOptimizedPrompt,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            OutlinedButton(
+                                                onClick = {
+                                                    customPromptDraft = activeOptimizedPrompt
+                                                    persistAndReload(
+                                                        settings.copy(
+                                                            gemmaPromptPreset = GemmaPromptPreset.CUSTOM,
+                                                            gemmaCustomPrompt = activeOptimizedPrompt
+                                                        )
+                                                    )
+                                                },
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.ContentCopy,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Copy & Edit as Custom Prompt")
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1350,6 +1390,7 @@ fun SpeechRecognitionSettingsSection(
                 storageModels.forEach { model ->
                     val isDownloaded = downloadedStatusMap[model] == true
                     val isEnabled = settings.isModelEnabled(model)
+                    val isBypassedByAi = model == DesertAntModel.PUNCT && isEnabled && settings.isAiPostProcessingActive
                     val canDelete = !model.isRequired && !isEnabled && isDownloaded
 
                     Row(
@@ -1357,7 +1398,7 @@ fun SpeechRecognitionSettingsSection(
                             .fillMaxWidth()
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
@@ -1370,6 +1411,11 @@ fun SpeechRecognitionSettingsSection(
                             val sizeLabel = if (model.isLlmModel) model.sizeGbLabel else "${model.sizeMb} MB"
                             val statusText = when {
                                 model.isRequired && isDownloaded -> "Downloaded • $sizeLabel (Required$ramTag)"
+                                isDownloaded && isBypassedByAi -> if (settings.isOpenAiApiEnabled) {
+                                    "Downloaded • $sizeLabel (Bypassed by OpenAI API)"
+                                } else {
+                                    "Downloaded • $sizeLabel (Bypassed by AI)"
+                                }
                                 isDownloaded && isEnabled -> "Downloaded • $sizeLabel (Active$ramTag)"
                                 isDownloaded && !isEnabled -> "Downloaded • $sizeLabel (Inactive)"
                                 else -> "Not downloaded ($sizeLabel)"
@@ -1393,7 +1439,8 @@ fun SpeechRecognitionSettingsSection(
                                 onClick = {
                                     DesertAntModelStorage.deleteModelCache(context, model)
                                     storageRefreshTick++
-                                }
+                                },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.DeleteOutline,
@@ -1401,7 +1448,7 @@ fun SpeechRecognitionSettingsSection(
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Delete")
+                                Text("Delete", maxLines = 1)
                             }
                         }
                     }
@@ -1591,7 +1638,9 @@ private fun ModelStatusChip(
             MaterialTheme.colorScheme.onErrorContainer,
             MaterialTheme.colorScheme.error
         )
-        ModelLoadState.DISABLED, ModelLoadState.NOT_DOWNLOADED -> Triple(
+        ModelLoadState.DISABLED,
+        ModelLoadState.BYPASSED,
+        ModelLoadState.NOT_DOWNLOADED -> Triple(
             MaterialTheme.colorScheme.surface.copy(alpha = 0.45f),
             MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
             MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)

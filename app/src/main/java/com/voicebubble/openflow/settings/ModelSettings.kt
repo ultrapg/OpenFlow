@@ -350,7 +350,7 @@ enum class GemmaPromptPreset(
 1. Self-corrections & backtracks: When the speaker retracts or revises words mid-thought ('wait', 'no wait', 'wait no', 'actually', 'actually sorry', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'oder nein', 'ich meine', 'besser gesagt'), delete BOTH the abandoned phrase and the repair cue, keeping ONLY the final intended wording. Keep genuine contrasts ('not X, but Y').
 2. Fillers, stutters & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word stutters ('the the', 'I I'), false starts, and hesitation 'like' / 'you know' / 'sort of' (never remove literal uses like 'I like this' or 'looks like'). Repair false mid-sentence pause periods, capitalization, and punctuation; keep spoken questions as questions.
 3. Vertical numbered & bulleted lists: Format spoken enumerations ('number one... number two... number three...', 'first... second... third...', 'one... two... three...', 'point one... point two...', 'item one... item two...', 'erstens... zweitens...', 'punkt eins... punkt zwei...') with a colon ':' on any lead-in clause (replacing spoken 'colon' / 'doppelpunkt') and put EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' (stripping the spoken cue). Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
-4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and model names ('Qwen3 4B', 'Gemma 4 E2B'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
+4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and product/model names ('Pixel 10', 'GPT-4o'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
 5. Paragraphs, emails & tech casing: Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') removing the cue, format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev'), capitalize technical terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'camelCase', 'snake_case'), and separate spoken greetings/sign-offs without inventing unspoken ones."""
     ),
     STRICT_CLEANUP(
@@ -451,6 +451,19 @@ enum class GemmaPromptPreset(
 3. Format all numbers with units ('0 MB', '6 GB', '380 ms', '5 minutes'), percentages, currencies, dates, times, version numbers, model names, spoken emails, and technical acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API') accurately."""
             CUSTOM -> defaultSystemPrompt
         }
+    }
+
+    /**
+     * Returns the task instruction appropriate for [provider]: provider-neutral generic instructions
+     * for [LlmProviderMode.OPENAI_API], or local-model-tuned instructions via [promptForModel] for
+     * [LlmProviderMode.LOCAL].
+     */
+    fun promptForProvider(
+        provider: LlmProviderMode,
+        llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
+    ): String = when (provider) {
+        LlmProviderMode.LOCAL -> promptForModel(llmChoice)
+        LlmProviderMode.OPENAI_API -> defaultSystemPrompt
     }
 
     companion object {
@@ -555,6 +568,14 @@ data class ModelSettings(
             openAiBaseUrl.isNotBlank() &&
             openAiModel.isNotBlank()
 
+    /** `true` when either a local LiteRT-LM model or a configured OpenAI-compatible API handles post-processing. */
+    val isAiPostProcessingActive: Boolean
+        get() = isLocalLlmEnabled || isOpenAiApiEnabled
+
+    /** `true` when local `Punct` is enabled and not bypassed by an active AI post-processor. */
+    val isPunctEffectivelyActive: Boolean
+        get() = punctEnabled && !isAiPostProcessingActive
+
     /** Concise status badge text for the collapsed AI Post-Processing card header. */
     val aiSectionSummaryLabel: String
         get() = when {
@@ -566,14 +587,14 @@ data class ModelSettings(
         }
 
     /**
-     * Resolves the active model-optimized task instruction based on [selectedLlmModel],
+     * Resolves the active provider/model task instruction based on [llmProvider], [selectedLlmModel],
      * [gemmaPromptPreset], and [gemmaCustomPrompt].
      */
     fun resolvedGemmaTaskInstruction(): String {
         return if (gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
-            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForModel(selectedLlmModel) }
+            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, selectedLlmModel) }
         } else {
-            gemmaPromptPreset.promptForModel(selectedLlmModel)
+            gemmaPromptPreset.promptForProvider(llmProvider, selectedLlmModel)
         }
     }
 

@@ -19,6 +19,7 @@ package com.voicebubble.openflow.core.speech
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.settings.GemmaPromptPreset
 import com.voicebubble.openflow.settings.LlmModelChoice
+import com.voicebubble.openflow.settings.LlmProviderMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -376,7 +377,8 @@ object OpenAiCompatibleClient {
                 preset = GemmaPromptPreset.CLEAN_AND_POLISH,
                 languageCode = "en",
                 disableThinking = true,
-                llmChoice = LlmModelChoice.GEMMA_4_E2B
+                llmChoice = LlmModelChoice.GEMMA_4_E2B,
+                llmProvider = LlmProviderMode.OPENAI_API
             )
             val sampleInput = "um hey sarah lets meet at three thirty pm"
             val userPrompt = GemmaTextProcessor.buildUserPrompt(sampleInput, "en")
@@ -512,7 +514,8 @@ object OpenAiCompatibleClient {
             customVocabulary = customVocabulary,
             fieldContext = fieldContext,
             disableThinking = true,
-            llmChoice = LlmModelChoice.GEMMA_4_E2B
+            llmChoice = LlmModelChoice.GEMMA_4_E2B,
+            llmProvider = LlmProviderMode.OPENAI_API
         )
         val userPrompt = GemmaTextProcessor.buildUserPrompt(inputForPrompt, languageCode)
         val approxWords = inputForPrompt.split(Regex("\\s+")).count { it.isNotEmpty() }
