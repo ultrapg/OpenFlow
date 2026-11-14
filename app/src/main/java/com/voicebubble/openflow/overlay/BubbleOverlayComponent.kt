@@ -86,6 +86,13 @@ import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.ProcessingProgress
 import kotlin.math.max
 
+private const val IDLE_CORNER_RADIUS_RATIO = 0.34f
+private val BUBBLE_TONAL_ELEVATION = 3.dp
+private val BUBBLE_IDLE_SHADOW_ELEVATION = 4.dp
+
+private fun bubbleBorder(contentColor: Color): BorderStroke =
+    BorderStroke(1.dp, contentColor.copy(alpha = 0.14f))
+
 @Composable
 fun BubbleOverlayComponent(
     audioController: AudioRecordingController,
@@ -234,7 +241,7 @@ fun BubbleOverlayComponent(
 
     val cornerRadius by animateDpAsState(
         targetValue = when (bubbleState) {
-            OverlayBubbleState.IDLE -> (bubbleSize * 0.34f).dp
+            OverlayBubbleState.IDLE -> (bubbleSize * IDLE_CORNER_RADIUS_RATIO).dp
             else -> (bubbleSize * 0.50f).dp
         },
         animationSpec = spring(
@@ -264,7 +271,7 @@ fun BubbleOverlayComponent(
             isDragging -> 10.dp
             isPressed -> 2.dp
             bubbleState == OverlayBubbleState.PROCESSING -> 6.dp
-            else -> 4.dp
+            else -> BUBBLE_IDLE_SHADOW_ELEVATION
         },
         animationSpec = spring(stiffness = Spring.StiffnessMedium),
         label = "m3BubbleElevation"
@@ -350,9 +357,9 @@ fun BubbleOverlayComponent(
             shape = bubbleShape,
             color = containerColor,
             contentColor = contentColor,
-            tonalElevation = 3.dp,
+            tonalElevation = BUBBLE_TONAL_ELEVATION,
             shadowElevation = shadowElevation,
-            border = BorderStroke(1.dp, contentColor.copy(alpha = 0.14f))
+            border = bubbleBorder(contentColor)
         ) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -373,24 +380,11 @@ fun BubbleOverlayComponent(
                 ) { state ->
                     when (state) {
                         OverlayBubbleState.IDLE -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (isLoadingModels) {
-                                    CircularProgressIndicator(
-                                        color = contentColor.copy(alpha = 0.6f),
-                                        strokeWidth = 2.dp,
-                                        modifier = Modifier.size((bubbleSize * 0.68f).dp)
-                                    )
-                                }
-                                Icon(
-                                    imageVector = Icons.Rounded.Mic,
-                                    contentDescription = "Start dictation",
-                                    tint = contentColor,
-                                    modifier = Modifier.size((bubbleSize * 0.46f).dp)
-                                )
-                            }
+                            IdleBubbleContent(
+                                bubbleSize = bubbleSize,
+                                contentColor = contentColor,
+                                isLoadingModels = isLoadingModels
+                            )
                         }
 
                         OverlayBubbleState.RECORDING -> {
@@ -645,6 +639,64 @@ fun RecordingBarsComponent(
             contentDescription = "Stop recording",
             tint = contentColor,
             modifier = Modifier.size((bubbleSize * 0.38f).coerceIn(16f, 22f).dp)
+        )
+    }
+}
+
+/**
+ * Static preview of the idle floating bubble matching [BubbleOverlayComponent]'s
+ * Material 3 Expressive squircle geometry, border, elevation, and rounded mic icon.
+ */
+@Composable
+fun BubbleSizePreview(
+    bubbleSize: Float,
+    modifier: Modifier = Modifier
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val containerColor = colorScheme.primaryContainer
+    val contentColor = colorScheme.onPrimaryContainer
+    val shape = RoundedCornerShape((bubbleSize * IDLE_CORNER_RADIUS_RATIO).dp)
+
+    Surface(
+        modifier = modifier.size(bubbleSize.dp),
+        shape = shape,
+        color = containerColor,
+        contentColor = contentColor,
+        tonalElevation = BUBBLE_TONAL_ELEVATION,
+        shadowElevation = BUBBLE_IDLE_SHADOW_ELEVATION,
+        border = bubbleBorder(contentColor)
+    ) {
+        IdleBubbleContent(
+            bubbleSize = bubbleSize,
+            contentColor = contentColor,
+            contentDescription = null
+        )
+    }
+}
+
+@Composable
+private fun IdleBubbleContent(
+    bubbleSize: Float,
+    contentColor: Color,
+    isLoadingModels: Boolean = false,
+    contentDescription: String? = "Start dictation"
+) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        if (isLoadingModels) {
+            CircularProgressIndicator(
+                color = contentColor.copy(alpha = 0.6f),
+                strokeWidth = 2.dp,
+                modifier = Modifier.size((bubbleSize * 0.68f).dp)
+            )
+        }
+        Icon(
+            imageVector = Icons.Rounded.Mic,
+            contentDescription = contentDescription,
+            tint = contentColor,
+            modifier = Modifier.size((bubbleSize * 0.46f).dp)
         )
     }
 }

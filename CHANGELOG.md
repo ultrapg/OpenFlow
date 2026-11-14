@@ -2,6 +2,11 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.20.4] - 2026-11-14
+
+### Fixed
+- **Bubble Size Preview (`MainActivity`, `overlay/BubbleOverlayComponent`):** Replaced the outdated circular Holo-era mic preview (`CircleShape` + `ic_btn_speak_now`) with a shared `BubbleSizePreview` composable reusing `BubbleOverlayComponent`'s Material 3 Expressive squircle geometry (`0.34f` corner radius ratio), `3.dp` tonal / `4.dp` shadow elevation, `1.dp` translucent border, and `Icons.Rounded.Mic` icon inside a fixed `80.dp` preview slot so the slider track stays stationary while dragging.
+
 ## [2.20.3] - 2026-11-14
 
 ### Fixed

@@ -28,25 +28,23 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.permissions.*
 import com.voicebubble.openflow.core.accessibility.TextInjectionAccessibilityService
 import com.voicebubble.openflow.core.debug.DebugLogManager
 import com.voicebubble.openflow.core.speech.SmartPipeline
+import com.voicebubble.openflow.overlay.BubbleSizePreview
 import com.voicebubble.openflow.overlay.FloatingBubbleService
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.ModelSettings
@@ -532,20 +530,10 @@ class MainActivity : ComponentActivity() {
                                 )
 
                                 Box(
-                                    modifier = Modifier
-                                        .size(bubbleSize.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.primaryContainer),
+                                    modifier = Modifier.size(80.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(
-                                        painter = androidx.compose.ui.res.painterResource(
-                                            android.R.drawable.ic_btn_speak_now
-                                        ),
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                        modifier = Modifier.size((bubbleSize * 0.5f).dp)
-                                    )
+                                    BubbleSizePreview(bubbleSize = bubbleSize)
                                 }
                             }
 
