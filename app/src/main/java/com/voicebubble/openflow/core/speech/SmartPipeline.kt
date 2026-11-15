@@ -1982,6 +1982,47 @@ class SmartPipeline(
     }
 
     /**
+     * Releases any live native/LiteRT-LM handle for [model] before deleting its files on disk
+     * so memory-mapped descriptors close cleanly first. Returns `false` if a dictation is in progress.
+     */
+    suspend fun unloadModelForDeletion(model: DesertAntModel): Boolean = withContext(Dispatchers.Default) {
+        pipelineMutex.withLock {
+            if (isTranscribing || isRecordingActive) {
+                return@withLock false
+            }
+            var closedAny = false
+            when {
+                model == DesertAntModel.VOZ && voz != null -> {
+                    closeVozLocked()
+                    closedAny = true
+                }
+                model == DesertAntModel.EAR && ear != null -> {
+                    closeEarLocked()
+                    closedAny = true
+                }
+                model == DesertAntModel.PUNCT && punctRestorer != null -> {
+                    closePunctLocked()
+                    closedAny = true
+                }
+                model.isLlmModel && gemmaProcessor != null && loadedLlmChoice?.desertAntModel == model -> {
+                    closeGemmaLocked()
+                    closedAny = true
+                }
+            }
+            if (closedAny) {
+                System.gc()
+                val snap = settings
+                updateStatusSnapshot(
+                    activeSettings = snap,
+                    phaseOverride = if (hasAnyLoadedModelLocked()) null else PipelinePhase.UNINITIALIZED,
+                    messageOverride = if (hasAnyLoadedModelLocked()) null else standbyStatusMessageLocked(snap)
+                )
+            }
+            true
+        }
+    }
+
+    /**
      * Asynchronous fire-and-forget wrapper around [evictAllModels] for UI actions.
      */
     fun evictAllModelsAsync(reason: String = "manual unload") {

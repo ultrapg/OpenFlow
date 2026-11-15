@@ -761,6 +761,10 @@ data class ModelSettings(
     val effectiveOpenAiReasoningEffortValue: String?
         get() = LlmThinkingEffort.resolveApiValue(openAiThinkingEffort, openAiCustomReasoningEffort)
 
+    /** `true` when at least one remote/cloud OpenAI-compatible API stage (`Voz`, `Ear`, or LLM) is active. */
+    val hasAnyRemoteApiActive: Boolean
+        get() = isRemoteVozActive || isRemoteEarActive || isOpenAiApiEnabled
+
     /** `true` when local `Punct` is enabled and not bypassed by an active AI post-processor. */
     val isPunctEffectivelyActive: Boolean
         get() = punctEnabled && !isAiPostProcessingActive
@@ -823,6 +827,25 @@ data class ModelSettings(
         DesertAntModel.GRANITE_4_2_3B,
         DesertAntModel.QWEN3_4B,
         DesertAntModel.GEMMA_4_E2B -> isLocalLlmEnabled && model == selectedLlmModel.desertAntModel
+    }
+
+    /**
+     * `true` when [model] is currently required locally (`Voz` when Remote Voz API is not active).
+     * When Remote Voz API is connected (`isRemoteVozActive == true`), local `Voz` is no longer
+     * required and can be deleted cleanly to reclaim 1.18 GB.
+     */
+    fun isModelLocallyRequired(model: DesertAntModel): Boolean =
+        model == DesertAntModel.VOZ && !isRemoteVozActive
+
+    /**
+     * `true` when any cached files for [model] can safely be deleted without breaking the active
+     * configuration (including local `Voz` when Remote Voz API is active, bypassed `Punct` when AI
+     * post-processing handles formatting, or any disabled/inactive model).
+     */
+    fun canDeleteModel(model: DesertAntModel): Boolean = when {
+        isModelLocallyRequired(model) -> false
+        model == DesertAntModel.PUNCT -> !isModelEnabled(model) || isAiPostProcessingActive
+        else -> !isModelEnabled(model)
     }
 
     val autoUnloadSummary: String
@@ -1516,29 +1539,98 @@ object DesertAntModelStorage {
     }
 
     /**
-     * Deletes cached files on disk for a non-required model (`Ear`).
-     * `Voz` is locked and cannot be deleted.
+     * Total bytes currently occupied on disk by [model] under `desert-ant-models/<id>` (including
+     * partial `.part` downloads) plus any compiled `litert_llm_cache/<llm>` artifacts for LLMs.
      */
-    fun deleteModelCache(context: Context, model: DesertAntModel): Boolean {
-        if (model.isRequired) return false
-        val revDir = modelRevisionDir(context, model)
-        directoryCompleteCache.remove(revDir.absolutePath)
-        val root = modelCacheRoot(context, model)
-        return if (root.exists()) {
-            root.deleteRecursively()
-        } else {
-            true
+    fun modelCacheDirectoryBytes(context: Context, model: DesertAntModel): Long {
+        val modelRoot = modelCacheRoot(context, model)
+        var totalBytes = computeDirectoryBytes(modelRoot)
+        if (model.isLlmModel) {
+            val llmChoice = LlmModelChoice.fromDesertAntModel(model)
+            if (llmChoice != null) {
+                val compilerCacheDir = File(context.applicationContext.cacheDir, "litert_llm_cache/${llmChoice.id}")
+                totalBytes += computeDirectoryBytes(compilerCacheDir)
+            }
+        }
+        return totalBytes
+    }
+
+    internal fun computeDirectoryBytes(dir: File): Long {
+        if (!dir.exists()) return 0L
+        return try {
+            dir.walkTopDown()
+                .filter { it.isFile }
+                .sumOf { it.length() }
+        } catch (_: Throwable) {
+            0L
         }
     }
 
     /**
-     * Deletes all downloaded optional models that are currently toggled OFF in [settings].
+     * Reliably deletes [targetDir] and (if provided) [extraCacheDir], clearing cached directory-check
+     * state and recovering from read-only files if needed. Returns `true` only once [targetDir]
+     * no longer exists on disk.
+     */
+    internal fun deleteModelDirectoryTree(targetDir: File, extraCacheDir: File? = null): Boolean {
+        val targetPrefix = targetDir.absolutePath
+        directoryCompleteCache.keys.removeAll { it == targetPrefix || it.startsWith("$targetPrefix/") || it.startsWith("$targetPrefix\\") }
+
+        fun forceDelete(dir: File): Boolean {
+            if (!dir.exists()) return true
+            return try {
+                if (!dir.deleteRecursively() && dir.exists()) {
+                    dir.walkBottomUp().forEach { entry ->
+                        runCatching {
+                            entry.setWritable(true)
+                            entry.delete()
+                        }
+                    }
+                }
+                !dir.exists()
+            } catch (_: Throwable) {
+                !dir.exists()
+            }
+        }
+
+        val primaryDeleted = forceDelete(targetDir)
+        if (extraCacheDir != null) {
+            forceDelete(extraCacheDir)
+        }
+        return primaryDeleted && !targetDir.exists()
+    }
+
+    /**
+     * Deletes cached files on disk for [model] (plus compiled LiteRT-LM cache for LLMs).
+     * Local `Voz` is blocked unless [allowRequired] is `true` (e.g. when Remote Voz API is active).
+     */
+    fun deleteModelCache(
+        context: Context,
+        model: DesertAntModel,
+        allowRequired: Boolean = false
+    ): Boolean {
+        if (model.isRequired && !allowRequired) return false
+        val root = modelCacheRoot(context, model)
+        val extraCompilerCache = if (model.isLlmModel) {
+            LlmModelChoice.fromDesertAntModel(model)?.let {
+                File(context.applicationContext.cacheDir, "litert_llm_cache/${it.id}")
+            }
+        } else {
+            null
+        }
+        return deleteModelDirectoryTree(root, extraCompilerCache)
+    }
+
+    /**
+     * Deletes all downloaded or partially cached models that are safe to remove under [settings]
+     * (`canDeleteModel`, including local `Voz` when Remote Voz API is active, bypassed `Punct` when
+     * AI post-processing is active, and any disabled or partial caches).
      */
     fun deleteAllInactiveModels(context: Context, settings: ModelSettings): Int {
         var deletedCount = 0
         for (model in DesertAntModel.entries) {
-            if (!model.isRequired && !settings.isModelEnabled(model) && isModelDownloaded(context, model)) {
-                if (deleteModelCache(context, model)) {
+            val onDisk = isModelDownloaded(context, model) || modelCacheDirectoryBytes(context, model) > 0L
+            if (settings.canDeleteModel(model) && onDisk) {
+                if (deleteModelCache(context, model, allowRequired = true)) {
                     deletedCount++
                 }
             }

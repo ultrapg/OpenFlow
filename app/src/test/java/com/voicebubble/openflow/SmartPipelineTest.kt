@@ -3828,4 +3828,68 @@ class SmartPipelineTest {
         )
         assertEquals(1400, startupHybridLocalVozCloudLlm.plannedPeakRamMb())
     }
+
+    @Test
+    fun `ModelSettings allows deleting Voz and bypassed Punct when Cloud APIs are connected, and directory cleanup deletes model and LiteRT cache trees`() {
+        val defaults = ModelSettings()
+        assertTrue(defaults.isModelLocallyRequired(com.voicebubble.openflow.settings.DesertAntModel.VOZ))
+        assertFalse(defaults.canDeleteModel(com.voicebubble.openflow.settings.DesertAntModel.VOZ))
+        assertFalse(defaults.canDeleteModel(com.voicebubble.openflow.settings.DesertAntModel.EAR))
+        assertTrue(defaults.canDeleteModel(com.voicebubble.openflow.settings.DesertAntModel.PUNCT))
+        assertTrue(defaults.canDeleteModel(com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B))
+
+        // Remote Voz + Remote Ear + OpenAI API active (even if Punct toggle was left ON):
+        // every local model (including Voz and bypassed Punct) is safely deletable.
+        val remoteAll = defaults.copy(
+            earEnabled = true,
+            punctEnabled = true,
+            gemmaEnabled = true,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API,
+            openAiBaseUrl = "https://api.openai.com/v1",
+            openAiModel = "gpt-4o-mini",
+            remoteVozEnabled = true,
+            remoteVozBaseUrl = "https://api.openai.com/v1",
+            remoteVozModel = "whisper-1",
+            remoteEarEnabled = true,
+            remoteEarUseSameEndpoint = true,
+            remoteEarModel = "ear"
+        )
+        assertTrue(remoteAll.hasAnyRemoteApiActive)
+        assertFalse(remoteAll.isModelLocallyRequired(com.voicebubble.openflow.settings.DesertAntModel.VOZ))
+        com.voicebubble.openflow.settings.DesertAntModel.entries.forEach { model ->
+            assertTrue("Expected ${model.id} to be deletable when remote APIs are active", remoteAll.canDeleteModel(model))
+        }
+
+        // Verify byte calculation & recursive deletion (including read-only files & extra LiteRT compiler cache)
+        val tempRoot = java.nio.file.Files.createTempDirectory("openflow_model_delete_test").toFile()
+        try {
+            val modelDir = java.io.File(tempRoot, "desert-ant-models/gemma4_e2b/v1")
+            modelDir.mkdirs()
+            val weightsFile = java.io.File(modelDir, "gemma4.litertlm").apply {
+                writeBytes(ByteArray(2048))
+                setReadOnly()
+            }
+            val metaFile = java.io.File(java.io.File(modelDir, ".dal-meta"), "manifest").apply {
+                parentFile?.mkdirs()
+                writeText("DAL1\n")
+            }
+            val compilerCacheDir = java.io.File(tempRoot, "litert_llm_cache/gemma4_e2b").apply { mkdirs() }
+            java.io.File(compilerCacheDir, "compiled.xnn").writeBytes(ByteArray(1024))
+
+            val totalBytes = com.voicebubble.openflow.settings.DesertAntModelStorage.computeDirectoryBytes(modelDir) +
+                com.voicebubble.openflow.settings.DesertAntModelStorage.computeDirectoryBytes(compilerCacheDir)
+            assertEquals(2048L + metaFile.length() + 1024L, totalBytes)
+            assertTrue(weightsFile.exists())
+
+            val deleted = com.voicebubble.openflow.settings.DesertAntModelStorage.deleteModelDirectoryTree(
+                targetDir = java.io.File(tempRoot, "desert-ant-models/gemma4_e2b"),
+                extraCacheDir = compilerCacheDir
+            )
+            assertTrue(deleted)
+            assertFalse(java.io.File(tempRoot, "desert-ant-models/gemma4_e2b").exists())
+            assertFalse(compilerCacheDir.exists())
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
 }

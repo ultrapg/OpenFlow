@@ -593,22 +593,40 @@ object ModelDownloadManager {
                     }
                 }
             } catch (ce: CancellationException) {
-                val pausedStatuses = initialStatuses.mapValues { (_, st) ->
-                    if (st == ModelQueueStatus.DOWNLOADING || st == ModelQueueStatus.VERIFYING) {
-                        ModelQueueStatus.PAUSED
-                    } else {
-                        st
+                val cancelledForDeletion = cancellingForDeletionModel
+                cancellingForDeletionModel = null
+                if (cancelledForDeletion != null) {
+                    val cleanedStatuses = initialStatuses.toMutableMap().apply { remove(cancelledForDeletion) }
+                    updateState {
+                        copy(
+                            isRunning = false,
+                            isPaused = false,
+                            activeModel = null,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            statusNote = null,
+                            errorMessage = null,
+                            modelStatuses = cleanedStatuses
+                        )
                     }
-                }
-                updateState {
-                    copy(
-                        isRunning = false,
-                        isPaused = true,
-                        speedBytesPerSec = 0L,
-                        etaSeconds = null,
-                        statusNote = "Download paused — progress saved on disk. Tap Resume anytime.",
-                        modelStatuses = pausedStatuses
-                    )
+                } else {
+                    val pausedStatuses = initialStatuses.mapValues { (_, st) ->
+                        if (st == ModelQueueStatus.DOWNLOADING || st == ModelQueueStatus.VERIFYING) {
+                            ModelQueueStatus.PAUSED
+                        } else {
+                            st
+                        }
+                    }
+                    updateState {
+                        copy(
+                            isRunning = false,
+                            isPaused = true,
+                            speedBytesPerSec = 0L,
+                            etaSeconds = null,
+                            statusNote = "Download paused — progress saved on disk. Tap Resume anytime.",
+                            modelStatuses = pausedStatuses
+                        )
+                    }
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Model download failed: ${t.message}", t)
@@ -637,6 +655,49 @@ object ModelDownloadManager {
     fun pauseDownloads() {
         activeJob?.cancel()
         activeJob = null
+    }
+
+    @Volatile
+    private var cancellingForDeletionModel: DesertAntModel? = null
+
+    /**
+     * Cancels any active, paused, or queued download for [model] and returns its active job
+     * (if running) so callers can await clean termination before deleting files on disk.
+     */
+    @Synchronized
+    fun cancelModelDownload(model: DesertAntModel): Job? {
+        val isActiveModel = _sessionState.value.activeModel == model
+        val updatedQueue = synchronized(queueLock) {
+            pendingAutoEnable.remove(model)
+            activeQueue.remove(model)
+            pendingAutoEnable.toSet() to activeQueue.size
+        }
+        val cancelledJob = if (isActiveModel) {
+            cancellingForDeletionModel = model
+            activeJob?.also {
+                it.cancel()
+                activeJob = null
+            }
+        } else {
+            null
+        }
+        updateState {
+            val cleanedStatuses = modelStatuses.toMutableMap().apply { remove(model) }
+            copy(
+                isRunning = if (isActiveModel) false else isRunning,
+                isPaused = if (isActiveModel) false else isPaused,
+                activeModel = if (isActiveModel) null else activeModel,
+                totalModelsInQueue = updatedQueue.second,
+                pendingAutoEnableModels = updatedQueue.first,
+                modelStatuses = cleanedStatuses
+            )
+        }
+        return cancelledJob
+    }
+
+    suspend fun cancelModelDownloadAndWait(model: DesertAntModel) {
+        val job = cancelModelDownload(model)
+        job?.join()
     }
 
     /**

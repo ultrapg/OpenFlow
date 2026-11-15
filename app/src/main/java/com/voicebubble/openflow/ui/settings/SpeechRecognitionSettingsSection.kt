@@ -147,6 +147,9 @@ fun SpeechRecognitionSettingsSection(
     }
 
     val downloadedStatusMap = remember { mutableStateMapOf<DesertAntModel, Boolean>() }
+    val diskBytesMap = remember { mutableStateMapOf<DesertAntModel, Long>() }
+    var isDeletingStorage by remember { mutableStateOf(false) }
+    var storageActionFeedback by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(
         settings,
         storageRefreshTick,
@@ -154,18 +157,23 @@ fun SpeechRecognitionSettingsSection(
         downloadState.isCompleted,
         downloadState.pendingAutoEnableModels
     ) {
-        val (latestPersisted, status) = withContext(Dispatchers.IO) {
+        val (latestPersisted, status, bytes) = withContext(Dispatchers.IO) {
             val loaded = ModelSettings.load(context)
             val diskStatus = DesertAntModel.entries.associateWith { model ->
                 DesertAntModelStorage.isModelDownloaded(context, model)
             }
-            loaded to diskStatus
+            val diskBytes = DesertAntModel.entries.associateWith { model ->
+                DesertAntModelStorage.modelCacheDirectoryBytes(context, model)
+            }
+            Triple(loaded, diskStatus, diskBytes)
         }
         if (latestPersisted != settings) {
             onSettingsChanged(latestPersisted)
         }
         downloadedStatusMap.clear()
         downloadedStatusMap.putAll(status)
+        diskBytesMap.clear()
+        diskBytesMap.putAll(bytes)
         smartPipeline.refreshStatusSnapshotAsync()
     }
     val downloadedCount = downloadedStatusMap.values.count { it }
@@ -174,6 +182,67 @@ fun SpeechRecognitionSettingsSection(
         ModelSettings.save(context, updated)
         onSettingsChanged(updated)
         smartPipeline.reloadSettingsAsync(updated)
+    }
+
+    val deleteLocalModelsSafely: (List<DesertAntModel>) -> Unit = { requestedTargets ->
+        if (!isDeletingStorage && requestedTargets.isNotEmpty()) {
+            scope.launch {
+                isDeletingStorage = true
+                storageActionFeedback = null
+                try {
+                    val deletedModels = mutableListOf<DesertAntModel>()
+                    var freedBytes = 0L
+                    var blockedByActiveDictation = false
+
+                    requestedTargets.forEach { target ->
+                        ModelDownloadManager.cancelModelDownloadAndWait(target)
+                    }
+
+                    withContext(Dispatchers.IO) {
+                        requestedTargets.forEach { model ->
+                            val unloaded = smartPipeline.unloadModelForDeletion(model)
+                            if (!unloaded) {
+                                blockedByActiveDictation = true
+                            } else {
+                                val bytesBefore = maxOf(
+                                    DesertAntModelStorage.modelCacheDirectoryBytes(context, model),
+                                    diskBytesMap[model] ?: 0L
+                                )
+                                if (DesertAntModelStorage.deleteModelCache(context, model, allowRequired = true)) {
+                                    deletedModels.add(model)
+                                    freedBytes += bytesBefore
+                                }
+                            }
+                        }
+                        DesertAntModelStorage.cleanupLegacyRemovedModels(context)
+                    }
+
+                    if (DesertAntModel.PUNCT in deletedModels && settings.punctEnabled) {
+                        persistAndReload(settings.copy(punctEnabled = false))
+                    } else {
+                        smartPipeline.refreshStatusSnapshotAsync()
+                    }
+
+                    storageRefreshTick++
+                    storageActionFeedback = when {
+                        deletedModels.isNotEmpty() -> {
+                            val freedLabel = formatStorageBytesLabel(freedBytes)
+                            if (deletedModels.size == 1) {
+                                "Deleted ${deletedModels.first().shortLabel} ($freedLabel freed)."
+                            } else {
+                                "Deleted ${deletedModels.size} local models ($freedLabel freed)."
+                            }
+                        }
+                        blockedByActiveDictation ->
+                            "Finish the active dictation before deleting loaded models."
+                        else ->
+                            "Could not remove cached model files from storage."
+                    }
+                } finally {
+                    isDeletingStorage = false
+                }
+            }
+        }
     }
 
     val handleOptionalToggle: (DesertAntModel, Boolean) -> Unit = { model, targetEnabled ->
@@ -648,6 +717,35 @@ fun SpeechRecognitionSettingsSection(
                     onResume = { handleOptionalToggle(DesertAntModel.VOZ, true) },
                     onCheckedChange = {}
                 )
+                if (!settings.isRemoteVozActive &&
+                    downloadedStatusMap[DesertAntModel.VOZ] == false &&
+                    downloadState.activeModel != DesertAntModel.VOZ
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            ModelDownloadManager.startQueue(
+                                context = context,
+                                models = listOf(DesertAntModel.VOZ),
+                                autoEnableOnComplete = false,
+                                onAllCompleted = {
+                                    storageRefreshTick++
+                                    val latest = ModelSettings.load(context)
+                                    onSettingsChanged(latest)
+                                    smartPipeline.reloadSettingsAsync(latest)
+                                }
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Download Local Voz (${DesertAntModel.VOZ.sizeMb} MB)")
+                    }
+                }
 
                 HorizontalDivider()
 
@@ -1430,7 +1528,8 @@ fun SpeechRecognitionSettingsSection(
                     add(DesertAntModel.PUNCT)
                     add(settings.selectedLlmModel.desertAntModel)
                     DesertAntModel.entries.forEach { candidate ->
-                        if (candidate.isLlmModel && downloadedStatusMap[candidate] == true && candidate !in this) {
+                        val hasCache = downloadedStatusMap[candidate] == true || (diskBytesMap[candidate] ?: 0L) > 0L
+                        if (candidate.isLlmModel && hasCache && candidate !in this) {
                             add(candidate)
                         }
                     }
@@ -1438,9 +1537,12 @@ fun SpeechRecognitionSettingsSection(
 
                 storageModels.forEach { model ->
                     val isDownloaded = downloadedStatusMap[model] == true
+                    val cachedBytes = diskBytesMap[model] ?: 0L
+                    val isOnDisk = isDownloaded || cachedBytes > 0L
                     val isEnabled = settings.isModelEnabled(model)
                     val isBypassedByAi = model == DesertAntModel.PUNCT && isEnabled && settings.isAiPostProcessingActive
-                    val canDelete = !model.isRequired && !isEnabled && isDownloaded
+                    val isLocallyRequired = settings.isModelLocallyRequired(model)
+                    val canDelete = settings.canDeleteModel(model) && isOnDisk
 
                     Row(
                         modifier = Modifier
@@ -1457,13 +1559,21 @@ fun SpeechRecognitionSettingsSection(
                             )
                             val loadState = pipelineStatus.modelStates[model]
                             val ramTag = if (loadState == ModelLoadState.LOADED) " • Loaded" else ""
-                            val sizeLabel = if (model.isLlmModel) model.sizeGbLabel else "${model.sizeMb} MB"
+                            val sizeLabel = if (isOnDisk && cachedBytes > 0L) {
+                                formatStorageBytesLabel(cachedBytes)
+                            } else if (model.isLlmModel) {
+                                model.sizeGbLabel
+                            } else {
+                                "${model.sizeMb} MB"
+                            }
                             val statusText = when {
                                 model == DesertAntModel.VOZ && settings.isRemoteVozActive ->
-                                    if (isDownloaded) "Downloaded • $sizeLabel (Remote Voz API active)" else "Using Remote Voz API ($sizeLabel saved)"
+                                    if (isOnDisk) "Downloaded • $sizeLabel (Unused — Remote Voz API active)" else "Using Remote Voz API (${model.sizeMb} MB saved)"
                                 model == DesertAntModel.EAR && settings.isRemoteEarActive ->
-                                    if (isDownloaded) "Downloaded • $sizeLabel (Remote Ear API active)" else "Using Remote Ear API"
-                                model.isRequired && isDownloaded -> "Downloaded • $sizeLabel (Required$ramTag)"
+                                    if (isOnDisk) "Downloaded • $sizeLabel (Unused — Remote Ear API active)" else "Using Remote Ear API (${model.sizeMb} MB saved)"
+                                isLocallyRequired && isOnDisk -> "Downloaded • $sizeLabel (Required$ramTag)"
+                                isLocallyRequired -> "Not downloaded (${model.sizeMb} MB • Required locally)"
+                                !isDownloaded && cachedBytes > 0L -> "Partial cache • $sizeLabel"
                                 isDownloaded && isBypassedByAi -> if (settings.isOpenAiApiEnabled) {
                                     "Downloaded • $sizeLabel (Bypassed by OpenAI API)"
                                 } else {
@@ -1471,7 +1581,7 @@ fun SpeechRecognitionSettingsSection(
                                 }
                                 isDownloaded && isEnabled -> "Downloaded • $sizeLabel (Active$ramTag)"
                                 isDownloaded && !isEnabled -> "Downloaded • $sizeLabel (Inactive)"
-                                else -> "Not downloaded ($sizeLabel)"
+                                else -> "Not downloaded (${if (model.isLlmModel) model.sizeGbLabel else "${model.sizeMb} MB"})"
                             }
                             Text(
                                 text = statusText,
@@ -1480,7 +1590,7 @@ fun SpeechRecognitionSettingsSection(
                             )
                         }
 
-                        if (model.isRequired) {
+                        if (isLocallyRequired) {
                             Icon(
                                 imageVector = Icons.Default.Lock,
                                 contentDescription = "Required",
@@ -1489,10 +1599,8 @@ fun SpeechRecognitionSettingsSection(
                             )
                         } else if (canDelete) {
                             OutlinedButton(
-                                onClick = {
-                                    DesertAntModelStorage.deleteModelCache(context, model)
-                                    storageRefreshTick++
-                                },
+                                enabled = !isDeletingStorage,
+                                onClick = { deleteLocalModelsSafely(listOf(model)) },
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                             ) {
                                 Icon(
@@ -1507,25 +1615,57 @@ fun SpeechRecognitionSettingsSection(
                     }
                 }
 
-                val hasInactiveDownloaded = DesertAntModel.entries.any { model ->
-                    !model.isRequired && !settings.isModelEnabled(model) && downloadedStatusMap[model] == true
+                val unusedModelsOnDisk = DesertAntModel.entries.filter { model ->
+                    val onDisk = downloadedStatusMap[model] == true || (diskBytesMap[model] ?: 0L) > 0L
+                    settings.canDeleteModel(model) && onDisk
+                }
+                val reclaimableBytes = unusedModelsOnDisk.sumOf { model ->
+                    maxOf(diskBytesMap[model] ?: 0L, if (downloadedStatusMap[model] == true) model.expectedBytes else 0L)
+                }
+
+                if (settings.hasAnyRemoteApiActive && unusedModelsOnDisk.isNotEmpty()) {
+                    Text(
+                        text = "Cloud / Remote API active — ${formatStorageBytesLabel(reclaimableBytes)} of replaced local models can be deleted safely.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
 
                 OutlinedButton(
-                    onClick = {
-                        DesertAntModelStorage.deleteAllInactiveModels(context, settings)
-                        storageRefreshTick++
-                    },
-                    enabled = hasInactiveDownloaded,
+                    onClick = { deleteLocalModelsSafely(unusedModelsOnDisk) },
+                    enabled = !isDeletingStorage && unusedModelsOnDisk.isNotEmpty(),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.DeleteOutline,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
+                    if (isDeletingStorage) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Deleting local models...")
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (unusedModelsOnDisk.isNotEmpty()) {
+                                "Delete all unused models (${formatStorageBytesLabel(reclaimableBytes)})"
+                            } else {
+                                "No unused local models on disk"
+                            }
+                        )
+                    }
+                }
+
+                if (storageActionFeedback != null) {
+                    Text(
+                        text = storageActionFeedback ?: "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Delete all inactive models")
                 }
 
                 Text(
@@ -2464,4 +2604,14 @@ private fun OpenAiApiEndpointSection(
             }
         )
     }
+}
+
+private fun formatStorageBytesLabel(bytes: Long): String {
+    if (bytes <= 0L) return "0 MB"
+    val gb = bytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+    if (gb >= 1.0) {
+        return String.format(Locale.US, "%.2f GB", gb)
+    }
+    val mb = (bytes.toDouble() / (1024.0 * 1024.0)).roundToInt().coerceAtLeast(1)
+    return "$mb MB"
 }
