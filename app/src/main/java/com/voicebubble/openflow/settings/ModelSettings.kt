@@ -529,6 +529,39 @@ enum class LlmProviderMode(val id: String, val title: String) {
 }
 
 /**
+ * Reasoning depth preference for thinking-capable LLMs.
+ * - [DEFAULT]: Uses the remote server / model default without forcing a `reasoning_effort` override.
+ * - [OFF]: Requests zero reasoning tokens (`reasoning_effort = "none"` when supported).
+ * - [LOW], [MEDIUM], [HIGH]: Scales reasoning token budgets proportionally.
+ */
+enum class LlmThinkingEffort(
+    val id: String,
+    val title: String,
+    val apiValue: String?,
+    val localBudgetScale: Float
+) {
+    DEFAULT("default", "Auto", null, 1.0f),
+    OFF("off", "Off", "none", 0.0f),
+    LOW("low", "Low", "low", 0.55f),
+    MEDIUM("medium", "Medium", "medium", 1.0f),
+    HIGH("high", "High", "high", 1.6f);
+
+    companion object {
+        val API_OPTIONS: List<LlmThinkingEffort> = entries
+        val LOCAL_OPTIONS: List<LlmThinkingEffort> = listOf(LOW, MEDIUM, HIGH)
+
+        fun fromId(id: String?): LlmThinkingEffort {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: DEFAULT
+        }
+
+        fun fromLocalId(id: String?): LlmThinkingEffort {
+            val parsed = fromId(id)
+            return if (parsed in LOCAL_OPTIONS) parsed else MEDIUM
+        }
+    }
+}
+
+/**
  * Immutable snapshot of user-configurable Desert Ant model settings persisted in SharedPreferences.
  */
 data class ModelSettings(
@@ -540,6 +573,8 @@ data class ModelSettings(
     val selectedLlmModel: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
     val gemmaDisableThinking: Boolean = selectedLlmModel.defaultDisableThinking,
     val gemmaAdaptiveThinking: Boolean = true,
+    val localThinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM,
+    val localLlmChunkingEnabled: Boolean = true,
     val gemmaPromptPreset: GemmaPromptPreset = GemmaPromptPreset.CLEAN_AND_POLISH,
     val gemmaCustomPrompt: String = "",
     val llmProvider: LlmProviderMode = LlmProviderMode.LOCAL,
@@ -547,15 +582,69 @@ data class ModelSettings(
     val openAiApiKey: String = "",
     val openAiModel: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_MODEL,
     val openAiTimeoutSeconds: Int = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_TIMEOUT_SECONDS,
+    val openAiThinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT,
+    val openAiChunkingEnabled: Boolean = false,
+    val remoteVozEnabled: Boolean = false,
+    val remoteVozBaseUrl: String = "",
+    val remoteVozApiKey: String = "",
+    val remoteVozModel: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_VOZ_MODEL,
+    val remoteVozTimeoutSeconds: Int = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS,
+    val remoteEarEnabled: Boolean = false,
+    val remoteEarUseSameEndpoint: Boolean = true,
+    val remoteEarBaseUrl: String = "",
+    val remoteEarApiKey: String = "",
+    val remoteEarModel: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_EAR_MODEL,
+    val remoteEarTimeoutSeconds: Int = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS,
     val preferredLanguage: String = defaultPreferredLanguage(),
     val customVocabulary: List<String> = emptyList(),
     val hardwareAccelerator: HardwareAccelerator = HardwareAccelerator.AUTO,
     val modelAutoUnloadMinutes: Int = DEFAULT_MODEL_AUTO_UNLOAD_MINUTES
 ) {
     /**
-     * `Voz` is the core STT engine and cannot be disabled.
+     * `Voz` is the core STT engine (on-device unless [isRemoteVozActive] is true) and cannot be disabled.
      */
     val vozEnabled: Boolean = true
+
+    /** `true` when [remoteVozBaseUrl] and [remoteVozModel] form a valid remote STT configuration. */
+    val isRemoteVozConfigured: Boolean
+        get() = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.isValidHttpUrl(remoteVozBaseUrl) &&
+            remoteVozModel.isNotBlank()
+
+    /** `true` when speech-to-text (`Voz`) runs on a configured remote OpenAI-compatible transcription endpoint. */
+    val isRemoteVozActive: Boolean
+        get() = remoteVozEnabled && isRemoteVozConfigured
+
+    /** Effective base URL used for Remote `Ear` (reuses [remoteVozBaseUrl] when [remoteEarUseSameEndpoint] is true). */
+    val effectiveRemoteEarBaseUrl: String
+        get() = if (remoteEarUseSameEndpoint && remoteVozEnabled) remoteVozBaseUrl else remoteEarBaseUrl
+
+    /** Effective API key used for Remote `Ear` (reuses [remoteVozApiKey] when [remoteEarUseSameEndpoint] is true). */
+    val effectiveRemoteEarApiKey: String
+        get() = if (remoteEarUseSameEndpoint && remoteVozEnabled) remoteVozApiKey else remoteEarApiKey
+
+    /** Effective request timeout in seconds for Remote `Ear`. */
+    val effectiveRemoteEarTimeoutSeconds: Int
+        get() = if (remoteEarUseSameEndpoint && remoteVozEnabled) remoteVozTimeoutSeconds else remoteEarTimeoutSeconds
+
+    /** `true` when Remote `Ear` has a valid effective endpoint URL and non-blank model ID. */
+    val isRemoteEarConfigured: Boolean
+        get() = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.isValidHttpUrl(effectiveRemoteEarBaseUrl) &&
+            remoteEarModel.isNotBlank()
+
+    /** `true` when language ID (`Ear`) is enabled and configured to call a remote transcription endpoint. */
+    val isRemoteEarActive: Boolean
+        get() = earEnabled && remoteEarEnabled && isRemoteEarConfigured
+
+    /** Concise status badge text for the collapsible Remote Voz & Ear section in Audio Models settings. */
+    val remoteAudioSummaryLabel: String
+        get() = when {
+            isRemoteVozActive && isRemoteEarActive ->
+                if (remoteEarUseSameEndpoint && remoteVozEnabled) "Voz + Ear · Shared API" else "Voz + Ear · 2 Endpoints"
+            isRemoteVozActive -> "Voz · API"
+            isRemoteEarActive -> "Ear · API"
+            remoteVozEnabled || (earEnabled && remoteEarEnabled) -> "Setup needed"
+            else -> "Local"
+        }
 
     /** `true` when AI post-processing is enabled and using an on-device LiteRT-LM model. */
     val isLocalLlmEnabled: Boolean
@@ -602,23 +691,23 @@ data class ModelSettings(
      * Active disk footprint in MB based on currently enabled on-device models (0 MB extra for cloud/LAN APIs).
      */
     val activeDiskFootprintMb: Int
-        get() = DesertAntModel.VOZ.sizeMb +
-            (if (earEnabled) DesertAntModel.EAR.sizeMb else 0) +
+        get() = (if (isRemoteVozActive) 0 else DesertAntModel.VOZ.sizeMb) +
+            (if (earEnabled && !isRemoteEarActive) DesertAntModel.EAR.sizeMb else 0) +
             (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
             (if (isLocalLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
 
     /**
      * Estimated peak RAM in MB based on models that can ever co-reside in RAM:
-     * - `Voz` (1,187 MB weights + runtime buffers): 1,400 MB
-     * - `Ear` (10 MB weights + runtime buffers): +50 MB
+     * - Local `Voz` (1,187 MB weights + runtime buffers): 1,400 MB (0 MB when [isRemoteVozActive])
+     * - Local `Ear` (10 MB weights + runtime buffers): +50 MB (0 MB when [isRemoteEarActive])
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
      *   - Active Local LLM (`Granite 4.1 3B` / `Granite 4.2 3B` +850 MB, `Gemma 4 E2B` +850 MB,
      *     `Qwen3 4B` / `Qwen3 4B Instruct 2507` +950 MB), OR
      *   - `Punct` (+120 MB) when AI post-processing (local or OpenAI API) is disabled.
      */
     val estimatedPeakRamMb: Int
-        get() = 1400 +
-            (if (earEnabled) 50 else 0) +
+        get() = (if (isRemoteVozActive) 0 else 1400) +
+            (if (earEnabled && !isRemoteEarActive) 50 else 0) +
             when {
                 isLocalLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
                 punctEnabled && !isOpenAiApiEnabled -> 120
@@ -626,8 +715,8 @@ data class ModelSettings(
             }
 
     fun isModelEnabled(model: DesertAntModel): Boolean = when (model) {
-        DesertAntModel.VOZ -> true
-        DesertAntModel.EAR -> earEnabled
+        DesertAntModel.VOZ -> !isRemoteVozActive
+        DesertAntModel.EAR -> earEnabled && !isRemoteEarActive
         DesertAntModel.PUNCT -> punctEnabled
         DesertAntModel.GRANITE_4_1_3B,
         DesertAntModel.QWEN3_4B_INSTRUCT_2507,
@@ -640,8 +729,8 @@ data class ModelSettings(
         get() = autoUnloadSummary(modelAutoUnloadMinutes)
 
     fun enabledModels(): List<DesertAntModel> = buildList {
-        add(DesertAntModel.VOZ)
-        if (earEnabled) add(DesertAntModel.EAR)
+        if (!isRemoteVozActive) add(DesertAntModel.VOZ)
+        if (earEnabled && !isRemoteEarActive) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
         if (isLocalLlmEnabled) add(selectedLlmModel.desertAntModel)
     }
@@ -655,6 +744,8 @@ data class ModelSettings(
         const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
+        const val KEY_LOCAL_THINKING_EFFORT = "local_thinking_effort"
+        const val KEY_LOCAL_LLM_CHUNKING_ENABLED = "local_llm_chunking_enabled"
         const val KEY_GEMMA_PROMPT_PRESET = "gemma_prompt_preset"
         const val KEY_GEMMA_CUSTOM_PROMPT = "gemma_custom_prompt"
         const val KEY_LLM_PROVIDER = "llm_provider"
@@ -662,6 +753,19 @@ data class ModelSettings(
         const val KEY_OPENAI_API_KEY = "openai_api_key"
         const val KEY_OPENAI_MODEL = "openai_model"
         const val KEY_OPENAI_TIMEOUT_SECONDS = "openai_timeout_seconds"
+        const val KEY_OPENAI_THINKING_EFFORT = "openai_thinking_effort"
+        const val KEY_OPENAI_CHUNKING_ENABLED = "openai_chunking_enabled"
+        const val KEY_REMOTE_VOZ_ENABLED = "remote_voz_enabled"
+        const val KEY_REMOTE_VOZ_BASE_URL = "remote_voz_base_url"
+        const val KEY_REMOTE_VOZ_API_KEY = "remote_voz_api_key"
+        const val KEY_REMOTE_VOZ_MODEL = "remote_voz_model"
+        const val KEY_REMOTE_VOZ_TIMEOUT_SECONDS = "remote_voz_timeout_seconds"
+        const val KEY_REMOTE_EAR_ENABLED = "remote_ear_enabled"
+        const val KEY_REMOTE_EAR_USE_SAME_ENDPOINT = "remote_ear_use_same_endpoint"
+        const val KEY_REMOTE_EAR_BASE_URL = "remote_ear_base_url"
+        const val KEY_REMOTE_EAR_API_KEY = "remote_ear_api_key"
+        const val KEY_REMOTE_EAR_MODEL = "remote_ear_model"
+        const val KEY_REMOTE_EAR_TIMEOUT_SECONDS = "remote_ear_timeout_seconds"
         const val KEY_PREFERRED_LANGUAGE = "preferred_language"
         const val KEY_CUSTOM_VOCABULARY = "custom_vocabulary"
         const val KEY_HARDWARE_ACCELERATOR = "hardware_accelerator"
@@ -743,6 +847,37 @@ data class ModelSettings(
                 KEY_OPENAI_TIMEOUT_SECONDS,
                 com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_TIMEOUT_SECONDS
             ).coerceIn(5, 90)
+            val openAiThinkingEffort = LlmThinkingEffort.fromId(
+                prefs.getString(KEY_OPENAI_THINKING_EFFORT, LlmThinkingEffort.DEFAULT.id)
+            )
+            val openAiChunkingEnabled = prefs.getBoolean(KEY_OPENAI_CHUNKING_ENABLED, false)
+            val localThinkingEffort = LlmThinkingEffort.fromLocalId(
+                prefs.getString(KEY_LOCAL_THINKING_EFFORT, LlmThinkingEffort.MEDIUM.id)
+            )
+            val localLlmChunkingEnabled = prefs.getBoolean(KEY_LOCAL_LLM_CHUNKING_ENABLED, true)
+            val remoteVozEnabled = prefs.getBoolean(KEY_REMOTE_VOZ_ENABLED, false)
+            val remoteVozBaseUrl = (prefs.getString(KEY_REMOTE_VOZ_BASE_URL, "") ?: "").trim()
+            val remoteVozApiKey = prefs.getString(KEY_REMOTE_VOZ_API_KEY, "") ?: ""
+            val remoteVozModel = (prefs.getString(
+                KEY_REMOTE_VOZ_MODEL,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_VOZ_MODEL
+            ) ?: com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_VOZ_MODEL).trim()
+            val remoteVozTimeoutSeconds = prefs.getInt(
+                KEY_REMOTE_VOZ_TIMEOUT_SECONDS,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS
+            ).coerceIn(5, 120)
+            val remoteEarEnabled = prefs.getBoolean(KEY_REMOTE_EAR_ENABLED, false)
+            val remoteEarUseSameEndpoint = prefs.getBoolean(KEY_REMOTE_EAR_USE_SAME_ENDPOINT, true)
+            val remoteEarBaseUrl = (prefs.getString(KEY_REMOTE_EAR_BASE_URL, "") ?: "").trim()
+            val remoteEarApiKey = prefs.getString(KEY_REMOTE_EAR_API_KEY, "") ?: ""
+            val remoteEarModel = (prefs.getString(
+                KEY_REMOTE_EAR_MODEL,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_EAR_MODEL
+            ) ?: com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_REMOTE_EAR_MODEL).trim()
+            val remoteEarTimeoutSeconds = prefs.getInt(
+                KEY_REMOTE_EAR_TIMEOUT_SECONDS,
+                com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS
+            ).coerceIn(5, 120)
             val rawGemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
             val rawSelectedId = prefs.getString(KEY_SELECTED_LLM_MODEL, null)
             val hasValidExplicitModel = LlmModelChoice.isSupportedId(rawSelectedId)
@@ -782,6 +917,8 @@ data class ModelSettings(
                 selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = resolvedDisableThinking,
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
+                localThinkingEffort = localThinkingEffort,
+                localLlmChunkingEnabled = localLlmChunkingEnabled,
                 gemmaPromptPreset = preset,
                 gemmaCustomPrompt = customPrompt,
                 llmProvider = llmProvider,
@@ -789,6 +926,19 @@ data class ModelSettings(
                 openAiApiKey = openAiApiKey,
                 openAiModel = openAiModel,
                 openAiTimeoutSeconds = openAiTimeoutSeconds,
+                openAiThinkingEffort = openAiThinkingEffort,
+                openAiChunkingEnabled = openAiChunkingEnabled,
+                remoteVozEnabled = remoteVozEnabled,
+                remoteVozBaseUrl = remoteVozBaseUrl,
+                remoteVozApiKey = remoteVozApiKey,
+                remoteVozModel = remoteVozModel,
+                remoteVozTimeoutSeconds = remoteVozTimeoutSeconds,
+                remoteEarEnabled = remoteEarEnabled,
+                remoteEarUseSameEndpoint = remoteEarUseSameEndpoint,
+                remoteEarBaseUrl = remoteEarBaseUrl,
+                remoteEarApiKey = remoteEarApiKey,
+                remoteEarModel = remoteEarModel,
+                remoteEarTimeoutSeconds = remoteEarTimeoutSeconds,
                 preferredLanguage = sanitizedLang,
                 customVocabulary = vocabList,
                 hardwareAccelerator = accel,
@@ -820,6 +970,8 @@ data class ModelSettings(
                 .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)
+                .putString(KEY_LOCAL_THINKING_EFFORT, settings.localThinkingEffort.id)
+                .putBoolean(KEY_LOCAL_LLM_CHUNKING_ENABLED, settings.localLlmChunkingEnabled)
                 .putString(KEY_GEMMA_PROMPT_PRESET, settings.gemmaPromptPreset.id)
                 .putString(KEY_GEMMA_CUSTOM_PROMPT, settings.gemmaCustomPrompt)
                 .putString(KEY_LLM_PROVIDER, settings.llmProvider.id)
@@ -827,6 +979,19 @@ data class ModelSettings(
                 .putString(KEY_OPENAI_API_KEY, settings.openAiApiKey.trim())
                 .putString(KEY_OPENAI_MODEL, settings.openAiModel.trim())
                 .putInt(KEY_OPENAI_TIMEOUT_SECONDS, settings.openAiTimeoutSeconds.coerceIn(5, 90))
+                .putString(KEY_OPENAI_THINKING_EFFORT, settings.openAiThinkingEffort.id)
+                .putBoolean(KEY_OPENAI_CHUNKING_ENABLED, settings.openAiChunkingEnabled)
+                .putBoolean(KEY_REMOTE_VOZ_ENABLED, settings.remoteVozEnabled)
+                .putString(KEY_REMOTE_VOZ_BASE_URL, settings.remoteVozBaseUrl.trim())
+                .putString(KEY_REMOTE_VOZ_API_KEY, settings.remoteVozApiKey.trim())
+                .putString(KEY_REMOTE_VOZ_MODEL, settings.remoteVozModel.trim())
+                .putInt(KEY_REMOTE_VOZ_TIMEOUT_SECONDS, settings.remoteVozTimeoutSeconds.coerceIn(5, 120))
+                .putBoolean(KEY_REMOTE_EAR_ENABLED, settings.remoteEarEnabled)
+                .putBoolean(KEY_REMOTE_EAR_USE_SAME_ENDPOINT, settings.remoteEarUseSameEndpoint)
+                .putString(KEY_REMOTE_EAR_BASE_URL, settings.remoteEarBaseUrl.trim())
+                .putString(KEY_REMOTE_EAR_API_KEY, settings.remoteEarApiKey.trim())
+                .putString(KEY_REMOTE_EAR_MODEL, settings.remoteEarModel.trim())
+                .putInt(KEY_REMOTE_EAR_TIMEOUT_SECONDS, settings.remoteEarTimeoutSeconds.coerceIn(5, 120))
                 .putString(KEY_PREFERRED_LANGUAGE, validLang)
                 .putString(KEY_CUSTOM_VOCABULARY, jsonArray.toString())
                 .putString(KEY_HARDWARE_ACCELERATOR, settings.hardwareAccelerator.id)

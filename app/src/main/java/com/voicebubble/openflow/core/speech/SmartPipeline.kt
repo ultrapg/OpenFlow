@@ -67,6 +67,7 @@ enum class ModelLoadState(val label: String) {
     BYPASSED("Bypassed by AI"),
     NOT_DOWNLOADED("Not Downloaded"),
     STANDBY("Standby (Dynamic)"),
+    REMOTE("Remote API"),
     LOADING("Loading..."),
     LOADED("Loaded in RAM"),
     ACTIVE("Running Inference"),
@@ -243,7 +244,9 @@ data class PipelineStatus(
     val isReady: Boolean
         get() = phase == PipelinePhase.READY ||
             phase == PipelinePhase.STANDBY_EVICTED ||
-            modelStates[DesertAntModel.VOZ] == ModelLoadState.LOADED
+            modelStates[DesertAntModel.VOZ] == ModelLoadState.LOADED ||
+            modelStates[DesertAntModel.VOZ] == ModelLoadState.REMOTE ||
+            modelStates[DesertAntModel.VOZ] == ModelLoadState.ACTIVE
 }
 
 /**
@@ -383,9 +386,9 @@ class SmartPipeline(
     @Volatile
     private var isTranscribing: Boolean = false
 
-    /** `true` as soon as the native `Voz` speech session is loaded in RAM (lock-free check for live streaming). */
+    /** `true` when `Voz` is ready via a configured remote endpoint or loaded natively in RAM (lock-free check). */
     val isVozReady: Boolean
-        get() = voz != null
+        get() = settings.isRemoteVozActive || voz != null
 
     /** `true` if inference is running OR a real audio chunk / stop-tap is queued at [pipelineMutex]. */
     val hasPendingOrActiveInference: Boolean
@@ -463,13 +466,11 @@ class SmartPipeline(
             val accelUnchanged = appliedAccelerator == currentSettings.hardwareAccelerator
             val alreadyReady = !forceReload &&
                 accelUnchanged &&
-                voz != null &&
-                (!warmUp || vozWarmedUp) &&
+                (currentSettings.isRemoteVozActive || (voz != null && (!warmUp || vozWarmedUp))) &&
                 areEnabledModelsReadyOrStandbyLocked(currentSettings)
 
             if (alreadyReady) {
-                val count = countLoadedModelsLocked(currentSettings)
-                val msg = "$count/${currentSettings.enabledModels().size} models ready in RAM ($activeAcceleratorDescription)"
+                val msg = readyStatusMessageLocked(currentSettings)
                 updateStatusSnapshot(
                     activeSettings = currentSettings,
                     phaseOverride = PipelinePhase.READY,
@@ -489,6 +490,7 @@ class SmartPipeline(
             DebugLogManager.logInfo(
                 TAG,
                 "initialize(warmUp=$warmUp) start • enabled=${currentSettings.enabledModels().map { it.id }} • " +
+                    "remoteVoz=${currentSettings.isRemoteVozActive} • remoteEar=${currentSettings.isRemoteEarActive} • " +
                     "accel=$activeAcceleratorDescription • npu=${NpuHardwareManager.detectHardwareProfile().summaryLabel}",
                 includeMemory = true
             )
@@ -496,10 +498,15 @@ class SmartPipeline(
             updateStatusSnapshot(
                 activeSettings = currentSettings,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Loading enabled models ($activeAcceleratorDescription)..."
+                messageOverride = "Preparing enabled models..."
             )
 
-            val vozLoaded = ensureVozLocked(currentSettings, warmUp = warmUp)
+            val vozReady = if (currentSettings.isRemoteVozActive) {
+                if (voz != null) closeVozLocked()
+                true
+            } else {
+                ensureVozLocked(currentSettings, warmUp = warmUp)
+            }
             ensureAuxiliaryModelsLocked(
                 activeSettings = currentSettings,
                 warmUp = warmUp && !memReport.isAnyMemoryTight,
@@ -509,7 +516,7 @@ class SmartPipeline(
             resetIdleEvictionTimerLocked()
 
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
-            val finalPhase = if (vozLoaded) {
+            val finalPhase = if (vozReady) {
                 PipelinePhase.READY
             } else if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
                 PipelinePhase.UNINITIALIZED
@@ -517,16 +524,13 @@ class SmartPipeline(
                 PipelinePhase.ERROR
             }
             val finalMsg = when (finalPhase) {
-                PipelinePhase.READY -> {
-                    val count = countLoadedModelsLocked(currentSettings)
-                    "$count/${currentSettings.enabledModels().size} models ready ($activeAcceleratorDescription)"
-                }
+                PipelinePhase.READY -> readyStatusMessageLocked(currentSettings)
                 PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
                 else -> "Failed to load Voz speech model"
             }
 
             _pipelineStatus.value = _pipelineStatus.value.copy(
-                lastWarmupMs = if (vozLoaded) elapsedMs else _pipelineStatus.value.lastWarmupMs
+                lastWarmupMs = if (vozReady) elapsedMs else _pipelineStatus.value.lastWarmupMs
             )
             updateStatusSnapshot(
                 activeSettings = currentSettings,
@@ -535,10 +539,10 @@ class SmartPipeline(
             )
             DebugLogManager.logInfo(
                 TAG,
-                "initialize(warmUp=$warmUp) finished in ${elapsedMs}ms • vozLoaded=$vozLoaded • status=$finalMsg",
+                "initialize(warmUp=$warmUp) finished in ${elapsedMs}ms • vozReady=$vozReady • status=$finalMsg",
                 includeMemory = true
             )
-            vozLoaded
+            vozReady
         }
     }
 
@@ -597,11 +601,17 @@ class SmartPipeline(
             pipelineMutex.withLock {
                 if (!isRecordingActive || hasPendingOrActiveInference) return@withLock
                 val activeSnap = settings
-                if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
+                if (!activeSnap.isRemoteVozActive &&
+                    !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)
+                ) {
                     updateStatusSnapshot(
                         activeSettings = activeSnap,
                         phaseOverride = PipelinePhase.UNINITIALIZED,
-                        messageOverride = "Models not downloaded yet"
+                        messageOverride = if (activeSnap.remoteVozEnabled) {
+                            "Remote Voz setup needed"
+                        } else {
+                            "Models not downloaded yet"
+                        }
                     )
                     return@withLock
                 }
@@ -609,8 +619,9 @@ class SmartPipeline(
                 val mem = evaluateMemoryPressure()
                 applyHardwareAcceleratorSettingsLocked(activeSnap.hardwareAccelerator, mem.isAnyMemoryTight)
 
-                // 1a. Preload lightweight Ear (10 MB, ~40 ms) first if enabled so early live language ID can run immediately
+                // 1a. Preload lightweight local Ear if enabled locally so early live language ID can run immediately
                 if (activeSnap.earEnabled &&
+                    !activeSnap.isRemoteEarActive &&
                     ear == null &&
                     !mem.isCriticalPressure &&
                     DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)
@@ -625,8 +636,8 @@ class SmartPipeline(
                     }
                 }
 
-                // 1b. Load Voz immediately while the user speaks
-                if (voz == null) {
+                // 1b. Load local Voz while user speaks unless running on Remote Voz API
+                if (!activeSnap.isRemoteVozActive && voz == null) {
                     updateStatusSnapshot(
                         activeSettings = activeSnap,
                         phaseOverride = PipelinePhase.LOADING,
@@ -648,22 +659,21 @@ class SmartPipeline(
                     updateStatusSnapshot(
                         activeSettings = activeSnap,
                         phaseOverride = PipelinePhase.READY,
-                        messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        messageOverride = readyStatusMessageLocked(activeSnap)
                     )
                     return@withLock
                 }
 
-                // 2. User is still mid-sentence with no chunk queued: compile Voz accelerator kernels ahead of Chunk #0
-                if (!vozWarmedUp && !mem.isAnyMemoryTight) {
+                // 2. Compile local Voz accelerator kernels ahead of Chunk #0 (skipped when Voz runs remotely)
+                if (!activeSnap.isRemoteVozActive && !vozWarmedUp && !mem.isAnyMemoryTight) {
                     ensureVozLocked(activeSnap, warmUp = true)
                 }
                 appliedSettingsSnapshot = activeSnap
 
-                val readyCount = countLoadedModelsLocked(activeSnap)
                 updateStatusSnapshot(
                     activeSettings = activeSnap,
-                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$readyCount/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                    phaseOverride = if (activeSnap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = readyStatusMessageLocked(activeSnap)
                 )
 
                 val needsLlm = activeSnap.isLocalLlmEnabled && isActiveLlmReadyOnDisk(activeSnap)
@@ -761,7 +771,7 @@ class SmartPipeline(
                                 updateStatusSnapshot(
                                     activeSettings = activeSnap,
                                     phaseOverride = PipelinePhase.READY,
-                                    messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                                    messageOverride = readyStatusMessageLocked(activeSnap)
                                 )
                             }
                         } else if (!activeSnap.isOpenAiApiEnabled &&
@@ -782,7 +792,7 @@ class SmartPipeline(
                                 updateStatusSnapshot(
                                     activeSettings = activeSnap,
                                     phaseOverride = PipelinePhase.READY,
-                                    messageOverride = "${countLoadedModelsLocked(activeSnap)}/${activeSnap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                                    messageOverride = readyStatusMessageLocked(activeSnap)
                                 )
                             }
                         }
@@ -845,11 +855,38 @@ class SmartPipeline(
         } else {
             ModelSettings.defaultPreferredLanguage()
         }
-        if (!activeSnap.earEnabled || !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
+        if (!activeSnap.earEnabled) {
+            return@withContext fallbackLanguage
+        }
+        val useRemoteEar = activeSnap.isRemoteEarActive
+        if (!useRemoteEar && !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
             return@withContext fallbackLanguage
         }
         val trimmed = trimLeadingAndTrailingSilence(previewSamples, threshold = 0.0020f, padSamples = 2_400)
         if (trimmed.size < 14_400) return@withContext null // Need >= 0.9s of voiced context for confident early ID
+
+        val slice = if (trimmed.size > MAX_EAR_WINDOW_SAMPLES) {
+            trimmed.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
+        } else {
+            trimmed
+        }
+        val conditioned = conditionAudioWhenClearDisabled(slice)
+
+        if (useRemoteEar) {
+            // Execute Remote Ear HTTP call lock-free so pipelineMutex never blocks Stop-tap or chunk transcription.
+            val outcome = OpenAiCompatibleClient.identifyLanguageRemote(
+                samples = conditioned,
+                baseUrl = activeSnap.effectiveRemoteEarBaseUrl,
+                apiKey = activeSnap.effectiveRemoteEarApiKey,
+                model = activeSnap.remoteEarModel,
+                timeoutSeconds = activeSnap.effectiveRemoteEarTimeoutSeconds
+            )
+            val detected = outcome.languageCode
+            if (detected != null) {
+                DebugLogManager.logInfo(TAG, "Early live Remote Ear pre-detected '$detected' in ${outcome.latencyMs}ms")
+            }
+            return@withContext detected
+        }
 
         if (!pipelineMutex.tryLock()) return@withContext null
         try {
@@ -864,12 +901,6 @@ class SmartPipeline(
                     return@withContext null
                 }
             }
-            val slice = if (trimmed.size > MAX_EAR_WINDOW_SAMPLES) {
-                trimmed.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
-            } else {
-                trimmed
-            }
-            val conditioned = conditionAudioWhenClearDisabled(slice)
             val earWindows = if (conditioned.size <= 40_000) 1 else 2
             val detection = earInstance.identify(
                 samples = conditioned,
@@ -1045,10 +1076,12 @@ class SmartPipeline(
                 appliedSettingsSnapshot?.gemmaEnabled == snapshot.gemmaEnabled &&
                 appliedSettingsSnapshot?.llmProvider == snapshot.llmProvider &&
                 appliedSettingsSnapshot?.selectedLlmModel == snapshot.selectedLlmModel &&
+                appliedSettingsSnapshot?.isRemoteVozActive == snapshot.isRemoteVozActive &&
+                appliedSettingsSnapshot?.isRemoteEarActive == snapshot.isRemoteEarActive &&
                 appliedSettingsSnapshot?.hardwareAccelerator == snapshot.hardwareAccelerator
             if (!accelChanged &&
                 modelSelectionUnchanged &&
-                voz != null &&
+                (snapshot.isRemoteVozActive || voz != null) &&
                 areEnabledModelsReadyOrStandbyLocked(snapshot)
             ) {
                 appliedSettingsSnapshot = snapshot
@@ -1067,8 +1100,7 @@ class SmartPipeline(
                         currentGemma.evictCachedSystemPrompt()
                     }
                 }
-                val count = countLoadedModelsLocked(snapshot)
-                val msg = "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                val msg = readyStatusMessageLocked(snapshot)
                 updateStatusSnapshot(
                     activeSettings = snapshot,
                     phaseOverride = PipelinePhase.READY,
@@ -1093,7 +1125,10 @@ class SmartPipeline(
                 closeVozLocked()
                 System.gc()
             } else {
-                if (!snapshot.earEnabled) closeEarLocked()
+                if (snapshot.isRemoteVozActive && voz != null) {
+                    closeVozLocked()
+                }
+                if (!snapshot.earEnabled || snapshot.isRemoteEarActive) closeEarLocked()
                 if (!snapshot.punctEnabled || isActiveLlmReadyOnDisk(snapshot) || snapshot.isOpenAiApiEnabled) {
                     closePunctLocked()
                 }
@@ -1108,10 +1143,14 @@ class SmartPipeline(
             updateStatusSnapshot(
                 activeSettings = snapshot,
                 phaseOverride = PipelinePhase.LOADING,
-                messageOverride = "Updating model pipeline ($activeAcceleratorDescription)..."
+                messageOverride = "Updating model pipeline..."
             )
 
-            val vozOk = ensureVozLocked(snapshot, warmUp = true)
+            val vozReady = if (snapshot.isRemoteVozActive) {
+                true
+            } else {
+                ensureVozLocked(snapshot, warmUp = true)
+            }
             ensureAuxiliaryModelsLocked(
                 activeSettings = snapshot,
                 warmUp = !memReport.isAnyMemoryTight,
@@ -1120,10 +1159,9 @@ class SmartPipeline(
             appliedSettingsSnapshot = snapshot
             resetIdleEvictionTimerLocked()
 
-            val phase = if (vozOk) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
-            val count = countLoadedModelsLocked(snapshot)
-            val msg = if (vozOk) {
-                "$count/${snapshot.enabledModels().size} models ready ($activeAcceleratorDescription)"
+            val phase = if (vozReady) PipelinePhase.READY else PipelinePhase.UNINITIALIZED
+            val msg = if (vozReady) {
+                readyStatusMessageLocked(snapshot)
             } else {
                 standbyStatusMessageLocked(snapshot)
             }
@@ -1279,8 +1317,14 @@ class SmartPipeline(
                     includeMemory = true
                 )
 
-                if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
-                    throw IllegalStateException("Voz speech recognition model is not downloaded.")
+                if (!activeSettings.isRemoteVozActive &&
+                    !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)
+                ) {
+                    if (activeSettings.remoteVozEnabled) {
+                        throw IllegalStateException("Remote Voz endpoint is not configured in Settings.")
+                    } else {
+                        throw IllegalStateException("Voz speech recognition model is not downloaded.")
+                    }
                 }
 
                 // =========================================================================
@@ -1345,43 +1389,62 @@ class SmartPipeline(
                         inPlace = preparedChunk !== rawChunk && preparedChunk !== samples
                     )
 
-                    // Stage 2: Multilingual Speech-to-Text (`Voz`)
-                    ensureMemoryHeadroomForFfiLocked(conditionedChunk.size)
-                    if (voz == null) {
-                        updateSingleModelStateLocked(
-                            activeSettings = activeSettings,
-                            model = DesertAntModel.VOZ,
-                            state = ModelLoadState.LOADING,
-                            message = "Loading Voz speech engine ($activeAcceleratorDescription)..."
+                    // Stage 2: Multilingual Speech-to-Text (`Voz` — local or remote endpoint)
+                    if (activeSettings.isRemoteVozActive) {
+                        setModelActiveStatusLocked(
+                            activeSettings,
+                            DesertAntModel.VOZ,
+                            "Transcribing via Remote Voz ($resolvedLanguage)$chunkSuffix..."
                         )
-                        onStageProgress?.invoke("Loading Voz...")
+                        onStageProgress?.invoke("Remote Voz ($resolvedLanguage)$chunkSuffix")
                         onProgress?.invoke(
                             ProcessingProgress(
-                                label = "Loading Voz",
+                                label = "Transcribing",
+                                detail = "API · $langDetail",
+                                stage = ProcessingStageKind.TRANSCRIBING,
+                                chunkCurrent = if (totalChunks > 1) chunkNumber else null,
+                                chunkTotal = if (totalChunks > 1) totalChunks else null,
+                                isRemoteAi = true
+                            )
+                        )
+                    } else {
+                        ensureMemoryHeadroomForFfiLocked(conditionedChunk.size)
+                        if (voz == null) {
+                            updateSingleModelStateLocked(
+                                activeSettings = activeSettings,
+                                model = DesertAntModel.VOZ,
+                                state = ModelLoadState.LOADING,
+                                message = "Loading Voz speech engine ($activeAcceleratorDescription)..."
+                            )
+                            onStageProgress?.invoke("Loading Voz...")
+                            onProgress?.invoke(
+                                ProcessingProgress(
+                                    label = "Loading Voz",
+                                    detail = langDetail,
+                                    stage = ProcessingStageKind.LOADING_MODEL,
+                                    chunkCurrent = if (totalChunks > 1) chunkNumber else null,
+                                    chunkTotal = if (totalChunks > 1) totalChunks else null
+                                )
+                            )
+                            ensureVozLocked(activeSettings, warmUp = false)
+                        }
+                        setModelActiveStatusLocked(
+                            activeSettings,
+                            DesertAntModel.VOZ,
+                            "Transcribing with Voz ($resolvedLanguage)$chunkSuffix..."
+                        )
+                        onStageProgress?.invoke("Voz ($resolvedLanguage)$chunkSuffix")
+                        onProgress?.invoke(
+                            ProcessingProgress(
+                                label = "Transcribing",
                                 detail = langDetail,
-                                stage = ProcessingStageKind.LOADING_MODEL,
+                                stage = ProcessingStageKind.TRANSCRIBING,
                                 chunkCurrent = if (totalChunks > 1) chunkNumber else null,
                                 chunkTotal = if (totalChunks > 1) totalChunks else null
                             )
                         )
-                        ensureVozLocked(activeSettings, warmUp = false)
+                        DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)$chunkSuffix")
                     }
-                    setModelActiveStatusLocked(
-                        activeSettings,
-                        DesertAntModel.VOZ,
-                        "Transcribing with Voz ($resolvedLanguage)$chunkSuffix..."
-                    )
-                    onStageProgress?.invoke("Voz ($resolvedLanguage)$chunkSuffix")
-                    onProgress?.invoke(
-                        ProcessingProgress(
-                            label = "Transcribing",
-                            detail = langDetail,
-                            stage = ProcessingStageKind.TRANSCRIBING,
-                            chunkCurrent = if (totalChunks > 1) chunkNumber else null,
-                            chunkTotal = if (totalChunks > 1) totalChunks else null
-                        )
-                    )
-                    DebugLogManager.logMemorySnapshot("Before Voz.transcribe ($resolvedLanguage)$chunkSuffix")
 
                     val transcription = runVozWithRetryLocked(
                         samples = conditionedChunk,
@@ -1523,12 +1586,11 @@ class SmartPipeline(
                 ) {
                     evictAllModelsLocked(snap, "immediate auto-unload after dictation")
                 } else {
-                    val count = countLoadedModelsLocked(snap)
                     updateStatusSnapshot(
                         activeSettings = snap,
-                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                        messageOverride = if (hasAnyLoadedModelLocked()) {
-                            "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        phaseOverride = if (snap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = if (snap.isRemoteVozActive || hasAnyLoadedModelLocked()) {
+                            readyStatusMessageLocked(snap)
                         } else {
                             standbyStatusMessageLocked(snap)
                         }
@@ -1641,11 +1703,10 @@ class SmartPipeline(
                 } finally {
                     isTranscribing = false
                     val snap = settings
-                    val count = countLoadedModelsLocked(snap)
                     updateStatusSnapshot(
                         activeSettings = snap,
-                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                        messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        phaseOverride = if (snap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = readyStatusMessageLocked(snap)
                     )
                     resetIdleEvictionTimerLocked()
                 }
@@ -1706,7 +1767,7 @@ class SmartPipeline(
                         activeSettings.modelAutoUnloadMinutes == ModelSettings.AUTO_UNLOAD_IMMEDIATELY
                     if (!immediateUnloadNow) {
                         val postMem = evaluateMemoryPressure()
-                        if (voz == null && !postMem.isCriticalPressure) {
+                        if (!activeSettings.isRemoteVozActive && voz == null && !postMem.isCriticalPressure) {
                             val activeLlm = loadedLlmChoice ?: activeSettings.selectedLlmModel
                             if (gemmaProcessor != null &&
                                 !postMem.canKeepVozAndLlmCoResident(
@@ -1737,12 +1798,11 @@ class SmartPipeline(
                     ) {
                         evictAllModelsLocked(snap, "immediate auto-unload after streaming session")
                     } else {
-                        val count = countLoadedModelsLocked(snap)
                         updateStatusSnapshot(
                             activeSettings = snap,
-                            phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                            messageOverride = if (hasAnyLoadedModelLocked()) {
-                                "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                            phaseOverride = if (snap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                            messageOverride = if (snap.isRemoteVozActive || hasAnyLoadedModelLocked()) {
+                                readyStatusMessageLocked(snap)
                             } else {
                                 standbyStatusMessageLocked(snap)
                             }
@@ -1890,12 +1950,11 @@ class SmartPipeline(
                 ) {
                     evictAllModelsLocked(snap, "immediate auto-unload after benchmark")
                 } else {
-                    val count = countLoadedModelsLocked(snap)
                     updateStatusSnapshot(
                         activeSettings = snap,
-                        phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                        messageOverride = if (hasAnyLoadedModelLocked()) {
-                            "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                        phaseOverride = if (snap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                        messageOverride = if (snap.isRemoteVozActive || hasAnyLoadedModelLocked()) {
+                            readyStatusMessageLocked(snap)
                         } else {
                             standbyStatusMessageLocked(snap)
                         }
@@ -1939,11 +1998,10 @@ class SmartPipeline(
                 closeGemmaLocked()
                 System.gc()
                 val snap = settings
-                val count = countLoadedModelsLocked(snap)
                 updateStatusSnapshot(
                     activeSettings = snap,
-                    phaseOverride = if (voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
-                    messageOverride = "$count/${snap.enabledModels().size} models ready ($activeAcceleratorDescription)"
+                    phaseOverride = if (snap.isRemoteVozActive || voz != null) PipelinePhase.READY else PipelinePhase.UNINITIALIZED,
+                    messageOverride = readyStatusMessageLocked(snap)
                 )
             }
         }
@@ -2150,7 +2208,8 @@ class SmartPipeline(
     }
 
     private fun areEnabledModelsReadyOrStandbyLocked(activeSettings: ModelSettings): Boolean {
-        if (voz == null) return false
+        if (!activeSettings.isRemoteVozActive && voz == null) return false
+        if (activeSettings.isRemoteVozActive && voz != null) return false
         if (!activeSettings.isLocalLlmEnabled && gemmaProcessor != null) return false
         if (activeSettings.isLocalLlmEnabled && loadedLlmChoice != null && loadedLlmChoice != activeSettings.selectedLlmModel) {
             return false
@@ -2161,9 +2220,13 @@ class SmartPipeline(
         val mem = evaluateMemoryPressure()
         if (!mem.isCriticalPressure) {
             if (activeSettings.earEnabled &&
+                !activeSettings.isRemoteEarActive &&
                 DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR) &&
                 ear == null
             ) {
+                return false
+            }
+            if (activeSettings.isRemoteEarActive && ear != null) {
                 return false
             }
             if (activeSettings.punctEnabled &&
@@ -2196,6 +2259,47 @@ class SmartPipeline(
         // Very short utterances (< 0.9s) do not have enough acoustic context for reliable language ID
         if (samples.size < 14_400) {
             return fallbackLanguage
+        }
+        if (activeSettings.isRemoteEarActive) {
+            return try {
+                setModelActiveStatusLocked(activeSettings, DesertAntModel.EAR, "Detecting language via Remote Ear...")
+                onProgress?.invoke(
+                    ProcessingProgress(
+                        label = "Detecting language",
+                        detail = "API · Ear",
+                        stage = ProcessingStageKind.DETECTING_LANGUAGE,
+                        isRemoteAi = true
+                    )
+                )
+                onStageProgress?.invoke("Remote Ear")
+                val rawEarInput = if (samples.size > MAX_EAR_WINDOW_SAMPLES) {
+                    samples.copyOfRange(0, MAX_EAR_WINDOW_SAMPLES)
+                } else {
+                    samples
+                }
+                val earInput = conditionAudioWhenClearDisabled(rawEarInput)
+                val outcome = OpenAiCompatibleClient.identifyLanguageRemote(
+                    samples = earInput,
+                    baseUrl = activeSettings.effectiveRemoteEarBaseUrl,
+                    apiKey = activeSettings.effectiveRemoteEarApiKey,
+                    model = activeSettings.remoteEarModel,
+                    timeoutSeconds = activeSettings.effectiveRemoteEarTimeoutSeconds
+                )
+                val detected = outcome.languageCode
+                if (detected != null) {
+                    DebugLogManager.logInfo(TAG, "Remote Ear detected '$detected' in ${outcome.latencyMs}ms")
+                    detected
+                } else {
+                    if (outcome.errorSummary != null) {
+                        DebugLogManager.logWarn(TAG, "Remote Ear failed (${outcome.errorSummary}); falling back to $fallbackLanguage")
+                    }
+                    fallbackLanguage
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                DebugLogManager.logWarn(TAG, "Remote Ear failed, falling back to $fallbackLanguage", t)
+                fallbackLanguage
+            }
         }
         if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
             return fallbackLanguage
@@ -2263,6 +2367,27 @@ class SmartPipeline(
         customVocabulary: List<String>,
         activeSettings: ModelSettings
     ): Transcription {
+        if (activeSettings.isRemoteVozActive) {
+            val outcome = OpenAiCompatibleClient.transcribeAudioRemote(
+                samples = samples,
+                baseUrl = activeSettings.remoteVozBaseUrl,
+                apiKey = activeSettings.remoteVozApiKey,
+                model = activeSettings.remoteVozModel,
+                language = language,
+                customVocabulary = customVocabulary,
+                timeoutSeconds = activeSettings.remoteVozTimeoutSeconds
+            )
+            val tx = outcome.transcription
+            if (tx != null) {
+                DebugLogManager.logInfo(
+                    TAG,
+                    "Remote Voz (${activeSettings.remoteVozModel}) transcribed ${tx.text.length} chars (${tx.words.size} timed words) in ${outcome.latencyMs}ms"
+                )
+                return tx
+            }
+            throw IllegalStateException("Remote Voz failed: ${outcome.errorSummary ?: "Empty response"}")
+        }
+
         val firstVoz = voz ?: run {
             ensureVozLocked(activeSettings, warmUp = false)
             voz
@@ -2378,6 +2503,10 @@ class SmartPipeline(
     }
 
     private suspend fun ensureVozLocked(activeSettings: ModelSettings, warmUp: Boolean): Boolean {
+        if (activeSettings.isRemoteVozActive) {
+            if (voz != null) closeVozLocked()
+            return true
+        }
         if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
             closeVozLocked()
             return false
@@ -2446,8 +2575,10 @@ class SmartPipeline(
             )
         }
 
-        // Ear
-        if (activeSettings.earEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
+        // Ear (skip native load when Ear runs remotely via API)
+        if (activeSettings.isRemoteEarActive) {
+            if (ear != null) closeEarLocked()
+        } else if (activeSettings.earEnabled && DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.EAR)) {
             if (ear == null && !mem.isCriticalPressure) {
                 try {
                     updateSingleModelStateLocked(
@@ -2790,7 +2921,9 @@ class SmartPipeline(
             customVocabulary = activeSettings.customVocabulary,
             fieldContext = rootFieldCtx,
             timeoutSeconds = activeSettings.openAiTimeoutSeconds,
-            engineResolved = engineResolved
+            engineResolved = engineResolved,
+            thinkingEffort = activeSettings.openAiThinkingEffort,
+            chunkingEnabled = activeSettings.openAiChunkingEnabled
         )
         return if (outcome.succeeded) {
             DebugLogManager.logInfo(
@@ -3006,6 +3139,8 @@ class SmartPipeline(
                 customVocabulary = activeSettings.customVocabulary,
                 disableThinking = activeSettings.gemmaDisableThinking,
                 adaptiveThinking = activeSettings.gemmaAdaptiveThinking,
+                thinkingEffort = activeSettings.localThinkingEffort,
+                enableTextChunking = activeSettings.localLlmChunkingEnabled,
                 precedingSegmentTailOverride = precedingCleanedTail,
                 applyLeadingCursorContinuation = applyLeadingCursorContinuation
             )
@@ -3046,13 +3181,25 @@ class SmartPipeline(
 
     private fun countLoadedModelsLocked(activeSettings: ModelSettings): Int {
         var count = 0
-        if (voz != null) count++
-        if (activeSettings.earEnabled && ear != null) count++
+        if (!activeSettings.isRemoteVozActive && voz != null) count++
+        if (activeSettings.earEnabled && !activeSettings.isRemoteEarActive && ear != null) count++
         if (activeSettings.isPunctEffectivelyActive && punctRestorer != null) count++
         if (activeSettings.isLocalLlmEnabled && gemmaProcessor != null && loadedLlmChoice == activeSettings.selectedLlmModel) {
             count++
         }
         return count
+    }
+
+    private fun readyStatusMessageLocked(activeSettings: ModelSettings): String {
+        val enabledLocalCount = activeSettings.enabledModels().size
+        return when {
+            enabledLocalCount == 0 && activeSettings.isRemoteVozActive ->
+                "Remote Voz ready (${activeSettings.remoteAudioSummaryLabel})"
+            activeSettings.isRemoteVozActive ->
+                "Remote Voz + ${countLoadedModelsLocked(activeSettings)}/$enabledLocalCount local ready"
+            else ->
+                "${countLoadedModelsLocked(activeSettings)}/$enabledLocalCount models ready ($activeAcceleratorDescription)"
+        }
     }
 
     private fun computeModelStatesSnapshot(
@@ -3062,6 +3209,14 @@ class SmartPipeline(
     ): Map<DesertAntModel, ModelLoadState> {
         val result = linkedMapOf<DesertAntModel, ModelLoadState>()
         for (model in DesertAntModel.entries) {
+            if (model == DesertAntModel.VOZ && activeSettings.isRemoteVozActive) {
+                result[model] = if (activeStageModel == model) ModelLoadState.ACTIVE else ModelLoadState.REMOTE
+                continue
+            }
+            if (model == DesertAntModel.EAR && activeSettings.isRemoteEarActive) {
+                result[model] = if (activeStageModel == model) ModelLoadState.ACTIVE else ModelLoadState.REMOTE
+                continue
+            }
             val enabled = activeSettings.isModelEnabled(model)
             if (!enabled) {
                 result[model] = ModelLoadState.DISABLED
@@ -3139,7 +3294,13 @@ class SmartPipeline(
         return voz != null || ear != null || punctRestorer != null || gemmaProcessor != null
     }
 
-    private fun standbyStatusMessageLocked(@Suppress("UNUSED_PARAMETER") activeSettings: ModelSettings): String {
+    private fun standbyStatusMessageLocked(activeSettings: ModelSettings): String {
+        if (activeSettings.isRemoteVozActive) {
+            return "Standby — Remote Voz (${activeSettings.remoteAudioSummaryLabel})"
+        }
+        if (activeSettings.remoteVozEnabled && !activeSettings.isRemoteVozConfigured) {
+            return "Remote Voz setup needed"
+        }
         val vozDownloaded = try {
             DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)
         } catch (_: Throwable) {

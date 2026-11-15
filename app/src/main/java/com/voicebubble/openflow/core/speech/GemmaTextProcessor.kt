@@ -48,6 +48,7 @@ import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.LlmPromptTier
 import com.voicebubble.openflow.settings.LlmProviderMode
+import com.voicebubble.openflow.settings.LlmThinkingEffort
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import java.io.File
@@ -246,9 +247,29 @@ class GemmaTextProcessor(
         private val CHANNEL_BLOCK_REGEX = Regex("<\\|channel>.*?<channel\\|>", setOf(RegexOption.DOT_MATCHES_ALL))
         private val UNCLOSED_CHANNEL_REGEX = Regex("<\\|channel>.*$", setOf(RegexOption.DOT_MATCHES_ALL))
         private val THOUGHT_TAG_REGEX = Regex("<\\|?thought\\|?>.*?</\\|?thought\\|?>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val ORPHAN_CLOSE_THOUGHT_PREFIX_REGEX = Regex("^.*?</\\|?thought\\|?>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val UNCLOSED_THOUGHT_TAG_REGEX = Regex("<\\|?thought\\|?>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val THINK_TAG_REGEX = Regex("<think>.*?</think>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val ORPHAN_CLOSE_THINK_PREFIX_REGEX = Regex("^.*?</think>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val UNCLOSED_THINK_TAG_REGEX = Regex("<think>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val THINKING_TAG_REGEX = Regex(
+            "<(?:thinking|reasoning|scratchpad|antThinking|inner_thoughts)>.*?</(?:thinking|reasoning|scratchpad|antThinking|inner_thoughts)>",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+        )
+        private val ORPHAN_CLOSE_THINKING_PREFIX_REGEX = Regex(
+            "^.*?</(?:thinking|reasoning|scratchpad|antThinking|inner_thoughts)>\\s*",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+        )
+        private val UNCLOSED_THINKING_TAG_REGEX = Regex(
+            "<(?:thinking|reasoning|scratchpad|antThinking|inner_thoughts)>.*$",
+            setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+        )
+        private val BEGIN_OF_THOUGHT_REGEX = Regex("<\\|begin_of_thought\\|>.*?<\\|end_of_thought\\|>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val ORPHAN_END_OF_THOUGHT_PREFIX_REGEX = Regex("^.*?<\\|end_of_thought\\|>\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val UNCLOSED_BEGIN_OF_THOUGHT_REGEX = Regex("<\\|begin_of_thought\\|>.*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val BRACKET_THINK_REGEX = Regex("\\[THINK\\].*?\\[/THINK\\]", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val ORPHAN_CLOSE_BRACKET_THINK_REGEX = Regex("^.*?\\[/THINK\\]\\s*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        private val UNCLOSED_BRACKET_THINK_REGEX = Regex("\\[THINK\\].*$", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
         private val TOOL_CALL_BLOCK_REGEX = Regex(
             "(?:<tool_call>.*?</tool_call>|<\\|tool_call>.*?<tool_call\\|>|<function\\s+name=[^>]*>.*?</function>|<\\|tool_call_start\\|>.*?<\\|tool_call_end\\|>|<\\|tool_list_start\\|>.*?<\\|tool_list_end\\|>)",
             setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
@@ -1053,7 +1074,8 @@ class GemmaTextProcessor(
             preset: GemmaPromptPreset,
             disableThinking: Boolean = false,
             maxContextTokens: Int = DEFAULT_MAX_CONTEXT_TOKENS,
-            llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
+            llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
+            thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM
         ): Int {
             val effectiveDisableThinking = disableThinking || !llmChoice.supportsThinking
             val approxWords = inputText.trim().split(Regex("\\s+")).count { it.isNotEmpty() }
@@ -1081,18 +1103,48 @@ class GemmaTextProcessor(
                 LlmPromptTier.BALANCED_3B -> 320
                 LlmPromptTier.FLAGSHIP_GEMMA_4 -> 640
             }
-            val thinkingHeadroom = min(windowHeadroom, tierHeadroomCap)
+            val effortHeadroom = (min(windowHeadroom, tierHeadroomCap) * thinkingEffort.localBudgetScale)
+                .toInt()
+                .coerceAtLeast(if (tierHeadroomCap > 0) 64 else 0)
             val maxCap = when {
-                maxContextTokens >= 4_096 -> 2_048
-                maxContextTokens >= 2_048 -> 1_280
+                maxContextTokens >= 4_096 -> if (thinkingEffort == LlmThinkingEffort.HIGH) 2_560 else 2_048
+                maxContextTokens >= 2_048 -> if (thinkingEffort == LlmThinkingEffort.HIGH) 1_536 else 1_280
                 else -> 576
             }
-            return (baseTokens + thinkingHeadroom).coerceIn(baseTokens, maxCap)
+            return (baseTokens + effortHeadroom).coerceIn(baseTokens, maxCap)
         }
 
         /**
-         * Sanitizes raw LLM generation output across Gemma 4, Qwen3, and Granite 4.1 / 4.2,
-         * stripping reasoning channels (`<|channel>thought`, `<think>`), ChatML/Granite/Mistral/Gemma turn tokens,
+         * Strips hidden reasoning channels (`<|channel>thought`, `<thought>`, `<think>`, `<thinking>`,
+         * `<reasoning>`, `<scratchpad>`, `<|begin_of_thought|>`, `[THINK]`) and special turn/tool tokens
+         * from raw model outputs so chain-of-thought reasoning can never leak into pasted text.
+         */
+        internal fun stripReasoningAndTurnTokens(rawText: String): String {
+            return rawText
+                .replace(CHANNEL_BLOCK_REGEX, "")
+                .replace(UNCLOSED_CHANNEL_REGEX, "")
+                .replace(THOUGHT_TAG_REGEX, "")
+                .replace(THINK_TAG_REGEX, "")
+                .replace(THINKING_TAG_REGEX, "")
+                .replace(BEGIN_OF_THOUGHT_REGEX, "")
+                .replace(BRACKET_THINK_REGEX, "")
+                .replace(ORPHAN_CLOSE_THOUGHT_PREFIX_REGEX, "")
+                .replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
+                .replace(ORPHAN_CLOSE_THINKING_PREFIX_REGEX, "")
+                .replace(ORPHAN_END_OF_THOUGHT_PREFIX_REGEX, "")
+                .replace(ORPHAN_CLOSE_BRACKET_THINK_REGEX, "")
+                .replace(UNCLOSED_THOUGHT_TAG_REGEX, "")
+                .replace(UNCLOSED_THINK_TAG_REGEX, "")
+                .replace(UNCLOSED_THINKING_TAG_REGEX, "")
+                .replace(UNCLOSED_BEGIN_OF_THOUGHT_REGEX, "")
+                .replace(UNCLOSED_BRACKET_THINK_REGEX, "")
+                .replace(TOOL_CALL_BLOCK_REGEX, "")
+                .replace(SPECIAL_TURN_TOKENS_REGEX, "")
+        }
+
+        /**
+         * Sanitizes raw LLM generation output across Gemma 4, Qwen3, Granite 4.1 / 4.2, and OpenAI reasoning APIs,
+         * stripping reasoning channels (`<|channel>thought`, `<think>`, `<thinking>`, `<reasoning>`), turn tokens,
          * `<transcript>` echoes, markdown fences, conversational preambles, or echoed continuity snippets, and falling
          * back safely to [fallbackInput] if generation is blank, runaway, or an AI assistant refusal.
          */
@@ -1110,16 +1162,8 @@ class GemmaTextProcessor(
                 .replace("\r\n", "\n")
                 .replace('\r', '\n')
 
-            // 1. Strip Gemma 4 thinking channels, <think> reasoning blocks (closed, orphan-closed, or truncated) & tool calls
-            text = text.replace(CHANNEL_BLOCK_REGEX, "")
-            text = text.replace(UNCLOSED_CHANNEL_REGEX, "")
-            text = text.replace(THOUGHT_TAG_REGEX, "")
-            text = text.replace(THINK_TAG_REGEX, "")
-            text = text.replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
-            text = text.replace(UNCLOSED_THINK_TAG_REGEX, "")
-            text = text.replace(TOOL_CALL_BLOCK_REGEX, "")
-            text = text.replace(SPECIAL_TURN_TOKENS_REGEX, "")
-            text = text.trim()
+            // 1. Strip reasoning blocks (closed, orphan-closed, or truncated), turn tokens & tool calls
+            text = stripReasoningAndTurnTokens(text).trim()
 
             // 2. Unwrap <transcript>...</transcript> if echoed by the model
             val wrapperMatch = TRANSCRIPT_WRAPPER_REGEX.find(text)
@@ -2817,7 +2861,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     private fun buildTurnThinkingConfig(
         modelSupportsThinking: Boolean,
         effectiveDisableThinking: Boolean,
-        isNpu: Boolean
+        isNpu: Boolean,
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM
     ): ThinkingConfig? {
         return when {
             !modelSupportsThinking -> null
@@ -2828,7 +2873,10 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 ThinkingConfig(enableThinking = true)
             }
             llmChoice.thinkingTokenBudgetCap > 0 -> {
-                ThinkingConfig(enableThinking = true, thinkingTokenBudget = llmChoice.thinkingTokenBudgetCap)
+                val scaledBudget = (llmChoice.thinkingTokenBudgetCap * thinkingEffort.localBudgetScale)
+                    .toInt()
+                    .coerceIn(64, max(llmChoice.thinkingTokenBudgetCap * 2, 1_024))
+                ThinkingConfig(enableThinking = true, thinkingTokenBudget = scaledBudget)
             }
             else -> ThinkingConfig(enableThinking = true)
         }
@@ -3071,6 +3119,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         customVocabulary: List<String>,
         disableThinking: Boolean = false,
         adaptiveThinking: Boolean = false,
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM,
+        enableTextChunking: Boolean = true,
         precedingSegmentTailOverride: String? = null,
         applyLeadingCursorContinuation: Boolean = true
     ): String {
@@ -3134,7 +3184,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
         // Pillar 6: Input-Grounded Sentence Sieve (keeps clean sentences verbatim in 0 ms and
         // sends only dirty sentence spans through the LLM)
-        if (precedingSegmentTailOverride == null && preNormalized.length <= maxCharsPerSegment) {
+        if (enableTextChunking && precedingSegmentTailOverride == null && preNormalized.length <= maxCharsPerSegment) {
             val sieveSpans = partitionSentenceSieve(preNormalized, preset, rootFieldContext)
             if (sieveSpans != null) {
                 val sieveOutputs = ArrayList<String>(sieveSpans.size)
@@ -3174,6 +3224,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                             allowPromptCache = spanIdx == 0 && precedingTail == null,
                             disableThinking = disableThinking,
                             adaptiveThinking = adaptiveThinking,
+                            thinkingEffort = thinkingEffort,
                             modelSupportsThinking = modelSupportsThinking
                         )
                         sieveOutputs.add(formattedSpan)
@@ -3197,7 +3248,11 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             }
         }
 
-        val segments = splitLongTranscript(preNormalized, maxCharsPerSegment)
+        val segments = if (enableTextChunking) {
+            splitLongTranscript(preNormalized, maxCharsPerSegment)
+        } else {
+            listOf(preNormalized)
+        }
         if (segments.isEmpty()) return text
 
         val transformedSegments = ArrayList<String>(segments.size)
@@ -3230,6 +3285,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                 allowPromptCache = index == 0 && precedingTail == null,
                 disableThinking = disableThinking,
                 adaptiveThinking = adaptiveThinking,
+                thinkingEffort = thinkingEffort,
                 modelSupportsThinking = modelSupportsThinking
             )
             transformedSegments.add(transformed)
@@ -3312,6 +3368,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         allowPromptCache: Boolean,
         disableThinking: Boolean,
         adaptiveThinking: Boolean,
+        thinkingEffort: LlmThinkingEffort,
         modelSupportsThinking: Boolean
     ): String {
         val segmentDisableThinking = when {
@@ -3465,7 +3522,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             customPrompt = customPrompt,
             precedingSegmentTail = precedingTail,
             disableThinking = segmentDisableThinking,
-            adaptiveSelected = adaptiveThinking && !disableThinking && modelSupportsThinking
+            adaptiveSelected = adaptiveThinking && !disableThinking && modelSupportsThinking,
+            thinkingEffort = thinkingEffort
         )
     }
 
@@ -3486,7 +3544,8 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         customPrompt: String,
         precedingSegmentTail: String?,
         disableThinking: Boolean,
-        adaptiveSelected: Boolean
+        adaptiveSelected: Boolean,
+        thinkingEffort: LlmThinkingEffort
     ): String {
         val callerJob = coroutineContext[Job]
         var attemptCacheKey = requestedCacheKey
@@ -3506,6 +3565,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     precedingSegmentTail = precedingSegmentTail,
                     disableThinking = disableThinking,
                     adaptiveSelected = adaptiveSelected,
+                    thinkingEffort = thinkingEffort,
                     callerJob = callerJob
                 )
             } catch (ce: CancellationException) {
@@ -3546,6 +3606,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         precedingSegmentTail: String?,
         disableThinking: Boolean,
         adaptiveSelected: Boolean,
+        thinkingEffort: LlmThinkingEffort,
         callerJob: Job?
     ): String {
         synchronized(engineLock) {
@@ -3562,6 +3623,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     precedingSegmentTail = precedingSegmentTail,
                     disableThinking = disableThinking,
                     adaptiveSelected = adaptiveSelected,
+                    thinkingEffort = thinkingEffort,
                     callerJob = callerJob
                 )
             } catch (ise: IllegalStateException) {
@@ -3583,6 +3645,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                         precedingSegmentTail = precedingSegmentTail,
                         disableThinking = true,
                         adaptiveSelected = adaptiveSelected,
+                        thinkingEffort = thinkingEffort,
                         callerJob = callerJob
                     )
                 } else {
@@ -3672,6 +3735,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         precedingSegmentTail: String?,
         disableThinking: Boolean,
         adaptiveSelected: Boolean,
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM,
         callerJob: Job?
     ): String {
         val candidate = candidates.getOrNull(activeCandidateIndex)
@@ -3684,12 +3748,14 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
             preset = preset,
             disableThinking = effectiveDisableThinking,
             maxContextTokens = activeMaxContextTokens,
-            llmChoice = llmChoice
+            llmChoice = llmChoice,
+            thinkingEffort = thinkingEffort
         )
         val thinkingConfig = buildTurnThinkingConfig(
             modelSupportsThinking = modelSupportsThinking,
             effectiveDisableThinking = effectiveDisableThinking,
-            isNpu = isNpu
+            isNpu = isNpu,
+            thinkingEffort = thinkingEffort
         )
         val templateContext = buildTemplateExtraContext(
             modelSupportsThinking = modelSupportsThinking,
@@ -3775,6 +3841,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
                     effectiveDisableThinking = effectiveDisableThinking,
                     maxVisibleChars = maxVisibleChars,
                     segmentFallback = segment,
+                    thinkingEffort = thinkingEffort,
                     callerJob = callerJob
                 )
                 val elapsedMs = SystemClock.elapsedRealtime() - startMs
@@ -3829,6 +3896,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         effectiveDisableThinking: Boolean,
         maxVisibleChars: Int,
         segmentFallback: String,
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.MEDIUM,
         callerJob: Job?
     ): StreamingTurnOutput {
         val streamLock = Any()
@@ -3846,13 +3914,20 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
         val abortedForRepetition = AtomicBoolean(false)
         val errorRef = AtomicReference<Throwable?>(null)
 
-        val thoughtBudgetTokens = llmChoice.thinkingTokenBudgetCap
-        val promptComplexityBonus = (userMessage.toString().length * 2).coerceIn(0, 700)
-        val maxThoughtChars = if (thoughtBudgetTokens > 0) {
-            val perTokenChars = if (isNpu) 6 else 8
-            max(360, thoughtBudgetTokens * perTokenChars + promptComplexityBonus)
+        val baseThoughtBudgetTokens = llmChoice.thinkingTokenBudgetCap
+        val scaledThoughtBudgetTokens = if (baseThoughtBudgetTokens > 0) {
+            (baseThoughtBudgetTokens * thinkingEffort.localBudgetScale)
+                .toInt()
+                .coerceIn(64, max(baseThoughtBudgetTokens * 2, 1_024))
         } else {
-            640
+            0
+        }
+        val promptComplexityBonus = (userMessage.toString().length * 2).coerceIn(0, 700)
+        val maxThoughtChars = if (scaledThoughtBudgetTokens > 0) {
+            val perTokenChars = if (isNpu) 6 else 8
+            max(280, scaledThoughtBudgetTokens * perTokenChars + promptComplexityBonus)
+        } else {
+            (640 * thinkingEffort.localBudgetScale).toInt().coerceIn(320, 1_280)
         }
         val noRepeatNgram = if (isNpu) null else NoRepeatNgramConfig(6, 64)
         val sendStartNs = SystemClock.elapsedRealtimeNanos()
@@ -4432,8 +4507,16 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
 
     private fun measureUnclosedInlineThoughtChars(buffer: CharSequence): Int {
         val str = buffer.toString().trimStart()
+        val lower = str.lowercase(Locale.ROOT)
         return when {
-            str.startsWith("<think>", ignoreCase = true) && !str.contains("</think>", ignoreCase = true) -> str.length
+            lower.startsWith("<think>") && !lower.contains("</think>") -> str.length
+            lower.startsWith("<thinking>") && !lower.contains("</thinking>") -> str.length
+            lower.startsWith("<reasoning>") && !lower.contains("</reasoning>") -> str.length
+            lower.startsWith("<scratchpad>") && !lower.contains("</scratchpad>") -> str.length
+            lower.startsWith("<thought>") && !lower.contains("</thought>") -> str.length
+            lower.startsWith("<|thought|>") && !lower.contains("</|thought|>") -> str.length
+            lower.startsWith("<|begin_of_thought|>") && !lower.contains("<|end_of_thought|>") -> str.length
+            lower.startsWith("[think]") && !lower.contains("[/think]") -> str.length
             str.startsWith("<|channel>thought") && !str.contains("<channel|>") -> str.length
             else -> 0
         }
@@ -4463,16 +4546,7 @@ check eight gigabyte ram headroom => check 8 GB RAM headroom"""
     }
 
     private fun isVisibleContentEmptyAfterStrippingThought(rawOutput: String): Boolean {
-        return rawOutput
-            .replace(CHANNEL_BLOCK_REGEX, "")
-            .replace(UNCLOSED_CHANNEL_REGEX, "")
-            .replace(THOUGHT_TAG_REGEX, "")
-            .replace(THINK_TAG_REGEX, "")
-            .replace(ORPHAN_CLOSE_THINK_PREFIX_REGEX, "")
-            .replace(UNCLOSED_THINK_TAG_REGEX, "")
-            .replace(TOOL_CALL_BLOCK_REGEX, "")
-            .replace(SPECIAL_TURN_TOKENS_REGEX, "")
-            .isBlank()
+        return stripReasoningAndTurnTokens(rawOutput).isBlank()
     }
 
     private fun inspectAppLabelForLog(systemInstructionText: String): String {

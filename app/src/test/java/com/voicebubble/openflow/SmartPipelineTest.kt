@@ -3609,4 +3609,75 @@ class SmartPipelineTest {
         assertFalse(punctOnly.isAiPostProcessingActive)
         assertTrue(punctOnly.isPunctEffectivelyActive)
     }
+
+    @Test
+    fun `ModelSettings resolves Remote Voz, Remote Ear shared vs two endpoints, RAM, chunking, and thinking defaults`() {
+        val defaults = ModelSettings()
+        assertFalse(defaults.remoteVozEnabled)
+        assertFalse(defaults.isRemoteVozActive)
+        assertFalse(defaults.remoteEarEnabled)
+        assertFalse(defaults.isRemoteEarActive)
+        assertEquals("Local", defaults.remoteAudioSummaryLabel)
+        assertFalse(defaults.openAiChunkingEnabled)
+        assertTrue(defaults.localLlmChunkingEnabled)
+        assertEquals(com.voicebubble.openflow.settings.LlmThinkingEffort.DEFAULT, defaults.openAiThinkingEffort)
+        assertEquals(com.voicebubble.openflow.settings.LlmThinkingEffort.MEDIUM, defaults.localThinkingEffort)
+
+        // Same endpoint shared between Remote Voz & Remote Ear
+        val sharedRemote = defaults.copy(
+            earEnabled = true,
+            remoteVozEnabled = true,
+            remoteVozBaseUrl = "http://192.168.1.50:8000/v1",
+            remoteVozApiKey = "shared-key",
+            remoteVozModel = "voz",
+            remoteVozTimeoutSeconds = 45,
+            remoteEarEnabled = true,
+            remoteEarUseSameEndpoint = true,
+            remoteEarModel = "ear"
+        )
+        assertTrue(sharedRemote.isRemoteVozActive)
+        assertTrue(sharedRemote.isRemoteEarActive)
+        assertEquals("http://192.168.1.50:8000/v1", sharedRemote.effectiveRemoteEarBaseUrl)
+        assertEquals("shared-key", sharedRemote.effectiveRemoteEarApiKey)
+        assertEquals(45, sharedRemote.effectiveRemoteEarTimeoutSeconds)
+        assertEquals("Voz + Ear · Shared API", sharedRemote.remoteAudioSummaryLabel)
+        assertEquals(0, sharedRemote.activeDiskFootprintMb)
+        assertEquals(0, sharedRemote.estimatedPeakRamMb)
+        assertFalse(sharedRemote.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.VOZ))
+        assertFalse(sharedRemote.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.EAR))
+        assertTrue(sharedRemote.enabledModels().isEmpty())
+
+        // Two separate endpoints for Remote Voz and Remote Ear
+        val dualEndpoints = sharedRemote.copy(
+            remoteEarUseSameEndpoint = false,
+            remoteEarBaseUrl = "https://ear.example.com/v1",
+            remoteEarApiKey = "ear-key",
+            remoteEarTimeoutSeconds = 15
+        )
+        assertEquals("https://ear.example.com/v1", dualEndpoints.effectiveRemoteEarBaseUrl)
+        assertEquals("ear-key", dualEndpoints.effectiveRemoteEarApiKey)
+        assertEquals(15, dualEndpoints.effectiveRemoteEarTimeoutSeconds)
+        assertEquals("Voz + Ear · 2 Endpoints", dualEndpoints.remoteAudioSummaryLabel)
+
+        // Hybrid: Remote Ear + Local Voz
+        val remoteEarOnly = defaults.copy(
+            earEnabled = true,
+            remoteVozEnabled = false,
+            remoteEarEnabled = true,
+            remoteEarUseSameEndpoint = true,
+            remoteEarBaseUrl = "http://192.168.1.51:8000/v1",
+            remoteEarModel = "ear"
+        )
+        assertFalse(remoteEarOnly.isRemoteVozActive)
+        assertTrue(remoteEarOnly.isRemoteEarActive)
+        assertEquals("Ear · API", remoteEarOnly.remoteAudioSummaryLabel)
+        assertEquals(1400, remoteEarOnly.estimatedPeakRamMb)
+        assertTrue(remoteEarOnly.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.VOZ))
+        assertFalse(remoteEarOnly.isModelEnabled(com.voicebubble.openflow.settings.DesertAntModel.EAR))
+
+        // Invalid URL shows Setup needed when enabled
+        val setupNeeded = defaults.copy(remoteVozEnabled = true, remoteVozBaseUrl = "not-a-url")
+        assertFalse(setupNeeded.isRemoteVozActive)
+        assertEquals("Setup needed", setupNeeded.remoteAudioSummaryLabel)
+    }
 }

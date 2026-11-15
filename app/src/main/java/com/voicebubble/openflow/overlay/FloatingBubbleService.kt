@@ -758,15 +758,21 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
         initPipelineJob = serviceScope.launch(Dispatchers.IO) {
             previousJob?.cancelAndJoin()
             try {
+                val activeSettings = com.voicebubble.openflow.settings.ModelSettings.load(this@FloatingBubbleService)
                 val vozDownloaded = com.voicebubble.openflow.settings.DesertAntModelStorage.isModelDownloaded(
                     this@FloatingBubbleService,
                     com.voicebubble.openflow.settings.DesertAntModel.VOZ
                 )
-                if (!vozDownloaded) {
+                if (!activeSettings.isRemoteVozActive && !vozDownloaded) {
+                    val promptMsg = if (activeSettings.remoteVozEnabled && !activeSettings.isRemoteVozConfigured) {
+                        "Please finish configuring the Remote Voz endpoint in OpenFlow."
+                    } else {
+                        "Please download the Voz speech model in OpenFlow first."
+                    }
                     withContext(Dispatchers.Main) {
                         android.widget.Toast.makeText(
                             this@FloatingBubbleService,
-                            "Please download the Voz speech model in OpenFlow first.",
+                            promptMsg,
                             android.widget.Toast.LENGTH_LONG
                         ).show()
                     }

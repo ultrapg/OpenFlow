@@ -2,6 +2,20 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.21.0] - 2026-11-15
+
+### Added
+- **Remote `Voz` & `Ear` via OpenAI-Compatible Transcription Endpoints (`core/speech/OpenAiCompatibleClient`, `core/speech/SmartPipeline`, `settings/ModelSettings`, `ui/settings/RemoteEndpointSettingsComponents`, `ui/settings/SpeechRecognitionSettingsSection`):**
+  - Added a collapsible **Remote Voz & Ear (OpenAI API)** section at the bottom of the *Desert Ant Audio Models* card (collapsed by default) with presets (**LAN / Self-Hosted**, **OpenAI**, **Groq**, **Local / Speaches**), URL normalization (`/v1/audio/transcriptions`), API key, `/models` discovery including audio/Whisper models, configurable timeouts, and live **Test Remote Voz** / **Test Remote Ear** calibration clip checks.
+  - Supports running `Voz` (STT via 16 kHz PCM16 WAV multipart upload with Custom Vocabulary `prompt` and `verbose_json` word-timestamp parsing + automatic `json` fallback) and/or `Ear` (spoken language ID across `verbose_json`, JSON-in-`text`, probabilities, ISO codes, and language names) on **the same shared endpoint** or on **two separate endpoints** (`Same endpoint & API key as Remote Voz` switch).
+  - Frees local RAM (`~1.4 GB` for `Voz`, `+50 MB` for `Ear`) and skips native model downloads/loads whenever remote endpoints are active, executing live `Ear` pre-detection lock-free outside `pipelineMutex`, and displays `Remote API` status badges across Settings.
+- **LLM Thinking Effort Selector (`settings/ModelSettings`, `OpenAiCompatibleClient`, `GemmaTextProcessor`):**
+  - Added `LlmThinkingEffort` options (**Auto**, **Off**, **Low**, **Medium**, **High** for OpenAI-compatible APIs via `reasoning_effort` with automatic HTTP `400`/`422` fallback retry, and **Low** / **Medium** / **High** budget scaling for local thinking-enabled models).
+
+### Changed
+- **LLM Text Chunking Option (Disabled by Default for Cloud/OpenAI APIs):** Added `Split Long Text into Chunks` toggles (`openAiChunkingEnabled = false` by default so cloud LLMs format the full transcript in a single pass with large output headroom; `localLlmChunkingEnabled = true` by default for finite-KV local models).
+- **Airtight Thinking Output Sanitization:** Excluded structured reasoning `content[]` parts (`thinking`, `reasoning`, `thought`, `redacted_thinking`, `analysis`, `thought=true`) in `OpenAiCompatibleClient.extractAssistantContent` and unified `GemmaTextProcessor.stripReasoningAndTurnTokens` to strip `<thinking>`, `<reasoning>`, `<scratchpad>`, `<thought>`, `<|begin_of_thought|>`, `[THINK]`, and unclosed/orphan variants so chain-of-thought text never leaks into pasted transcripts.
+
 ## [2.20.4] - 2026-11-14
 
 ### Fixed

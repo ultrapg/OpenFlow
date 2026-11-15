@@ -48,19 +48,15 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -85,6 +81,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -99,15 +96,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.voicebubble.openflow.core.speech.LlmBenchmarkResult
 import com.voicebubble.openflow.core.speech.LlmSinglePassMetrics
 import com.voicebubble.openflow.core.speech.ModelLoadState
 import com.voicebubble.openflow.core.speech.OpenAiCompatibleClient
-import com.voicebubble.openflow.core.speech.OpenAiConnectionTestResult
 import com.voicebubble.openflow.core.speech.PipelinePhase
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
@@ -118,6 +112,7 @@ import com.voicebubble.openflow.settings.HardwareAccelerator
 import com.voicebubble.openflow.settings.LlmBenchmarkSample
 import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.LlmProviderMode
+import com.voicebubble.openflow.settings.LlmThinkingEffort
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelSettings
 import com.voicebubble.openflow.settings.supportedLanguages
@@ -195,6 +190,8 @@ fun SpeechRecognitionSettingsSection(
                 }
                 persistAndReload(updated)
             }
+        } else if (model == DesertAntModel.EAR && settings.remoteEarEnabled && settings.isRemoteEarConfigured) {
+            persistAndReload(settings.copy(earEnabled = true))
         } else {
             scope.launch {
                 val alreadyDownloaded = withContext(Dispatchers.IO) {
@@ -509,6 +506,7 @@ fun SpeechRecognitionSettingsSection(
                         Text(
                             when {
                                 isWorking -> "Loading..."
+                                settings.enabledModels().isEmpty() && pipelineStatus.isReady -> "Refresh Remote Status"
                                 pipelineStatus.loadedCount == pipelineStatus.enabledCount && pipelineStatus.isReady ->
                                     "Re-Warm Models"
                                 else -> "Load Models Now"
@@ -624,15 +622,28 @@ fun SpeechRecognitionSettingsSection(
                     fontWeight = FontWeight.SemiBold
                 )
 
-                // Voz (Locked ON)
+                // Voz (Local or Remote API)
+                val vozTitle = if (settings.isRemoteVozActive) {
+                    "Voz — Speech Recognition (Remote API)"
+                } else {
+                    "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB)"
+                }
+                val vozSubtitle = when {
+                    settings.isRemoteVozActive ->
+                        "Using remote model '${settings.remoteVozModel.trim()}' • 0 MB local RAM"
+                    settings.remoteVozEnabled ->
+                        "Remote Voz selected • Finish configuring URL & model below (local fallback active)"
+                    else ->
+                        "Required • Core transcription across 25 European languages"
+                }
                 ModelToggleItem(
-                    title = "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB)",
-                    subtitle = "Required • Core transcription across 25 European languages",
+                    title = vozTitle,
+                    subtitle = vozSubtitle,
                     loadState = pipelineStatus.modelStates[DesertAntModel.VOZ],
                     checked = true,
                     enabled = false,
                     isLocked = true,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.VOZ && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                    activeDownloadState = if (!settings.isRemoteVozActive && downloadState.activeModel == DesertAntModel.VOZ && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
                     onPause = { ModelDownloadManager.pauseDownloads() },
                     onResume = { handleOptionalToggle(DesertAntModel.VOZ, true) },
                     onCheckedChange = {}
@@ -640,15 +651,30 @@ fun SpeechRecognitionSettingsSection(
 
                 HorizontalDivider()
 
-                // Ear
+                // Ear (Local or Remote API)
+                val earTitle = if (settings.isRemoteEarActive) {
+                    "Ear — Auto Language Detection (Remote API)"
+                } else {
+                    "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)"
+                }
+                val earSubtitle = if (settings.isRemoteEarActive) {
+                    val endpointTag = if (settings.remoteEarUseSameEndpoint && settings.remoteVozEnabled) {
+                        "shared endpoint"
+                    } else {
+                        "separate endpoint"
+                    }
+                    "Using remote model '${settings.remoteEarModel.trim()}' ($endpointTag) • 0 MB local RAM"
+                } else {
+                    DesertAntModel.EAR.roleSummary
+                }
                 ModelToggleItem(
-                    title = "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)",
-                    subtitle = DesertAntModel.EAR.roleSummary,
+                    title = earTitle,
+                    subtitle = earSubtitle,
                     loadState = pipelineStatus.modelStates[DesertAntModel.EAR],
                     checked = settings.earEnabled || DesertAntModel.EAR in downloadState.pendingAutoEnableModels,
                     enabled = !(downloadState.isRunning && downloadState.activeModel == DesertAntModel.EAR),
                     isLocked = false,
-                    activeDownloadState = if (downloadState.activeModel == DesertAntModel.EAR && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
+                    activeDownloadState = if (!settings.isRemoteEarActive && downloadState.activeModel == DesertAntModel.EAR && (downloadState.isRunning || downloadState.isPaused)) downloadState else null,
                     onPause = { ModelDownloadManager.pauseDownloads() },
                     onResume = { handleOptionalToggle(DesertAntModel.EAR, true) },
                     onCheckedChange = { handleOptionalToggle(DesertAntModel.EAR, it) }
@@ -712,6 +738,11 @@ fun SpeechRecognitionSettingsSection(
                         }
                     }
                 }
+
+                RemoteAudioModelsCollapsibleSection(
+                    settings = settings,
+                    onPersistSettings = persistAndReload
+                )
             }
         }
 
@@ -1013,7 +1044,28 @@ fun SpeechRecognitionSettingsSection(
                                         }
                                     )
                                 }
+
+                                if (!settings.gemmaDisableThinking) {
+                                    ThinkingEffortChipRow(
+                                        title = "Thinking Effort",
+                                        subtitle = "Controls how much reasoning token budget ${selectedLlm.title} uses when thinking is active.",
+                                        options = LlmThinkingEffort.LOCAL_OPTIONS,
+                                        selected = settings.localThinkingEffort,
+                                        onSelect = { effort ->
+                                            persistAndReload(settings.copy(localThinkingEffort = effort))
+                                        }
+                                    )
+                                }
                             }
+
+                            SettingToggleRow(
+                                title = "Split Long Text into Chunks",
+                                subtitle = "Splits long transcripts into sentence-bounded passes for finite KV cache memory. On by default for local models.",
+                                checked = settings.localLlmChunkingEnabled,
+                                onCheckedChange = { chunking ->
+                                    persistAndReload(settings.copy(localLlmChunkingEnabled = chunking))
+                                }
+                            )
                         } else {
                             OpenAiApiEndpointSection(
                                 settings = settings,
@@ -1404,6 +1456,10 @@ fun SpeechRecognitionSettingsSection(
                             val ramTag = if (loadState == ModelLoadState.LOADED) " • Loaded" else ""
                             val sizeLabel = if (model.isLlmModel) model.sizeGbLabel else "${model.sizeMb} MB"
                             val statusText = when {
+                                model == DesertAntModel.VOZ && settings.isRemoteVozActive ->
+                                    if (isDownloaded) "Downloaded • $sizeLabel (Remote Voz API active)" else "Using Remote Voz API ($sizeLabel saved)"
+                                model == DesertAntModel.EAR && settings.isRemoteEarActive ->
+                                    if (isDownloaded) "Downloaded • $sizeLabel (Remote Ear API active)" else "Using Remote Ear API"
                                 model.isRequired && isDownloaded -> "Downloaded • $sizeLabel (Required$ramTag)"
                                 isDownloaded && isBypassedByAi -> if (settings.isOpenAiApiEnabled) {
                                     "Downloaded • $sizeLabel (Bypassed by OpenAI API)"
@@ -1611,6 +1667,11 @@ private fun ModelStatusChip(
             Color(0xFF1B5E20).copy(alpha = 0.16f),
             Color(0xFF2E7D32),
             Color(0xFF2E7D32)
+        )
+        ModelLoadState.REMOTE -> Triple(
+            MaterialTheme.colorScheme.secondaryContainer,
+            MaterialTheme.colorScheme.onSecondaryContainer,
+            MaterialTheme.colorScheme.primary
         )
         ModelLoadState.ACTIVE -> Triple(
             MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
@@ -2297,414 +2358,95 @@ private fun OpenAiApiEndpointSection(
     settings: ModelSettings,
     onPersistSettings: (ModelSettings) -> Unit
 ) {
-    val scope = rememberCoroutineScope()
-    var urlDraft by rememberSaveable { mutableStateOf(settings.openAiBaseUrl) }
-    var apiKeyDraft by rememberSaveable { mutableStateOf(settings.openAiApiKey) }
-    var modelDraft by rememberSaveable { mutableStateOf(settings.openAiModel) }
-    var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
-
-    var fetchedModels by remember { mutableStateOf<List<String>>(emptyList()) }
-    var showModelMenu by remember { mutableStateOf(false) }
-    var isFetchingModels by remember { mutableStateOf(false) }
-    var fetchError by remember { mutableStateOf<String?>(null) }
-
-    var isTestingConnection by remember { mutableStateOf(false) }
-    var connectionResult by remember { mutableStateOf<OpenAiConnectionTestResult?>(null) }
-
-    LaunchedEffect(settings.openAiBaseUrl) {
-        if (urlDraft.trim() != settings.openAiBaseUrl) {
-            urlDraft = settings.openAiBaseUrl
-        }
-    }
-    LaunchedEffect(settings.openAiApiKey) {
-        if (apiKeyDraft.trim() != settings.openAiApiKey) {
-            apiKeyDraft = settings.openAiApiKey
-        }
-    }
-    LaunchedEffect(settings.openAiModel) {
-        if (modelDraft.trim() != settings.openAiModel) {
-            modelDraft = settings.openAiModel
-        }
-    }
-
-    LaunchedEffect(urlDraft, apiKeyDraft, modelDraft) {
-        val cleanUrl = urlDraft.trim()
-        val cleanKey = apiKeyDraft.trim()
-        val cleanModel = modelDraft.trim()
-        if (cleanUrl == settings.openAiBaseUrl &&
-            cleanKey == settings.openAiApiKey &&
-            cleanModel == settings.openAiModel
-        ) {
-            return@LaunchedEffect
-        }
-        delay(350)
-        onPersistSettings(
-            settings.copy(
-                llmProvider = LlmProviderMode.OPENAI_API,
-                openAiBaseUrl = cleanUrl,
-                openAiApiKey = cleanKey,
-                openAiModel = cleanModel
-            )
-        )
-    }
-
-    fun flushedSettings(
-        gemmaEnabledOverride: Boolean = settings.gemmaEnabled,
-        timeoutOverride: Int = settings.openAiTimeoutSeconds
-    ): ModelSettings {
-        return settings.copy(
-            llmProvider = LlmProviderMode.OPENAI_API,
-            gemmaEnabled = gemmaEnabledOverride,
-            openAiBaseUrl = urlDraft.trim(),
-            openAiApiKey = apiKeyDraft.trim(),
-            openAiModel = modelDraft.trim(),
-            openAiTimeoutSeconds = timeoutOverride
-        )
-    }
-
-    val urlValid = OpenAiCompatibleClient.isValidHttpUrl(urlDraft)
-    val modelReady = modelDraft.trim().isNotEmpty()
-    val resolvedChatUrl = remember(urlDraft) {
-        if (urlDraft.isBlank()) "" else OpenAiCompatibleClient.resolveChatCompletionsUrl(urlDraft)
-    }
+    val urlReady = OpenAiCompatibleClient.isValidHttpUrl(settings.openAiBaseUrl)
+    val modelReady = settings.openAiModel.trim().isNotEmpty()
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .clickable {
-                    onPersistSettings(flushedSettings(gemmaEnabledOverride = !settings.gemmaEnabled))
-                }
-                .padding(vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(end = 12.dp)
-            ) {
-                Text(
-                    text = "Enable AI Post-Processing (OpenAI API)",
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    text = when {
-                        urlDraft.isBlank() || !modelReady -> "Enter a valid Base URL & Model ID below."
-                        settings.gemmaEnabled -> "Active · ${modelDraft.trim()} (${settings.openAiTimeoutSeconds}s timeout)"
-                        else -> "Configured · Toggle on to format transcripts remotely."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+        SettingToggleRow(
+            title = "Enable AI Post-Processing (OpenAI API)",
+            subtitle = when {
+                !urlReady || !modelReady -> "Enter a valid Base URL & Model ID below."
+                settings.gemmaEnabled -> "Active · ${settings.openAiModel.trim()} (${settings.openAiTimeoutSeconds}s timeout)"
+                else -> "Configured · Toggle on to format transcripts remotely."
+            },
+            checked = settings.gemmaEnabled && settings.llmProvider == LlmProviderMode.OPENAI_API,
+            onCheckedChange = { enabled ->
+                onPersistSettings(
+                    settings.copy(
+                        llmProvider = LlmProviderMode.OPENAI_API,
+                        gemmaEnabled = enabled
+                    )
                 )
             }
-            Switch(
-                checked = settings.gemmaEnabled && settings.llmProvider == LlmProviderMode.OPENAI_API,
-                onCheckedChange = { enabled ->
-                    onPersistSettings(flushedSettings(gemmaEnabledOverride = enabled))
+        )
+
+        key("openai_llm_endpoint") {
+            RemoteEndpointFieldsBlock(
+                baseUrl = settings.openAiBaseUrl,
+                apiKey = settings.openAiApiKey,
+                model = settings.openAiModel,
+                timeoutSeconds = settings.openAiTimeoutSeconds,
+                presets = OpenAiCompatibleClient.PRESETS.asCompat(),
+                urlPlaceholder = "https://api.openai.com/v1",
+                modelPlaceholder = "gpt-4o-mini",
+                urlSupportingDefault = "Accepts base URL, host:port (LAN Ollama/LM Studio), or /chat/completions.",
+                resolveEndpointPreview = OpenAiCompatibleClient::resolveChatCompletionsUrl,
+                includeAudioModelsInFetch = false,
+                timeoutOptions = listOf(10, 20, 30, 45),
+                testButtonLabel = "Test Connection",
+                testingButtonLabel = "Testing API Connection...",
+                onFieldsCommit = { url, key, model ->
+                    onPersistSettings(
+                        settings.copy(
+                            llmProvider = LlmProviderMode.OPENAI_API,
+                            openAiBaseUrl = url,
+                            openAiApiKey = key,
+                            openAiModel = model
+                        )
+                    )
+                },
+                onTimeoutChange = { seconds ->
+                    onPersistSettings(
+                        settings.copy(
+                            llmProvider = LlmProviderMode.OPENAI_API,
+                            openAiTimeoutSeconds = seconds
+                        )
+                    )
+                },
+                onTestConnection = { url, key, model, timeout ->
+                    OpenAiCompatibleClient.testConnection(
+                        baseUrl = url,
+                        apiKey = key,
+                        model = model,
+                        timeoutSeconds = timeout,
+                        thinkingEffort = settings.openAiThinkingEffort
+                    )
+                },
+                footerTip = if (settings.isRemoteVozActive) {
+                    "Tip: Hidden reasoning/thinking output is automatically stripped so only final formatted text is pasted."
+                } else {
+                    "Tip: Voice audio is transcribed offline on your device first; only transcript text is sent, and hidden reasoning/thinking output is stripped automatically."
                 }
             )
         }
 
-        Surface(
-            shape = RoundedCornerShape(10.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "Quick Endpoint Presets",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    OpenAiCompatibleClient.PRESETS.forEach { preset ->
-                        val isSelectedPreset = urlDraft.trim().trimEnd('/').equals(
-                            preset.baseUrl.trimEnd('/'),
-                            ignoreCase = true
-                        )
-                        FilterChip(
-                            selected = isSelectedPreset,
-                            onClick = {
-                                urlDraft = preset.baseUrl
-                                modelDraft = preset.defaultModel
-                                fetchedModels = emptyList()
-                                fetchError = null
-                                connectionResult = null
-                                onPersistSettings(
-                                    settings.copy(
-                                        llmProvider = LlmProviderMode.OPENAI_API,
-                                        openAiBaseUrl = preset.baseUrl,
-                                        openAiApiKey = apiKeyDraft.trim(),
-                                        openAiModel = preset.defaultModel
-                                    )
-                                )
-                            },
-                            label = { Text(preset.label) }
-                        )
-                    }
-                }
-
-                OutlinedTextField(
-                    value = urlDraft,
-                    onValueChange = {
-                        urlDraft = it
-                        fetchedModels = emptyList()
-                        connectionResult = null
-                    },
-                    label = { Text("Base URL") },
-                    placeholder = { Text("https://api.openai.com/v1") },
-                    isError = urlDraft.isNotBlank() && !urlValid,
-                    supportingText = {
-                        Text(
-                            text = when {
-                                urlDraft.isBlank() -> "Accepts base URL, host:port (LAN Ollama/LM Studio), or /chat/completions."
-                                !urlValid -> "Enter a valid http:// or https:// URL."
-                                else -> "Endpoint: $resolvedChatUrl"
-                            },
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                OutlinedTextField(
-                    value = apiKeyDraft,
-                    onValueChange = {
-                        apiKeyDraft = it
-                        fetchedModels = emptyList()
-                        connectionResult = null
-                    },
-                    label = { Text("API Key (optional for local servers)") },
-                    placeholder = { Text("sk-...") },
-                    visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = {
-                        IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
-                            Icon(
-                                imageVector = if (apiKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                contentDescription = if (apiKeyVisible) "Hide API Key" else "Show API Key"
-                            )
-                        }
-                    },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = modelDraft,
-                        onValueChange = {
-                            modelDraft = it
-                            connectionResult = null
-                        },
-                        label = { Text("Model ID") },
-                        placeholder = { Text("gpt-4o-mini") },
-                        trailingIcon = if (fetchedModels.isNotEmpty()) {
-                            {
-                                IconButton(onClick = { showModelMenu = true }) {
-                                    Icon(
-                                        imageVector = Icons.Default.ArrowDropDown,
-                                        contentDescription = "Choose fetched model"
-                                    )
-                                }
-                            }
-                        } else {
-                            null
-                        },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-
-                    Box(modifier = Modifier.padding(top = 6.dp)) {
-                        OutlinedButton(
-                            enabled = urlValid && !isFetchingModels,
-                            onClick = {
-                                isFetchingModels = true
-                                fetchError = null
-                                val flushed = flushedSettings()
-                                onPersistSettings(flushed)
-                                scope.launch {
-                                    val res = OpenAiCompatibleClient.fetchAvailableModels(
-                                        baseUrl = flushed.openAiBaseUrl,
-                                        apiKey = flushed.openAiApiKey,
-                                        timeoutSeconds = flushed.openAiTimeoutSeconds
-                                    )
-                                    isFetchingModels = false
-                                    res.onSuccess { list ->
-                                        fetchedModels = list
-                                        if (modelDraft.isBlank() && list.isNotEmpty()) {
-                                            modelDraft = list.first()
-                                            onPersistSettings(flushedSettings())
-                                        }
-                                        showModelMenu = true
-                                    }.onFailure { err ->
-                                        fetchError = err.message ?: "Failed to fetch models"
-                                    }
-                                }
-                            }
-                        ) {
-                            if (isFetchingModels) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Fetch")
-                            }
-                        }
-
-                        DropdownMenu(
-                            expanded = showModelMenu && fetchedModels.isNotEmpty(),
-                            onDismissRequest = { showModelMenu = false }
-                        ) {
-                            fetchedModels.take(40).forEach { candidateModel ->
-                                DropdownMenuItem(
-                                    text = { Text(candidateModel) },
-                                    onClick = {
-                                        modelDraft = candidateModel
-                                        showModelMenu = false
-                                        connectionResult = null
-                                        onPersistSettings(flushedSettings())
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if (!fetchError.isNullOrBlank()) {
-                    Text(
-                        text = fetchError.orEmpty(),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "Timeout:",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    listOf(10, 20, 30, 45).forEach { seconds ->
-                        FilterChip(
-                            selected = settings.openAiTimeoutSeconds == seconds,
-                            onClick = {
-                                onPersistSettings(flushedSettings(timeoutOverride = seconds))
-                            },
-                            label = { Text("${seconds}s") }
-                        )
-                    }
-                }
-
-                Button(
-                    enabled = urlValid && modelReady && !isTestingConnection,
-                    onClick = {
-                        isTestingConnection = true
-                        connectionResult = null
-                        fetchError = null
-                        val flushed = flushedSettings()
-                        onPersistSettings(flushed)
-                        scope.launch {
-                            val result = OpenAiCompatibleClient.testConnection(
-                                baseUrl = flushed.openAiBaseUrl,
-                                apiKey = flushed.openAiApiKey,
-                                model = flushed.openAiModel,
-                                timeoutSeconds = flushed.openAiTimeoutSeconds
-                            )
-                            connectionResult = result
-                            isTestingConnection = false
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    if (isTestingConnection) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.onPrimary
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Testing API Connection...")
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.Bolt,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Test Connection")
-                    }
-                }
-
-                connectionResult?.let { result ->
-                    Surface(
-                        shape = RoundedCornerShape(8.dp),
-                        color = if (result.success) {
-                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
-                        } else {
-                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(10.dp),
-                            verticalAlignment = Alignment.Top,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = if (result.success) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
-                                contentDescription = null,
-                                tint = if (result.success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = result.message,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (result.success) {
-                                    MaterialTheme.colorScheme.onPrimaryContainer
-                                } else {
-                                    MaterialTheme.colorScheme.onErrorContainer
-                                }
-                            )
-                        }
-                    }
-                }
-
-                if (urlValid && modelReady) {
-                    Text(
-                        text = "Tip: Voice audio is always transcribed offline on your device first; only the final transcript text is sent for formatting.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+        ThinkingEffortChipRow(
+            title = "Thinking Effort",
+            subtitle = "Sends reasoning_effort for thinking models (falls back automatically if unsupported). Thinking text is never pasted.",
+            options = LlmThinkingEffort.API_OPTIONS,
+            selected = settings.openAiThinkingEffort,
+            onSelect = { effort ->
+                onPersistSettings(settings.copy(openAiThinkingEffort = effort))
             }
-        }
+        )
+
+        SettingToggleRow(
+            title = "Split Long Text into Chunks",
+            subtitle = "Off by default — cloud models have huge context windows and format your entire transcript in one pass. Enable only for small local servers.",
+            checked = settings.openAiChunkingEnabled,
+            onCheckedChange = { chunking ->
+                onPersistSettings(settings.copy(openAiChunkingEnabled = chunking))
+            }
+        )
     }
 }
