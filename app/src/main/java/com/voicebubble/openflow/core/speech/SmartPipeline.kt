@@ -518,14 +518,18 @@ class SmartPipeline(
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
             val finalPhase = if (vozReady) {
                 PipelinePhase.READY
-            } else if (!DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)) {
+            } else if (currentSettings.isRemoteVozActive ||
+                !DesertAntModelStorage.isModelDownloaded(appContext, DesertAntModel.VOZ)
+            ) {
                 PipelinePhase.UNINITIALIZED
             } else {
                 PipelinePhase.ERROR
             }
-            val finalMsg = when (finalPhase) {
-                PipelinePhase.READY -> readyStatusMessageLocked(currentSettings)
-                PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
+            val finalMsg = when {
+                finalPhase == PipelinePhase.READY -> readyStatusMessageLocked(currentSettings)
+                finalPhase == PipelinePhase.UNINITIALIZED && currentSettings.remoteVozEnabled && !currentSettings.isRemoteVozConfigured ->
+                    "Remote Voz setup needed"
+                finalPhase == PipelinePhase.UNINITIALIZED -> "Models not downloaded yet"
                 else -> "Failed to load Voz speech model"
             }
 
@@ -2923,6 +2927,7 @@ class SmartPipeline(
             timeoutSeconds = activeSettings.openAiTimeoutSeconds,
             engineResolved = engineResolved,
             thinkingEffort = activeSettings.openAiThinkingEffort,
+            customReasoningEffort = activeSettings.openAiCustomReasoningEffort,
             chunkingEnabled = activeSettings.openAiChunkingEnabled
         )
         return if (outcome.succeeded) {

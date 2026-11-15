@@ -88,7 +88,8 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 val (loadedSettings, allReady) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     val loaded = ModelSettings.load(context)
-                    val ready = DesertAntModelStorage.areAllEnabledModelsDownloaded(context, loaded)
+                    val ready = ModelSettings.isOnboardingCompleted(context) ||
+                        DesertAntModelStorage.areAllEnabledModelsDownloaded(context, loaded)
                     loaded to ready
                 }
                 modelSettings = loadedSettings

@@ -196,7 +196,12 @@ object OpenAiCompatibleClient {
         "thought",
         "redacted_thinking",
         "analysis",
-        "reasoning_content"
+        "reasoning_content",
+        "internal_thought",
+        "thought_signature",
+        "reasoning_text",
+        "thinking_content",
+        "encrypted_content"
     )
 
     private val LANGUAGE_ALIAS_MAP: Map<String, String> = mapOf(
@@ -339,7 +344,8 @@ object OpenAiCompatibleClient {
         userPrompt: String,
         includeSamplingParams: Boolean = true,
         maxTokens: Int? = null,
-        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT,
+        customReasoningEffort: String = ""
     ): JSONObject {
         val messages = JSONArray().apply {
             if (systemInstruction.isNotBlank()) {
@@ -367,7 +373,7 @@ object OpenAiCompatibleClient {
             if (maxTokens != null && maxTokens > 0) {
                 put("max_tokens", maxTokens)
             }
-            thinkingEffort.apiValue?.let { effortValue ->
+            LlmThinkingEffort.resolveApiValue(thinkingEffort, customReasoningEffort)?.let { effortValue ->
                 put("reasoning_effort", effortValue)
             }
         }
@@ -398,9 +404,13 @@ object OpenAiCompatibleClient {
                                 is JSONObject -> {
                                     val partType = part.optString("type", "").lowercase(Locale.ROOT)
                                     val isThoughtPart = part.optBoolean("thought", false) ||
-                                        partType in THINKING_CONTENT_PART_TYPES
+                                        partType in THINKING_CONTENT_PART_TYPES ||
+                                        part.has("thinking") ||
+                                        part.has("reasoning") ||
+                                        part.has("reasoning_content")
                                     if (!isThoughtPart) {
                                         val text = part.optString("text", "")
+                                            .ifEmpty { part.optString("content", "") }
                                         if (text.isNotEmpty()) append(text)
                                     }
                                 }
@@ -521,7 +531,8 @@ object OpenAiCompatibleClient {
         apiKey: String,
         model: String,
         timeoutSeconds: Int = DEFAULT_TIMEOUT_SECONDS,
-        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT
+        thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT,
+        customReasoningEffort: String = ""
     ): OpenAiConnectionTestResult = withContext(Dispatchers.IO) {
         if (!isValidHttpUrl(baseUrl)) {
             return@withContext OpenAiConnectionTestResult(
@@ -544,20 +555,29 @@ object OpenAiCompatibleClient {
         val startNs = System.nanoTime()
 
         try {
+            val effectiveEffortValue = LlmThinkingEffort.resolveApiValue(thinkingEffort, customReasoningEffort)
+            val disableThinking = thinkingEffort == LlmThinkingEffort.OFF ||
+                thinkingEffort == LlmThinkingEffort.DEFAULT ||
+                LlmThinkingEffort.isDisabledApiValue(effectiveEffortValue)
             val systemPrompt = GemmaTextProcessor.buildSystemInstruction(
                 preset = GemmaPromptPreset.CLEAN_AND_POLISH,
                 languageCode = "en",
-                disableThinking = thinkingEffort == LlmThinkingEffort.OFF || thinkingEffort == LlmThinkingEffort.DEFAULT,
+                disableThinking = disableThinking,
                 llmChoice = LlmModelChoice.GEMMA_4_E2B,
                 llmProvider = LlmProviderMode.OPENAI_API
             )
             val sampleInput = "um hey sarah lets meet at three thirty pm"
             val userPrompt = GemmaTextProcessor.buildUserPrompt(sampleInput, "en")
-            val testMaxTokens = when (thinkingEffort) {
-                LlmThinkingEffort.LOW -> 256
-                LlmThinkingEffort.MEDIUM -> 512
-                LlmThinkingEffort.HIGH -> 1_024
-                else -> 128
+            val testMaxTokens = when {
+                LlmThinkingEffort.isDisabledApiValue(effectiveEffortValue) -> 256
+                thinkingEffort == LlmThinkingEffort.MINIMAL -> 512
+                thinkingEffort == LlmThinkingEffort.LOW -> 512
+                thinkingEffort == LlmThinkingEffort.MEDIUM -> 1_024
+                thinkingEffort == LlmThinkingEffort.HIGH -> 1_536
+                thinkingEffort == LlmThinkingEffort.XHIGH ||
+                    thinkingEffort == LlmThinkingEffort.MAX ||
+                    thinkingEffort == LlmThinkingEffort.CUSTOM -> 2_048
+                else -> 512
             }
             val response = executeChatCompletionWithFallback(
                 chatUrl = chatUrl,
@@ -567,6 +587,7 @@ object OpenAiCompatibleClient {
                 userPrompt = userPrompt,
                 maxTokens = testMaxTokens,
                 thinkingEffort = thinkingEffort,
+                customReasoningEffort = customReasoningEffort,
                 connectTimeoutMs = minOf(timeoutMs, 10_000),
                 readTimeoutMs = timeoutMs
             )
@@ -632,6 +653,7 @@ object OpenAiCompatibleClient {
         timeoutSeconds: Int = DEFAULT_TIMEOUT_SECONDS,
         engineResolved: Boolean = false,
         thinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT,
+        customReasoningEffort: String = "",
         chunkingEnabled: Boolean = false
     ): OpenAiCompletionOutcome = withContext(Dispatchers.IO) {
         val trimmed = text.trim()
@@ -688,6 +710,10 @@ object OpenAiCompatibleClient {
                 } else {
                     null
                 }
+                val effectiveEffortValue = LlmThinkingEffort.resolveApiValue(thinkingEffort, customReasoningEffort)
+                val disableThinking = thinkingEffort == LlmThinkingEffort.OFF ||
+                    thinkingEffort == LlmThinkingEffort.DEFAULT ||
+                    LlmThinkingEffort.isDisabledApiValue(effectiveEffortValue)
                 val systemInstruction = GemmaTextProcessor.buildSystemInstruction(
                     preset = preset,
                     customPrompt = customPrompt,
@@ -695,12 +721,12 @@ object OpenAiCompatibleClient {
                     customVocabulary = customVocabulary,
                     fieldContext = segmentFieldCtx,
                     precedingSegmentTail = precedingTail,
-                    disableThinking = thinkingEffort == LlmThinkingEffort.OFF || thinkingEffort == LlmThinkingEffort.DEFAULT,
+                    disableThinking = disableThinking,
                     llmChoice = LlmModelChoice.GEMMA_4_E2B,
                     llmProvider = LlmProviderMode.OPENAI_API
                 )
                 val userPrompt = GemmaTextProcessor.buildUserPrompt(segment, languageCode)
-                val maxOutputTokens = computeRemoteMaxOutputTokens(segment, thinkingEffort)
+                val maxOutputTokens = computeRemoteMaxOutputTokens(segment, thinkingEffort, customReasoningEffort)
 
                 val response = executeChatCompletionWithFallback(
                     chatUrl = chatUrl,
@@ -710,6 +736,7 @@ object OpenAiCompatibleClient {
                     userPrompt = userPrompt,
                     maxTokens = maxOutputTokens,
                     thinkingEffort = thinkingEffort,
+                    customReasoningEffort = customReasoningEffort,
                     connectTimeoutMs = minOf(timeoutMs, 10_000),
                     readTimeoutMs = timeoutMs
                 )
@@ -1158,16 +1185,24 @@ object OpenAiCompatibleClient {
 
     private fun computeRemoteMaxOutputTokens(
         text: String,
-        thinkingEffort: LlmThinkingEffort
+        thinkingEffort: LlmThinkingEffort,
+        customReasoningEffort: String = ""
     ): Int {
         val approxWords = text.split(Regex("\\s+")).count { it.isNotEmpty() }
         val baseTokens = (approxWords * 4 + 256).coerceIn(256, 12_288)
-        val thinkingHeadroom = when (thinkingEffort) {
-            LlmThinkingEffort.DEFAULT,
-            LlmThinkingEffort.OFF -> 0
-            LlmThinkingEffort.LOW -> 1_024
-            LlmThinkingEffort.MEDIUM -> 2_048
-            LlmThinkingEffort.HIGH -> 4_096
+        val effectiveEffortValue = LlmThinkingEffort.resolveApiValue(thinkingEffort, customReasoningEffort)
+        val thinkingHeadroom = when {
+            LlmThinkingEffort.isDisabledApiValue(effectiveEffortValue) -> 0
+            thinkingEffort == LlmThinkingEffort.OFF -> 0
+            thinkingEffort == LlmThinkingEffort.DEFAULT -> 1_024
+            thinkingEffort == LlmThinkingEffort.MINIMAL -> 512
+            thinkingEffort == LlmThinkingEffort.LOW -> 1_024
+            thinkingEffort == LlmThinkingEffort.MEDIUM -> 2_048
+            thinkingEffort == LlmThinkingEffort.HIGH -> 4_096
+            thinkingEffort == LlmThinkingEffort.XHIGH -> 6_144
+            thinkingEffort == LlmThinkingEffort.MAX -> 8_192
+            thinkingEffort == LlmThinkingEffort.CUSTOM -> if (effectiveEffortValue == null) 1_024 else 4_096
+            else -> 1_024
         }
         return (baseTokens + thinkingHeadroom).coerceIn(256, 16_384)
     }
@@ -1180,6 +1215,7 @@ object OpenAiCompatibleClient {
         userPrompt: String,
         maxTokens: Int?,
         thinkingEffort: LlmThinkingEffort,
+        customReasoningEffort: String = "",
         connectTimeoutMs: Int,
         readTimeoutMs: Int
     ): HttpResult {
@@ -1189,7 +1225,8 @@ object OpenAiCompatibleClient {
             userPrompt = userPrompt,
             includeSamplingParams = true,
             maxTokens = maxTokens,
-            thinkingEffort = thinkingEffort
+            thinkingEffort = thinkingEffort,
+            customReasoningEffort = customReasoningEffort
         )
         var response = executeHttpRequest(
             urlString = chatUrl,
@@ -1200,15 +1237,18 @@ object OpenAiCompatibleClient {
             readTimeoutMs = readTimeoutMs
         )
         if ((response.statusCode == 400 || response.statusCode == 422) && shouldRetryWithoutOptionalParams(response.body)) {
-            val dropEffort = thinkingEffort != LlmThinkingEffort.DEFAULT && mentionsReasoningParam(response.body)
+            val hasExplicitEffort = LlmThinkingEffort.resolveApiValue(thinkingEffort, customReasoningEffort) != null
+            val dropEffort = hasExplicitEffort && mentionsReasoningParam(response.body)
             val fallbackEffort = if (dropEffort) LlmThinkingEffort.DEFAULT else thinkingEffort
+            val fallbackCustomEffort = if (dropEffort) "" else customReasoningEffort
             val retryPayload = buildChatCompletionPayload(
                 model = model,
                 systemInstruction = systemInstruction,
                 userPrompt = userPrompt,
                 includeSamplingParams = false,
                 maxTokens = null,
-                thinkingEffort = fallbackEffort
+                thinkingEffort = fallbackEffort,
+                customReasoningEffort = fallbackCustomEffort
             )
             response = executeHttpRequest(
                 urlString = chatUrl,
@@ -1219,7 +1259,7 @@ object OpenAiCompatibleClient {
                 readTimeoutMs = readTimeoutMs
             )
             if ((response.statusCode == 400 || response.statusCode == 422) &&
-                fallbackEffort != LlmThinkingEffort.DEFAULT &&
+                LlmThinkingEffort.resolveApiValue(fallbackEffort, fallbackCustomEffort) != null &&
                 mentionsReasoningParam(response.body)
             ) {
                 val minimalPayload = buildChatCompletionPayload(
@@ -1228,7 +1268,8 @@ object OpenAiCompatibleClient {
                     userPrompt = userPrompt,
                     includeSamplingParams = false,
                     maxTokens = null,
-                    thinkingEffort = LlmThinkingEffort.DEFAULT
+                    thinkingEffort = LlmThinkingEffort.DEFAULT,
+                    customReasoningEffort = ""
                 )
                 response = executeHttpRequest(
                     urlString = chatUrl,
@@ -1409,7 +1450,12 @@ object OpenAiCompatibleClient {
 
     private fun mentionsReasoningParam(errorBody: String): Boolean {
         val lower = errorBody.lowercase(Locale.ROOT)
-        return lower.contains("reasoning_effort") || lower.contains("reasoning") || lower.contains("'none'")
+        return lower.contains("reasoning_effort") ||
+            lower.contains("reasoning") ||
+            lower.contains("'none'") ||
+            lower.contains("'xhigh'") ||
+            lower.contains("'max'") ||
+            lower.contains("'minimal'")
     }
 
     private fun shouldRetryWithoutOptionalParams(errorBody: String): Boolean {
@@ -1418,8 +1464,10 @@ object OpenAiCompatibleClient {
             lower.contains("max_tokens") ||
             lower.contains("max_completion_tokens") ||
             lower.contains("reasoning_effort") ||
+            lower.contains("reasoning") ||
             lower.contains("unsupported parameter") ||
-            lower.contains("unknown_parameter")
+            lower.contains("unknown_parameter") ||
+            lower.contains("invalid_value")
     }
 
     private fun shouldRetryAudioAsSimpleJson(errorBody: String): Boolean {

@@ -17,6 +17,7 @@
 package com.voicebubble.openflow.ui.settings
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -126,15 +127,51 @@ internal fun SettingToggleRow(
 /**
  * Reusable chip selector for LLM reasoning depth / thinking effort.
  */
-@OptIn(ExperimentalLayoutApi::class)
+/**
+ * Dropdown menu selector for [LlmThinkingEffort] with optional inline custom string entry
+ * when [allowCustom] is enabled and [LlmThinkingEffort.CUSTOM] is selected.
+ */
 @Composable
-internal fun ThinkingEffortChipRow(
+internal fun ThinkingEffortDropdown(
     title: String,
     subtitle: String,
     options: List<LlmThinkingEffort>,
     selected: LlmThinkingEffort,
-    onSelect: (LlmThinkingEffort) -> Unit
+    onSelect: (LlmThinkingEffort) -> Unit,
+    allowCustom: Boolean = false,
+    customValue: String = "",
+    onCustomValueChange: (String) -> Unit = {},
+    showApiBadges: Boolean = false
 ) {
+    var expanded by remember { mutableStateOf(false) }
+    var draftCustomValue by rememberSaveable { mutableStateOf(customValue) }
+    LaunchedEffect(customValue) {
+        if (customValue != draftCustomValue.trim()) {
+            draftCustomValue = customValue
+        }
+    }
+
+    LaunchedEffect(allowCustom, selected, draftCustomValue) {
+        if (!allowCustom || selected != LlmThinkingEffort.CUSTOM) return@LaunchedEffect
+        val trimmedDraft = draftCustomValue.trim()
+        if (trimmedDraft == customValue.trim()) return@LaunchedEffect
+        delay(200)
+        onCustomValueChange(trimmedDraft)
+    }
+
+    val effectiveBadge = when {
+        !showApiBadges -> null
+        selected == LlmThinkingEffort.CUSTOM ->
+            draftCustomValue.trim().takeIf { it.isNotEmpty() }?.let { "reasoning_effort: $it" } ?: "auto (blank)"
+        selected.apiValue != null -> "reasoning_effort: ${selected.apiValue}"
+        else -> "server default"
+    }
+    val selectedTitle = if (selected == LlmThinkingEffort.CUSTOM && draftCustomValue.trim().isNotEmpty()) {
+        "Custom (${draftCustomValue.trim()})"
+    } else {
+        selected.title
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
             text = title,
@@ -146,18 +183,176 @@ internal fun ThinkingEffortChipRow(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            options.forEach { effort ->
-                FilterChip(
-                    selected = selected == effort,
-                    onClick = { onSelect(effort) },
-                    label = { Text(effort.title) }
-                )
+
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { expanded = true },
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = selectedTitle,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (effectiveBadge != null) {
+                                val isHeavy = selected == LlmThinkingEffort.MAX || selected == LlmThinkingEffort.XHIGH
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (isHeavy) {
+                                        MaterialTheme.colorScheme.tertiaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.secondaryContainer
+                                    }
+                                ) {
+                                    Text(
+                                        text = effectiveBadge,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isHeavy) {
+                                            MaterialTheme.colorScheme.onTertiaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.onSecondaryContainer
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            text = selected.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Icon(
+                        imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = "Choose $title",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
+
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.fillMaxWidth(0.86f)
+            ) {
+                options.forEach { effort ->
+                    val isSelected = effort == selected
+                    DropdownMenuItem(
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = effort.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                                    )
+                                    val badgeText = when {
+                                        !showApiBadges -> null
+                                        effort == LlmThinkingEffort.CUSTOM -> "custom"
+                                        effort.apiValue != null -> effort.apiValue
+                                        else -> "auto"
+                                    }
+                                    if (badgeText != null) {
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = if (isSelected) {
+                                                MaterialTheme.colorScheme.primaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceVariant
+                                            }
+                                        ) {
+                                            Text(
+                                                text = badgeText,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isSelected) {
+                                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                                Text(
+                                    text = effort.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        trailingIcon = {
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Icons.Filled.CheckCircle,
+                                    contentDescription = "Selected",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        },
+                        onClick = {
+                            expanded = false
+                            onSelect(effort)
+                        }
+                    )
+                }
+            }
+        }
+
+        AnimatedVisibility(visible = allowCustom && selected == LlmThinkingEffort.CUSTOM) {
+            val trimmedDraft = draftCustomValue.trim()
+            OutlinedTextField(
+                value = draftCustomValue,
+                onValueChange = { next ->
+                    draftCustomValue = next
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                label = { Text("Custom reasoning_effort Value") },
+                placeholder = { Text("e.g. xhigh, minimal, disabled, 0, budget_2048") },
+                supportingText = {
+                    Text(
+                        text = if (trimmedDraft.isEmpty()) {
+                            "Leave blank for server default (omits reasoning_effort)."
+                        } else {
+                            "Sends \"reasoning_effort\": \"$trimmedDraft\" (falls back automatically if rejected)."
+                        }
+                    )
+                },
+                singleLine = true
+            )
         }
     }
 }
@@ -436,22 +631,30 @@ internal fun RemoteEndpointFieldsBlock(
             }
 
             if (showEndpointFields) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
-                        text = "Timeout:",
+                        text = "Timeout",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    timeoutOptions.forEach { seconds ->
-                        FilterChip(
-                            selected = timeoutSeconds == seconds,
-                            onClick = { onTimeoutChange(seconds) },
-                            label = { Text("${seconds}s") }
-                        )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        timeoutOptions.forEach { seconds ->
+                            FilterChip(
+                                selected = timeoutSeconds == seconds,
+                                onClick = { onTimeoutChange(seconds) },
+                                label = {
+                                    Text(
+                                        text = "${seconds}s",
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -561,10 +764,10 @@ internal fun RemoteAudioModelsCollapsibleSection(
     settings: ModelSettings,
     onPersistSettings: (ModelSettings) -> Unit
 ) {
-    var expanded by rememberSaveable { mutableStateOf(false) }
     val anyRemoteActive = settings.isRemoteVozActive || settings.isRemoteEarActive
     val anySetupNeeded = !anyRemoteActive &&
         (settings.remoteVozEnabled || (settings.earEnabled && settings.remoteEarEnabled))
+    var expanded by rememberSaveable { mutableStateOf(anySetupNeeded) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         HorizontalDivider()

@@ -746,8 +746,11 @@ fun SpeechRecognitionSettingsSection(
             }
         }
 
-        // 3b. AI Post-Processing & Formatting (Collapsed by default • Instant Engine, Local AI, or OpenAI API)
-        var aiSectionExpanded by rememberSaveable { mutableStateOf(false) }
+        // 3b. AI Post-Processing & Formatting (Collapsed by default; auto-expands if API setup is pending)
+        val openAiSetupPending = settings.gemmaEnabled &&
+            settings.llmProvider == LlmProviderMode.OPENAI_API &&
+            !settings.isOpenAiApiEnabled
+        var aiSectionExpanded by rememberSaveable { mutableStateOf(openAiSetupPending) }
         val isAiActive = settings.isAiPostProcessingActive
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -1046,7 +1049,7 @@ fun SpeechRecognitionSettingsSection(
                                 }
 
                                 if (!settings.gemmaDisableThinking) {
-                                    ThinkingEffortChipRow(
+                                    ThinkingEffortDropdown(
                                         title = "Thinking Effort",
                                         subtitle = "Controls how much reasoning token budget ${selectedLlm.title} uses when thinking is active.",
                                         options = LlmThinkingEffort.LOCAL_OPTIONS,
@@ -1182,7 +1185,7 @@ fun SpeechRecognitionSettingsSection(
                             )
                             var instructionPreviewExpanded by rememberSaveable { mutableStateOf(false) }
                             val instructionHeaderTitle = if (settings.llmProvider == LlmProviderMode.OPENAI_API) {
-                                "Active System Instruction (${settings.gemmaPromptPreset.shortLabel})"
+                                "Active System Instruction (Cloud API · ${settings.gemmaPromptPreset.shortLabel})"
                             } else {
                                 "Active System Instruction (${selectedLlm.title})"
                             }
@@ -2419,7 +2422,8 @@ private fun OpenAiApiEndpointSection(
                         apiKey = key,
                         model = model,
                         timeoutSeconds = timeout,
-                        thinkingEffort = settings.openAiThinkingEffort
+                        thinkingEffort = settings.openAiThinkingEffort,
+                        customReasoningEffort = settings.openAiCustomReasoningEffort
                     )
                 },
                 footerTip = if (settings.isRemoteVozActive) {
@@ -2430,13 +2434,24 @@ private fun OpenAiApiEndpointSection(
             )
         }
 
-        ThinkingEffortChipRow(
-            title = "Thinking Effort",
-            subtitle = "Sends reasoning_effort for thinking models (falls back automatically if unsupported). Thinking text is never pasted.",
+        ThinkingEffortDropdown(
+            title = "Reasoning Effort",
+            subtitle = "Choose a reasoning depth preset (including Max) or enter any custom level supported by your endpoint. Hidden thinking blocks are stripped automatically.",
             options = LlmThinkingEffort.API_OPTIONS,
             selected = settings.openAiThinkingEffort,
+            allowCustom = true,
+            customValue = settings.openAiCustomReasoningEffort,
+            showApiBadges = true,
             onSelect = { effort ->
                 onPersistSettings(settings.copy(openAiThinkingEffort = effort))
+            },
+            onCustomValueChange = { custom ->
+                onPersistSettings(
+                    settings.copy(
+                        openAiThinkingEffort = LlmThinkingEffort.CUSTOM,
+                        openAiCustomReasoningEffort = custom
+                    )
+                )
             }
         )
 

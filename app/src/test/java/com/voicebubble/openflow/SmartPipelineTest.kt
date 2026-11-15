@@ -24,6 +24,7 @@ import com.voicebubble.openflow.settings.supportedLanguages
 import ai.desertant.voz.Voz
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1668,6 +1669,90 @@ class SmartPipelineTest {
             com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
                 rawOutput = "<think>\nLet me analyze every word of the user's dictation carefully...",
                 fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+    }
+
+    @Test
+    fun `sanitizeGemmaOutput strips Gemma 4 bare thought prefixes, orphan channels, Harmony tags, and preserves real speech`() {
+        val rawFallback = "um call lukas at three thirty pm"
+
+        // 1. Orphan closing <channel|> when template pre-opened <|channel>thought
+        assertEquals(
+            "Call Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "Thinking Process:\n1. Fix capitalization and time.\n<channel|>Call Lukas at 3:30 PM.",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // 2. OpenAI Harmony format with analysis + final channels
+        assertEquals(
+            "Call Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "<|channel|>analysis<|message|>The user wants to format 3:30 PM.<|end|><|start|>assistant<|channel|>final<|message|>Call Lukas at 3:30 PM.<|return|>",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // 3. Piped <|thought|>...<|thought|>, <|think|>...<|/think|>, <seed:think>, and <|reasoning_start|>
+        listOf(
+            "<|thought|>Analyze text<|thought|>Call Lukas at 3:30 PM.",
+            "<|think|>Analyze text<|/think|>Call Lukas at 3:30 PM.",
+            "<seed:think>Analyze text</seed:think>\nCall Lukas at 3:30 PM.",
+            "<|reasoning_start|>Analyze text<|reasoning_end|>\nCall Lukas at 3:30 PM."
+        ).forEach { raw ->
+            assertEquals(
+                "Call Lukas at 3:30 PM.",
+                com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                    rawOutput = raw,
+                    fallbackInput = rawFallback,
+                    preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+                )
+            )
+        }
+
+        // 4. Bare vLLM Gemma 4 (skip_special_tokens=true) stripping <|channel> and <channel|>
+        assertEquals(
+            "Call Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "thought\nThinking Process:\n\n1.  **Analyze the Request:**\n    * Input: \"um call lukas at three thirty pm\"\n    * Task: Clean up grammar and format time.\n\n2.  **Formulate Output:**\n    * Call Lukas at 3:30 PM.\n\nCall Lukas at 3:30 PM.",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
+            )
+        )
+
+        // 5. Bare thought prefix with multi-paragraph output (Custom / Professional Email) keeps all final paragraphs
+        assertEquals(
+            "Hi Lukas,\n\nLet's meet at 3:30 PM tomorrow.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "thought\nThe user wants an email greeting Lukas and scheduling 3:30 PM tomorrow.\n\nHi Lukas,\n\nLet's meet at 3:30 PM tomorrow.",
+                fallbackInput = "hi lukas lets meet at three thirty pm tomorrow",
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,
+                customPrompt = "Write as a polite email"
+            )
+        )
+
+        // 6. Truncated bare thought prefix with no final output falls back safely to transcript
+        assertEquals(
+            rawFallback,
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "thought\nThinking Process:\n\n1. **Analyze the Request:**\n   * Input: \"$rawFallback\"",
+                fallbackInput = rawFallback,
+                preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CUSTOM,
+                customPrompt = "Keep concise"
+            )
+        )
+
+        // 7. Real dictated speech starting with "thought..." is preserved untouched
+        assertEquals(
+            "Thought about calling Lukas at 3:30 PM.",
+            com.voicebubble.openflow.core.speech.GemmaTextProcessor.sanitizeGemmaOutput(
+                rawOutput = "Thought about calling Lukas at 3:30 PM.",
+                fallbackInput = "thought about calling lukas at three thirty pm",
                 preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
             )
         )
@@ -3561,29 +3646,40 @@ class SmartPipelineTest {
     }
 
     @Test
-    fun `OpenAI API uses provider-neutral prompts and accurately marks Punct as bypassed`() {
-        val localModelTags = listOf("Gemma", "Qwen", "Granite", "LiteRT-LM", "Voz")
+    fun `OpenAI API uses provider-neutral cloud-optimized prompts and accurately marks Punct as bypassed`() {
+        val localBiasTags = listOf("Gemma", "Qwen", "Granite", "LiteRT-LM", "Voz", "NPU", "OpenFlow")
         for (preset in com.voicebubble.openflow.settings.GemmaPromptPreset.entries) {
             val apiTask = preset.promptForProvider(
                 provider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API,
                 llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B
             )
-            for (tag in localModelTags) {
+            assertTrue("OpenAI API preset ${preset.id} must have non-blank cloud prompt", apiTask.isNotBlank())
+            for (tag in localBiasTags) {
+                val pattern = Regex("\\b${Regex.escape(tag)}\\b", RegexOption.IGNORE_CASE)
                 assertFalse(
-                    "OpenAI API preset ${preset.id} must not leak local model reference '$tag'",
-                    apiTask.contains(tag, ignoreCase = true)
+                    "OpenAI API preset ${preset.id} must not leak local/benchmark reference '$tag'",
+                    pattern.containsMatchIn(apiTask)
                 )
             }
         }
 
         val apiSystemInstruction = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = true,
+            customVocabulary = listOf("Bifrost", "PostgreSQL"),
+            disableThinking = false,
             llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
             llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API
         )
         assertFalse(apiSystemInstruction.contains("Gemma", ignoreCase = true))
         assertFalse(apiSystemInstruction.contains("on-device", ignoreCase = true))
+        assertFalse(Regex("\\bNPU\\b", RegexOption.IGNORE_CASE).containsMatchIn(apiSystemInstruction))
+        assertFalse(apiSystemInstruction.contains("OpenFlow", ignoreCase = true))
+        assertFalse(apiSystemInstruction.contains("under 35 words", ignoreCase = true))
+        assertTrue(apiSystemInstruction.contains("clause-level backtracks"))
+        assertTrue(apiSystemInstruction.contains("paragraph breaks"))
+        assertTrue(apiSystemInstruction.contains("phonetically close"))
+        assertTrue(apiSystemInstruction.contains("Bifrost, PostgreSQL"))
+        assertTrue(apiSystemInstruction.contains("Keep any internal reasoning silent"))
 
         val punctWithOpenAiApi = ModelSettings(
             punctEnabled = true,
@@ -3595,7 +3691,7 @@ class SmartPipelineTest {
         assertTrue(punctWithOpenAiApi.isAiPostProcessingActive)
         assertFalse(punctWithOpenAiApi.isPunctEffectivelyActive)
         assertEquals(
-            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH.defaultSystemPrompt,
+            com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH.cloudSystemPrompt,
             punctWithOpenAiApi.resolvedGemmaTaskInstruction()
         )
 
@@ -3622,6 +3718,33 @@ class SmartPipelineTest {
         assertTrue(defaults.localLlmChunkingEnabled)
         assertEquals(com.voicebubble.openflow.settings.LlmThinkingEffort.DEFAULT, defaults.openAiThinkingEffort)
         assertEquals(com.voicebubble.openflow.settings.LlmThinkingEffort.MEDIUM, defaults.localThinkingEffort)
+        assertEquals("", defaults.openAiCustomReasoningEffort)
+        assertNull(defaults.effectiveOpenAiReasoningEffortValue)
+        assertTrue(com.voicebubble.openflow.settings.LlmThinkingEffort.MAX in com.voicebubble.openflow.settings.LlmThinkingEffort.API_OPTIONS)
+        assertTrue(com.voicebubble.openflow.settings.LlmThinkingEffort.MAX in com.voicebubble.openflow.settings.LlmThinkingEffort.LOCAL_OPTIONS)
+        assertTrue(com.voicebubble.openflow.settings.LlmThinkingEffort.CUSTOM in com.voicebubble.openflow.settings.LlmThinkingEffort.API_OPTIONS)
+        assertEquals(
+            "xhigh",
+            defaults.copy(openAiThinkingEffort = com.voicebubble.openflow.settings.LlmThinkingEffort.XHIGH).effectiveOpenAiReasoningEffortValue
+        )
+        assertEquals(
+            "max",
+            defaults.copy(openAiThinkingEffort = com.voicebubble.openflow.settings.LlmThinkingEffort.MAX).effectiveOpenAiReasoningEffortValue
+        )
+        assertEquals(
+            "budget_2048",
+            defaults.copy(
+                openAiThinkingEffort = com.voicebubble.openflow.settings.LlmThinkingEffort.CUSTOM,
+                openAiCustomReasoningEffort = "  budget_2048  "
+            ).effectiveOpenAiReasoningEffortValue
+        )
+        assertNull(
+            defaults.copy(
+                openAiThinkingEffort = com.voicebubble.openflow.settings.LlmThinkingEffort.CUSTOM,
+                openAiCustomReasoningEffort = "   "
+            ).effectiveOpenAiReasoningEffortValue
+        )
+        assertTrue(com.voicebubble.openflow.settings.LlmThinkingEffort.isDisabledApiValue("disabled"))
 
         // Same endpoint shared between Remote Voz & Remote Ear
         val sharedRemote = defaults.copy(
@@ -3679,5 +3802,30 @@ class SmartPipelineTest {
         val setupNeeded = defaults.copy(remoteVozEnabled = true, remoteVozBaseUrl = "not-a-url")
         assertFalse(setupNeeded.isRemoteVozActive)
         assertEquals("Setup needed", setupNeeded.remoteAudioSummaryLabel)
+
+        // Startup / onboarding planned local models skip downloads whenever API mode is chosen
+        val startupApiOnly = defaults.copy(
+            remoteVozEnabled = true,
+            earEnabled = true,
+            remoteEarEnabled = true,
+            punctEnabled = false,
+            gemmaEnabled = true,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API
+        )
+        assertTrue(startupApiOnly.plannedLocalModels().isEmpty())
+        assertEquals(0, startupApiOnly.plannedPeakRamMb())
+
+        val startupHybridLocalVozCloudLlm = defaults.copy(
+            remoteVozEnabled = false,
+            earEnabled = false,
+            punctEnabled = false,
+            gemmaEnabled = true,
+            llmProvider = com.voicebubble.openflow.settings.LlmProviderMode.OPENAI_API
+        )
+        assertEquals(
+            listOf(com.voicebubble.openflow.settings.DesertAntModel.VOZ),
+            startupHybridLocalVozCloudLlm.plannedLocalModels()
+        )
+        assertEquals(1400, startupHybridLocalVozCloudLlm.plannedPeakRamMb())
     }
 }

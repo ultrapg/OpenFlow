@@ -543,6 +543,44 @@ class OpenAiCompatibleClientTest {
             assertTrue(fallbackEffort.succeeded)
             assertEquals(2, requestCount.get())
             assertEquals(listOf("none", null), seenReasoningEfforts)
+
+            // 4. Max and Custom reasoning_effort presets work cleanly (including blank custom -> omitted and HTTP 400 fallback)
+            val maxPayload = OpenAiCompatibleClient.buildChatCompletionPayload(
+                model = "gemma-4-31b-it",
+                systemInstruction = "Clean",
+                userPrompt = "test",
+                thinkingEffort = LlmThinkingEffort.MAX
+            )
+            assertEquals("max", maxPayload.getString("reasoning_effort"))
+
+            val blankCustomPayload = OpenAiCompatibleClient.buildChatCompletionPayload(
+                model = "gemma-4-31b-it",
+                systemInstruction = "Clean",
+                userPrompt = "test",
+                thinkingEffort = LlmThinkingEffort.CUSTOM,
+                customReasoningEffort = "   "
+            )
+            assertFalse(blankCustomPayload.has("reasoning_effort"))
+
+            requestCount.set(0)
+            seenReasoningEfforts.clear()
+            rejectReasoningEffortOnce = true
+            val customFallback = OpenAiCompatibleClient.processTranscript(
+                text = "um schedule a meeting with Alex on friday afternoon",
+                baseUrl = baseUrl,
+                apiKey = "sk-test",
+                model = "custom-endpoint-model",
+                preset = GemmaPromptPreset.CLEAN_AND_POLISH,
+                customPrompt = "",
+                languageCode = "en",
+                customVocabulary = emptyList(),
+                thinkingEffort = LlmThinkingEffort.CUSTOM,
+                customReasoningEffort = "ultra_deep",
+                chunkingEnabled = false
+            )
+            assertTrue(customFallback.succeeded)
+            assertEquals(2, requestCount.get())
+            assertEquals(listOf("ultra_deep", null), seenReasoningEfforts)
         }
     }
 

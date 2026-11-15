@@ -339,7 +339,8 @@ enum class GemmaPromptPreset(
     val title: String,
     val shortLabel: String,
     val subtitle: String,
-    val defaultSystemPrompt: String
+    val defaultSystemPrompt: String,
+    val cloudSystemPrompt: String
 ) {
     CLEAN_AND_POLISH(
         id = "clean_polish",
@@ -351,42 +352,52 @@ enum class GemmaPromptPreset(
 2. Fillers, stutters & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word stutters ('the the', 'I I'), false starts, and hesitation 'like' / 'you know' / 'sort of' (never remove literal uses like 'I like this' or 'looks like'). Repair false mid-sentence pause periods, capitalization, and punctuation; keep spoken questions as questions.
 3. Vertical numbered & bulleted lists: Format spoken enumerations ('number one... number two... number three...', 'first... second... third...', 'one... two... three...', 'point one... point two...', 'item one... item two...', 'erstens... zweitens...', 'punkt eins... punkt zwei...') with a colon ':' on any lead-in clause (replacing spoken 'colon' / 'doppelpunkt') and put EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' (stripping the spoken cue). Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
 4. Numbers, dates & units: ALWAYS use digits (including 0–9) when paired with any unit, time, date, percent, money, version, or spec/model name — percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '380 ms', '42.5 tokens/s', '5 minutes'), and product/model names ('Pixel 10', 'GPT-4o'). Spell out standalone prose counts one through nine ONLY when not paired with a unit, and use digits for standalone 10+.
-5. Paragraphs, emails & tech casing: Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') removing the cue, format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev'), capitalize technical terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'camelCase', 'snake_case'), and separate spoken greetings/sign-offs without inventing unspoken ones."""
+5. Paragraphs, emails & tech casing: Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') removing the cue, format spoken emails & domains ('elena dot kovacs at openflow dot dev' -> 'elena.kovacs@openflow.dev'), capitalize technical terms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'OpenFlow', 'camelCase', 'snake_case'), and separate spoken greetings/sign-offs without inventing unspoken ones.""",
+        cloudSystemPrompt = """Transform raw spoken dictation into clean, natural, ready-to-send written text preserving the speaker's exact voice, tone, meaning, and language:
+1. Self-corrections & pivots: Resolve both short repairs and clause-level backtracks ('wait', 'no wait', 'wait no', 'actually', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'oder nein', 'ich meine', 'besser gesagt') by deleting the retracted attempt and repair cue, keeping only what the speaker finally meant. Keep genuine contrasts ('not X, but Y').
+2. Disfluencies & faithful flow: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters, false starts, and hesitation 'like' / 'you know' / 'sort of' (keep literal uses such as 'I like this'). Repair false pause periods, punctuation, capitalization, and unmistakable context-implied speech-recognition slips without altering names, slang, or intentional wording; keep questions as questions.
+3. Paragraphs, lists & layout cues: On longer monologues, insert paragraph breaks naturally at clear topic shifts without over-splitting short notes. Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') and drop the cue words. Format spoken enumerations ('first... second...', 'number one... number two...', 'one... two... three...', 'erstens... zweitens...', 'bullet point...') with ':' after any lead-in clause and each item on its own '1. ' or '- ' line; keep brief inline series ('milk, eggs, and bread') inline.
+4. Numbers, entities & plain text: Format numbers paired with any unit (0+), standalone 10+, percentages, currencies, clock times, dates, version numbers, dictated emails ('name@domain.com'), URLs, technical acronyms, file paths, and code casing ('camelCase', 'snake_case') cleanly; spell out standalone prose counts one through nine. Separate spoken greetings and sign-offs onto their own lines without inventing unspoken ones, and emit plain text only (no unsolicited bold '**' or Markdown headings '#')."""
     ),
     STRICT_CLEANUP(
         id = "strict_cleanup",
         title = "Light Cleanup (Verbatim)",
         shortLabel = "Light Cleanup",
         subtitle = "Verbatim cleanup: strips fillers, stutters & obvious backtracks, formats numbers/units & fixes punctuation with zero rephrasing",
-        defaultSystemPrompt = "Perform light, verbatim dictation cleanup: remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and obvious mid-phrase self-corrections (keeping only the intended correction), convert spoken decimals, percentages, currencies, dates, times, version numbers, measurements/units ('0 MB', '6 GB', '380 ms'), and 10+ counts into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API'), and repair broken punctuation, mid-sentence pause periods, and capitalization. Never rephrase, reorder, summarize, or alter the speaker's vocabulary."
+        defaultSystemPrompt = "Perform light, verbatim dictation cleanup: remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and obvious mid-phrase self-corrections (keeping only the intended correction), convert spoken decimals, percentages, currencies, dates, times, version numbers, measurements/units ('0 MB', '6 GB', '380 ms'), and 10+ counts into digits, capitalize standard acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'KV', 'API'), and repair broken punctuation, mid-sentence pause periods, and capitalization. Never rephrase, reorder, summarize, or alter the speaker's vocabulary.",
+        cloudSystemPrompt = "Perform light, faithful verbatim cleanup in the speaker's exact language and wording: remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters, and clear mid-sentence self-corrections (keeping only the intended repair), convert spoken decimals, percentages, currencies, clock times, dates, version numbers, numbers paired with units, and standalone 10+ into clean digits, format dictated emails/URLs and standard acronyms, apply explicit 'new line'/'new paragraph' breaks, and fix punctuation and capitalization without rephrasing, reordering, or summarizing."
     ),
     CONCISE_DIRECT(
         id = "concise_direct",
         title = "Crisp & Direct",
         shortLabel = "Crisp",
         subtitle = "Resolves backtracks and tightens rambling spoken thoughts into crisp, scannable sentences, lists & clean numbers",
-        defaultSystemPrompt = "Edit the spoken dictation into crisp, concise, scannable text. Resolve all mid-sentence backtracks and self-corrections, strip vocal fillers, hedging, and redundant phrasing, place multi-item enumerations on separate '1. ' or '- ' lines after a ':', and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units accurately as digits while preserving every fact, name, and the speaker's original language."
+        defaultSystemPrompt = "Edit the spoken dictation into crisp, concise, scannable text. Resolve all mid-sentence backtracks and self-corrections, strip vocal fillers, hedging, and redundant phrasing, place multi-item enumerations on separate '1. ' or '- ' lines after a ':', and format spoken numbers, decimals, percentages, currencies, dates, times, versions, and units accurately as digits while preserving every fact, name, and the speaker's original language.",
+        cloudSystemPrompt = "Distill the spoken dictation into crisp, high-signal written text in the speaker's exact language: resolve all self-corrections, strip vocal fillers, throat-clearing, and hedging, tighten wordy repetition into direct sentences while preserving 100% of facts, names, constraints, and intent, break distinct topics into clean paragraphs, place multi-item enumerations on separate '1. ' or '- ' lines after ':', and format numbers, times, dates, currencies, percentages, versions, units, and emails cleanly."
     ),
     PROFESSIONAL_MESSAGE(
         id = "professional_message",
         title = "Email & Work Message",
         shortLabel = "Email / Work",
         subtitle = "Structures emails & work messages with clean greeting/sign-off spacing, paragraphs, action lists & accurate numbers",
-        defaultSystemPrompt = "Format the spoken dictation into a natural, well-structured email or work message. Resolve all mid-sentence self-corrections and remove vocal hesitations, place spoken greetings (e.g., 'Hi Sarah,') and sign-offs (e.g., 'Best,\\nAlex') on separate lines with clean paragraph breaks, place multi-step action items on separate '1. ' or '- ' lines, and convert spoken numbers, dates, times, currencies, versions, and units into clean written digits in the speaker's original language without inventing placeholders or greetings that were not spoken."
+        defaultSystemPrompt = "Format the spoken dictation into a natural, well-structured email or work message. Resolve all mid-sentence self-corrections and remove vocal hesitations, place spoken greetings (e.g., 'Hi Sarah,') and sign-offs (e.g., 'Best,\\nAlex') on separate lines with clean paragraph breaks, place multi-step action items on separate '1. ' or '- ' lines, and convert spoken numbers, dates, times, currencies, versions, and units into clean written digits in the speaker's original language without inventing placeholders or greetings that were not spoken.",
+        cloudSystemPrompt = "Format the spoken dictation into a polished, natural email or workplace message in the speaker's exact language: resolve self-corrections and strip vocal fillers while keeping a genuine human voice (never add stiff corporate clichés). Place any spoken greeting (e.g., 'Hi Sarah,') on its own line followed by a blank line, structure distinct topics into paragraphs, put multi-step action items on separate '1. ' or '- ' lines after ':', place any spoken sign-off at the end on separate lines without inventing unspoken ones, and format numbers, dates, times, currencies, versions, units, and dictated emails cleanly."
     ),
     STRUCTURED_NOTES(
         id = "structured_notes",
         title = "Structured Lists & Notes",
         shortLabel = "Lists & Notes",
         subtitle = "Organizes spoken thoughts, meeting notes, or tasks into clean bulleted or numbered lists with backtrack cleanup",
-        defaultSystemPrompt = "Transform the spoken dictation into a clean, scannable set of structured notes with each point on its own '- ' bullet line (or '1. ' numbered line when sequential). Resolve mid-sentence self-corrections, remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related action items logically, and preserve the speaker's original language."
+        defaultSystemPrompt = "Transform the spoken dictation into a clean, scannable set of structured notes with each point on its own '- ' bullet line (or '1. ' numbered line when sequential). Resolve mid-sentence self-corrections, remove all vocal fillers and repetitions, format spoken numbers, dates, times, versions, currencies, and units cleanly as digits, group related action items logically, and preserve the speaker's original language.",
+        cloudSystemPrompt = "Organize the spoken dictation into crisp, scannable structured notes in the speaker's exact language: place any brief spoken topic heading above a list ending with ':', put each distinct point or action item on its own '- ' bullet line (or '1. ' numbered line when sequential), resolve all self-corrections and remove fillers while retaining every concrete detail, name, and caveat, and format numbers, dates, times, versions, currencies, units, and emails accurately."
     ),
     CUSTOM(
         id = "custom",
         title = "Custom System Prompt",
         shortLabel = "Custom",
         subtitle = "Write your own custom system instruction for how the selected AI model transforms dictated speech",
-        defaultSystemPrompt = "Resolve mid-sentence self-corrections, remove vocal fillers ('um', 'uh', 'like') and stutters, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning."
+        defaultSystemPrompt = "Resolve mid-sentence self-corrections, remove vocal fillers ('um', 'uh', 'like') and stutters, convert spoken numbers, dates, versions, and units into proper digits, and format the text cleanly while keeping the original meaning.",
+        cloudSystemPrompt = "Apply the user's custom instruction cleanly to the dictated speech inside <transcript>...</transcript>: resolve obvious vocal fillers and mid-sentence self-corrections unless literal output is requested, format numbers, dates, and entities cleanly, and return only the transformed text without commentary."
     );
 
     /**
@@ -454,16 +465,16 @@ enum class GemmaPromptPreset(
     }
 
     /**
-     * Returns the task instruction appropriate for [provider]: provider-neutral generic instructions
-     * for [LlmProviderMode.OPENAI_API], or local-model-tuned instructions via [promptForModel] for
-     * [LlmProviderMode.LOCAL].
+     * Returns the task instruction appropriate for [provider]: cloud-optimized high-capacity
+     * instructions ([cloudSystemPrompt]) for [LlmProviderMode.OPENAI_API], or local-model-tuned
+     * instructions via [promptForModel] for [LlmProviderMode.LOCAL].
      */
     fun promptForProvider(
         provider: LlmProviderMode,
         llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
     ): String = when (provider) {
         LlmProviderMode.LOCAL -> promptForModel(llmChoice)
-        LlmProviderMode.OPENAI_API -> defaultSystemPrompt
+        LlmProviderMode.OPENAI_API -> cloudSystemPrompt
     }
 
     companion object {
@@ -532,23 +543,87 @@ enum class LlmProviderMode(val id: String, val title: String) {
  * Reasoning depth preference for thinking-capable LLMs.
  * - [DEFAULT]: Uses the remote server / model default without forcing a `reasoning_effort` override.
  * - [OFF]: Requests zero reasoning tokens (`reasoning_effort = "none"` when supported).
- * - [LOW], [MEDIUM], [HIGH]: Scales reasoning token budgets proportionally.
+ * - [MINIMAL], [LOW], [MEDIUM], [HIGH], [XHIGH], [MAX]: Scales reasoning depth proportionally.
+ * - [CUSTOM]: Sends an arbitrary user-entered `reasoning_effort` value for endpoints with custom levels.
  */
 enum class LlmThinkingEffort(
     val id: String,
     val title: String,
+    val description: String,
     val apiValue: String?,
     val localBudgetScale: Float
 ) {
-    DEFAULT("default", "Auto", null, 1.0f),
-    OFF("off", "Off", "none", 0.0f),
-    LOW("low", "Low", "low", 0.55f),
-    MEDIUM("medium", "Medium", "medium", 1.0f),
-    HIGH("high", "High", "high", 1.6f);
+    DEFAULT(
+        id = "default",
+        title = "Auto (Server Default)",
+        description = "Omits reasoning_effort so your endpoint uses its default",
+        apiValue = null,
+        localBudgetScale = 1.0f
+    ),
+    OFF(
+        id = "off",
+        title = "Off (none)",
+        description = "Requests disabled reasoning via reasoning_effort = \"none\"",
+        apiValue = "none",
+        localBudgetScale = 0.0f
+    ),
+    MINIMAL(
+        id = "minimal",
+        title = "Minimal",
+        description = "Ultra-light reasoning pass for lowest latency",
+        apiValue = "minimal",
+        localBudgetScale = 0.35f
+    ),
+    LOW(
+        id = "low",
+        title = "Low",
+        description = "Light reasoning check for quick dictation cleanup",
+        apiValue = "low",
+        localBudgetScale = 0.55f
+    ),
+    MEDIUM(
+        id = "medium",
+        title = "Medium",
+        description = "Balanced reasoning for self-corrections and structure",
+        apiValue = "medium",
+        localBudgetScale = 1.0f
+    ),
+    HIGH(
+        id = "high",
+        title = "High",
+        description = "Deep reasoning for complex edits and tricky formatting",
+        apiValue = "high",
+        localBudgetScale = 1.6f
+    ),
+    XHIGH(
+        id = "xhigh",
+        title = "Very High (xhigh)",
+        description = "Extended reasoning depth (e.g. OpenAI GPT-5 / o-series endpoints)",
+        apiValue = "xhigh",
+        localBudgetScale = 1.85f
+    ),
+    MAX(
+        id = "max",
+        title = "Max",
+        description = "Maximum thinking depth when supported (not recommended for everyday speed)",
+        apiValue = "max",
+        localBudgetScale = 2.0f
+    ),
+    CUSTOM(
+        id = "custom",
+        title = "Custom…",
+        description = "Type an exact reasoning_effort string supported by your endpoint",
+        apiValue = null,
+        localBudgetScale = 1.5f
+    );
 
     companion object {
-        val API_OPTIONS: List<LlmThinkingEffort> = entries
-        val LOCAL_OPTIONS: List<LlmThinkingEffort> = listOf(LOW, MEDIUM, HIGH)
+        val API_OPTIONS: List<LlmThinkingEffort> = listOf(
+            DEFAULT, OFF, MINIMAL, LOW, MEDIUM, HIGH, XHIGH, MAX, CUSTOM
+        )
+        val LOCAL_OPTIONS: List<LlmThinkingEffort> = listOf(LOW, MEDIUM, HIGH, MAX)
+
+        private val DISABLED_API_VALUES = setOf("none", "off", "disable", "disabled", "0", "false")
 
         fun fromId(id: String?): LlmThinkingEffort {
             return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: DEFAULT
@@ -557,6 +632,23 @@ enum class LlmThinkingEffort(
         fun fromLocalId(id: String?): LlmThinkingEffort {
             val parsed = fromId(id)
             return if (parsed in LOCAL_OPTIONS) parsed else MEDIUM
+        }
+
+        /**
+         * Resolves the raw string value sent in JSON `"reasoning_effort"`, or `null` when omitted.
+         */
+        fun resolveApiValue(effort: LlmThinkingEffort, customValue: String = ""): String? {
+            return when (effort) {
+                CUSTOM -> customValue.trim().takeIf { it.isNotEmpty() }
+                else -> effort.apiValue
+            }
+        }
+
+        /**
+         * `true` when the resolved effort explicitly asks the model not to think (`"none"`, `"off"`, etc.).
+         */
+        fun isDisabledApiValue(apiValue: String?): Boolean {
+            return apiValue != null && apiValue.trim().lowercase(Locale.ROOT) in DISABLED_API_VALUES
         }
     }
 }
@@ -583,6 +675,7 @@ data class ModelSettings(
     val openAiModel: String = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_MODEL,
     val openAiTimeoutSeconds: Int = com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_TIMEOUT_SECONDS,
     val openAiThinkingEffort: LlmThinkingEffort = LlmThinkingEffort.DEFAULT,
+    val openAiCustomReasoningEffort: String = "",
     val openAiChunkingEnabled: Boolean = false,
     val remoteVozEnabled: Boolean = false,
     val remoteVozBaseUrl: String = "",
@@ -661,6 +754,13 @@ data class ModelSettings(
     val isAiPostProcessingActive: Boolean
         get() = isLocalLlmEnabled || isOpenAiApiEnabled
 
+    /**
+     * Effective `reasoning_effort` string sent in OpenAI-compatible API requests, or `null` when
+     * omitted (`DEFAULT`, or `CUSTOM` while blank).
+     */
+    val effectiveOpenAiReasoningEffortValue: String?
+        get() = LlmThinkingEffort.resolveApiValue(openAiThinkingEffort, openAiCustomReasoningEffort)
+
     /** `true` when local `Punct` is enabled and not bypassed by an active AI post-processor. */
     val isPunctEffectivelyActive: Boolean
         get() = punctEnabled && !isAiPostProcessingActive
@@ -735,6 +835,30 @@ data class ModelSettings(
         if (isLocalLlmEnabled) add(selectedLlmModel.desertAntModel)
     }
 
+    /**
+     * Local models required by the user's selected mode flags during startup/onboarding, even
+     * before remote API URLs and keys are filled in, so API-mode selections require zero local
+     * model downloads.
+     */
+    fun plannedLocalModels(): List<DesertAntModel> = buildList {
+        if (!remoteVozEnabled) add(DesertAntModel.VOZ)
+        if (earEnabled && !remoteEarEnabled) add(DesertAntModel.EAR)
+        if (punctEnabled) add(DesertAntModel.PUNCT)
+        if (gemmaEnabled && llmProvider == LlmProviderMode.LOCAL) add(selectedLlmModel.desertAntModel)
+    }
+
+    /**
+     * Estimated peak local RAM (MB) matching [plannedLocalModels] before API credentials are entered.
+     */
+    fun plannedPeakRamMb(): Int =
+        (if (!remoteVozEnabled) 1400 else 0) +
+            (if (earEnabled && !remoteEarEnabled) 50 else 0) +
+            when {
+                gemmaEnabled && llmProvider == LlmProviderMode.LOCAL -> selectedLlmModel.estimatedIncrementalRamMb
+                punctEnabled && !(gemmaEnabled && llmProvider == LlmProviderMode.OPENAI_API) -> 120
+                else -> 0
+            }
+
     companion object {
         const val PREFS_NAME = "openflow_model_settings"
         const val KEY_EAR_ENABLED = "ear_enabled"
@@ -754,6 +878,7 @@ data class ModelSettings(
         const val KEY_OPENAI_MODEL = "openai_model"
         const val KEY_OPENAI_TIMEOUT_SECONDS = "openai_timeout_seconds"
         const val KEY_OPENAI_THINKING_EFFORT = "openai_thinking_effort"
+        const val KEY_OPENAI_CUSTOM_REASONING_EFFORT = "openai_custom_reasoning_effort"
         const val KEY_OPENAI_CHUNKING_ENABLED = "openai_chunking_enabled"
         const val KEY_REMOTE_VOZ_ENABLED = "remote_voz_enabled"
         const val KEY_REMOTE_VOZ_BASE_URL = "remote_voz_base_url"
@@ -850,6 +975,7 @@ data class ModelSettings(
             val openAiThinkingEffort = LlmThinkingEffort.fromId(
                 prefs.getString(KEY_OPENAI_THINKING_EFFORT, LlmThinkingEffort.DEFAULT.id)
             )
+            val openAiCustomReasoningEffort = (prefs.getString(KEY_OPENAI_CUSTOM_REASONING_EFFORT, "") ?: "").trim()
             val openAiChunkingEnabled = prefs.getBoolean(KEY_OPENAI_CHUNKING_ENABLED, false)
             val localThinkingEffort = LlmThinkingEffort.fromLocalId(
                 prefs.getString(KEY_LOCAL_THINKING_EFFORT, LlmThinkingEffort.MEDIUM.id)
@@ -927,6 +1053,7 @@ data class ModelSettings(
                 openAiModel = openAiModel,
                 openAiTimeoutSeconds = openAiTimeoutSeconds,
                 openAiThinkingEffort = openAiThinkingEffort,
+                openAiCustomReasoningEffort = openAiCustomReasoningEffort,
                 openAiChunkingEnabled = openAiChunkingEnabled,
                 remoteVozEnabled = remoteVozEnabled,
                 remoteVozBaseUrl = remoteVozBaseUrl,
@@ -980,6 +1107,7 @@ data class ModelSettings(
                 .putString(KEY_OPENAI_MODEL, settings.openAiModel.trim())
                 .putInt(KEY_OPENAI_TIMEOUT_SECONDS, settings.openAiTimeoutSeconds.coerceIn(5, 90))
                 .putString(KEY_OPENAI_THINKING_EFFORT, settings.openAiThinkingEffort.id)
+                .putString(KEY_OPENAI_CUSTOM_REASONING_EFFORT, settings.openAiCustomReasoningEffort.trim())
                 .putBoolean(KEY_OPENAI_CHUNKING_ENABLED, settings.openAiChunkingEnabled)
                 .putBoolean(KEY_REMOTE_VOZ_ENABLED, settings.remoteVozEnabled)
                 .putString(KEY_REMOTE_VOZ_BASE_URL, settings.remoteVozBaseUrl.trim())

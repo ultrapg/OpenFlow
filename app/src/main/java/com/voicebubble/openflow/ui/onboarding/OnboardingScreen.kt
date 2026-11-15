@@ -18,6 +18,8 @@ package com.voicebubble.openflow.ui.onboarding
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -31,6 +33,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Lock
@@ -43,6 +46,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -68,6 +72,7 @@ import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.LlmModelChoice
+import com.voicebubble.openflow.settings.LlmProviderMode
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelQueueStatus
 import com.voicebubble.openflow.settings.ModelSettings
@@ -81,6 +86,7 @@ private enum class OnboardingStep {
     DOWNLOADING
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun OnboardingScreen(
     initialSettings: ModelSettings,
@@ -89,9 +95,12 @@ fun OnboardingScreen(
     val context = LocalContext.current
     val sessionState by ModelDownloadManager.sessionState.collectAsState()
 
+    var remoteVozSelected by remember { mutableStateOf(initialSettings.remoteVozEnabled) }
     var earSelected by remember { mutableStateOf(initialSettings.earEnabled) }
+    var remoteEarSelected by remember { mutableStateOf(initialSettings.remoteEarEnabled) }
     var punctSelected by remember { mutableStateOf(initialSettings.punctEnabled) }
     var gemmaSelected by remember { mutableStateOf(initialSettings.gemmaEnabled) }
+    var llmProvider by remember { mutableStateOf(initialSettings.llmProvider) }
 
     var step by remember {
         mutableStateOf(
@@ -104,31 +113,41 @@ fun OnboardingScreen(
     }
 
     val configuredSettings = initialSettings.copy(
+        remoteVozEnabled = remoteVozSelected,
         earEnabled = earSelected,
+        remoteEarEnabled = earSelected && remoteEarSelected,
         punctEnabled = punctSelected,
-        gemmaEnabled = gemmaSelected
+        gemmaEnabled = gemmaSelected,
+        llmProvider = llmProvider
     )
 
-    val selectedModels = configuredSettings.enabledModels()
-    val totalSelectedBytes = selectedModels.sumOf { ModelDownloadManager.modelTotalBytes(it) }
+    val modelsToDownload = configuredSettings.plannedLocalModels()
+    val plannedDiskMb = modelsToDownload.sumOf { it.sizeMb }
+    val plannedPeakRamMb = configuredSettings.plannedPeakRamMb()
+
+    val totalSelectedBytes = modelsToDownload.sumOf { ModelDownloadManager.modelTotalBytes(it) }
     var cachedOrPartialBytes by remember { mutableLongStateOf(0L) }
 
-    LaunchedEffect(selectedModels, sessionState.overallDownloadedBytes, step) {
+    val completeOnboarding: (ModelSettings) -> Unit = { finalSettings ->
+        ModelSettings.save(context, finalSettings)
+        ModelSettings.setOnboardingCompleted(context, true)
+        SmartPipeline.getInstance(context).reloadSettingsAsync(finalSettings)
+        onOnboardingComplete(finalSettings)
+    }
+
+    LaunchedEffect(modelsToDownload, sessionState.overallDownloadedBytes, step) {
         cachedOrPartialBytes = withContext(Dispatchers.IO) {
-            selectedModels.sumOf { ModelDownloadManager.getCachedOrPartialBytes(context, it) }
+            modelsToDownload.sumOf { ModelDownloadManager.getCachedOrPartialBytes(context, it) }
         }
     }
 
-    LaunchedEffect(sessionState.isCompleted) {
+    LaunchedEffect(sessionState.isCompleted, modelsToDownload) {
         if (sessionState.isCompleted) {
             val allReady = withContext(Dispatchers.IO) {
-                DesertAntModelStorage.areAllEnabledModelsDownloaded(context, configuredSettings)
+                modelsToDownload.all { DesertAntModelStorage.isModelDownloaded(context, it) }
             }
             if (allReady) {
-                ModelSettings.save(context, configuredSettings)
-                ModelSettings.setOnboardingCompleted(context, true)
-                SmartPipeline.getInstance(context).reloadSettingsAsync(configuredSettings)
-                onOnboardingComplete(configuredSettings)
+                completeOnboarding(configuredSettings)
             }
         }
     }
@@ -137,18 +156,19 @@ fun OnboardingScreen(
     val hasPartialProgress = cachedOrPartialBytes > 0L && remainingBytesToDownload > 0L
 
     val launchDownloadQueue: () -> Unit = {
-        step = OnboardingStep.DOWNLOADING
-        ModelSettings.save(context, configuredSettings)
-        ModelDownloadManager.startQueue(
-            context = context,
-            models = configuredSettings.enabledModels(),
-            onAllCompleted = {
-                ModelSettings.save(context, configuredSettings)
-                ModelSettings.setOnboardingCompleted(context, true)
-                SmartPipeline.getInstance(context).reloadSettingsAsync(configuredSettings)
-                onOnboardingComplete(configuredSettings)
-            }
-        )
+        if (modelsToDownload.isEmpty()) {
+            completeOnboarding(configuredSettings)
+        } else {
+            step = OnboardingStep.DOWNLOADING
+            ModelSettings.save(context, configuredSettings)
+            ModelDownloadManager.startQueue(
+                context = context,
+                models = modelsToDownload,
+                onAllCompleted = {
+                    completeOnboarding(configuredSettings)
+                }
+            )
+        }
     }
 
     val notificationPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -158,7 +178,9 @@ fun OnboardingScreen(
     }
 
     val startOrResumeDownloads: () -> Unit = {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+        if (modelsToDownload.isEmpty()) {
+            completeOnboarding(configuredSettings)
+        } else if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
             androidx.core.content.ContextCompat.checkSelfPermission(
                 context,
                 android.Manifest.permission.POST_NOTIFICATIONS
@@ -190,7 +212,7 @@ fun OnboardingScreen(
             )
 
             Text(
-                text = "OpenFlow runs 100% offline on your device using the Desert Ant Labs neural audio pipeline on LiteRT. Select which speech models to download once before starting.",
+                text = "Run offline on your device using Desert Ant Labs LiteRT models, connect OpenAI-compatible remote/cloud APIs with zero downloads, or mix both.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -207,39 +229,104 @@ fun OnboardingScreen(
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Text(
-                            text = "Select On-Device Models",
+                            text = "Setup Mode",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold
                         )
 
-                        // Voz (Locked ON)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            FilterChip(
+                                selected = !remoteVozSelected && llmProvider == LlmProviderMode.LOCAL,
+                                onClick = {
+                                    remoteVozSelected = false
+                                    remoteEarSelected = false
+                                    llmProvider = LlmProviderMode.LOCAL
+                                },
+                                label = { Text("On-Device Offline") }
+                            )
+                            FilterChip(
+                                selected = remoteVozSelected && llmProvider == LlmProviderMode.OPENAI_API,
+                                onClick = {
+                                    remoteVozSelected = true
+                                    if (earSelected) remoteEarSelected = true
+                                    punctSelected = false
+                                    gemmaSelected = true
+                                    llmProvider = LlmProviderMode.OPENAI_API
+                                },
+                                label = { Text("Remote / Cloud APIs (0 MB)") }
+                            )
+                        }
+
+                        HorizontalDivider()
+
+                        Text(
+                            text = "Configure Speech & AI Pipeline",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+
+                        // Voz (Always enabled; Local or Remote API)
                         OnboardingModelRow(
-                            title = "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB, Required)",
-                            subtitle = DesertAntModel.VOZ.roleSummary,
+                            title = if (remoteVozSelected) {
+                                "Voz — Speech Recognition (Remote API · 0 MB)"
+                            } else {
+                                "Voz — Speech Recognition (${DesertAntModel.VOZ.sizeMb} MB, Required)"
+                            },
+                            subtitle = if (remoteVozSelected) {
+                                "Uses a remote OpenAI-compatible /audio/transcriptions server configured in Settings."
+                            } else {
+                                DesertAntModel.VOZ.roleSummary
+                            },
                             checked = true,
                             enabled = false,
-                            isLocked = true,
+                            isLocked = !remoteVozSelected,
                             onCheckedChange = {}
+                        )
+                        OnboardingModeChipRow(
+                            localLabel = "Local (${DesertAntModel.VOZ.sizeMb} MB)",
+                            remoteLabel = "Remote API (0 MB)",
+                            isRemote = remoteVozSelected,
+                            onSelectRemote = { remoteVozSelected = it }
                         )
 
                         HorizontalDivider()
 
                         // Ear
                         OnboardingModelRow(
-                            title = "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)",
+                            title = when {
+                                !earSelected -> "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB, Optional)"
+                                remoteEarSelected -> "Ear — Auto Language Detection (Remote API · 0 MB)"
+                                else -> "Ear — Auto Language Detection (${DesertAntModel.EAR.sizeMb} MB)"
+                            },
                             subtitle = DesertAntModel.EAR.roleSummary,
                             checked = earSelected,
                             enabled = true,
                             isLocked = false,
                             onCheckedChange = { earSelected = it }
                         )
+                        if (earSelected) {
+                            OnboardingModeChipRow(
+                                localLabel = "Local (${DesertAntModel.EAR.sizeMb} MB)",
+                                remoteLabel = "Remote API (0 MB)",
+                                isRemote = remoteEarSelected,
+                                onSelectRemote = { remoteEarSelected = it }
+                            )
+                        }
 
                         HorizontalDivider()
 
                         // Punct (Off by default)
                         OnboardingModelRow(
                             title = "Punct — Text & Punctuation Cleanup (${DesertAntModel.PUNCT.sizeMb} MB, Optional)",
-                            subtitle = DesertAntModel.PUNCT.roleSummary,
+                            subtitle = if (gemmaSelected) {
+                                "Automatically bypassed while AI Post-Processing is enabled."
+                            } else {
+                                DesertAntModel.PUNCT.roleSummary
+                            },
                             checked = punctSelected,
                             enabled = true,
                             isLocked = false,
@@ -248,16 +335,34 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        // On-Device AI Post-Processing (Off by default; defaults to Gemma 4 E2B)
+                        // AI Post-Processing (Local offline or OpenAI-Compatible API)
                         val onboardingLlm = configuredSettings.selectedLlmModel
                         OnboardingModelRow(
-                            title = "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)",
-                            subtitle = "${onboardingLlm.description} (${LlmModelChoice.entries.size} AI models selectable in Settings)",
+                            title = if (gemmaSelected && llmProvider == LlmProviderMode.OPENAI_API) {
+                                "AI Post-Processing (OpenAI-Compatible API · 0 MB)"
+                            } else {
+                                "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)"
+                            },
+                            subtitle = if (gemmaSelected && llmProvider == LlmProviderMode.OPENAI_API) {
+                                "Cleans dictation using your own cloud or LAN OpenAI-compatible API endpoint."
+                            } else {
+                                "${onboardingLlm.description} (${LlmModelChoice.entries.size} AI models selectable in Settings)"
+                            },
                             checked = gemmaSelected,
                             enabled = true,
                             isLocked = false,
                             onCheckedChange = { gemmaSelected = it }
                         )
+                        if (gemmaSelected) {
+                            OnboardingModeChipRow(
+                                localLabel = "Local (${onboardingLlm.desertAntModel.sizeMb} MB)",
+                                remoteLabel = "OpenAI API (0 MB)",
+                                isRemote = llmProvider == LlmProviderMode.OPENAI_API,
+                                onSelectRemote = { useRemote ->
+                                    llmProvider = if (useRemote) LlmProviderMode.OPENAI_API else LlmProviderMode.LOCAL
+                                }
+                            )
+                        }
                     }
                 }
 
@@ -276,48 +381,77 @@ fun OnboardingScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (hasPartialProgress) {
-                                    "Remaining Download: ${DownloadSessionState.formatBytesMb(remainingBytesToDownload)}"
-                                } else {
-                                    "Total Download: ${configuredSettings.activeDiskFootprintMb} MB"
+                                text = when {
+                                    modelsToDownload.isEmpty() -> "No Local Downloads Needed (0 MB)"
+                                    hasPartialProgress ->
+                                        "Remaining Download: ${DownloadSessionState.formatBytesMb(remainingBytesToDownload)}"
+                                    else -> "Total Download: $plannedDiskMb MB"
                                 },
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
-                            if (hasPartialProgress) {
+                            if (modelsToDownload.isEmpty()) {
                                 Text(
-                                    text = "${DownloadSessionState.formatBytesMb(cachedOrPartialBytes)} already saved on device (resumable)",
+                                    text = "Configure your API endpoints and keys next in Settings.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            } else {
+                                if (hasPartialProgress) {
+                                    Text(
+                                        text = "${DownloadSessionState.formatBytesMb(cachedOrPartialBytes)} already saved on device (resumable)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                }
+                                Text(
+                                    text = "Est. Local Peak RAM: ~$plannedPeakRamMb MB • Runs in background",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                             }
-                            Text(
-                                text = "Est. Peak RAM: ~${configuredSettings.estimatedPeakRamMb} MB • Runs in background",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
                         }
                         Icon(
-                            imageVector = Icons.Default.CloudDownload,
+                            imageVector = if (modelsToDownload.isEmpty()) Icons.Default.Cloud else Icons.Default.CloudDownload,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(4.dp))
 
                 Button(
                     onClick = startOrResumeDownloads,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    val label = if (hasPartialProgress) {
-                        "Resume Model Download (${DownloadSessionState.formatBytesMb(remainingBytesToDownload)} left)"
-                    } else {
-                        "Download Selected Models (${configuredSettings.activeDiskFootprintMb} MB)"
+                    val label = when {
+                        modelsToDownload.isEmpty() -> "Continue to OpenFlow Settings (0 MB)"
+                        hasPartialProgress ->
+                            "Resume Model Download (${DownloadSessionState.formatBytesMb(remainingBytesToDownload)} left)"
+                        else -> "Download Selected Models ($plannedDiskMb MB)"
                     }
                     Text(label)
+                }
+
+                if (modelsToDownload.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = {
+                            val apiSettings = configuredSettings.copy(
+                                remoteVozEnabled = true,
+                                earEnabled = earSelected,
+                                remoteEarEnabled = earSelected,
+                                punctEnabled = false,
+                                gemmaEnabled = true,
+                                llmProvider = LlmProviderMode.OPENAI_API
+                            )
+                            completeOnboarding(apiSettings)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Skip Downloads & Use Remote APIs")
+                    }
                 }
             } else {
                 Card(
@@ -489,7 +623,7 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        selectedModels.forEach { model ->
+                        modelsToDownload.forEach { model ->
                             val state = sessionState.modelStatuses[model] ?: ModelQueueStatus.QUEUED
                             val modelTotal = ModelDownloadManager.modelTotalBytes(model)
                             Row(
@@ -605,5 +739,33 @@ private fun OnboardingModelRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun OnboardingModeChipRow(
+    localLabel: String,
+    remoteLabel: String,
+    isRemote: Boolean,
+    onSelectRemote: (Boolean) -> Unit
+) {
+    FlowRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 40.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        FilterChip(
+            selected = !isRemote,
+            onClick = { onSelectRemote(false) },
+            label = { Text(localLabel, maxLines = 1, softWrap = false) }
+        )
+        FilterChip(
+            selected = isRemote,
+            onClick = { onSelectRemote(true) },
+            label = { Text(remoteLabel, maxLines = 1, softWrap = false) }
+        )
     }
 }
