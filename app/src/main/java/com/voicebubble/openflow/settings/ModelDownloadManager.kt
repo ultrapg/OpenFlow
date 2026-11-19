@@ -248,46 +248,6 @@ object ModelDownloadManager {
                 )
             )
             ),
-        DesertAntModel.GRANITE_4_1_3B to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "granite-4.1-3b_int4.litertlm",
-                    sizeBytes = 2_191_540_224L,
-                    sha256 = "48cf6df6547de8149b3b82a424bfcdd465e84854cac1b86208add2f6bdd6a045",
-                    downloadUrl = "https://huggingface.co/litert-community/granite-4.1-3b/resolve/89f95d3906452412fd4ceff00de3938d076b779c/granite-4.1-3b_int4.litertlm"
-                )
-            )
-            ),
-        DesertAntModel.QWEN3_4B_INSTRUCT_2507 to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "qwen3_4b_instruct_2507_mixed_int4.litertlm",
-                    sizeBytes = 2_659_057_664L,
-                    sha256 = "9e48b165836256f5344d9d044930607b9c47f6ef34e27f82e96881664f3ba2fd",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-4B-Instruct-2507/resolve/4d409771b414d86b270ca54d27ffc45032a81142/qwen3_4b_instruct_2507_mixed_int4.litertlm"
-                )
-            )
-            ),
-        DesertAntModel.GRANITE_4_2_3B to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "granite-4.2-3b_int4.litertlm",
-                    sizeBytes = 2_190_819_328L,
-                    sha256 = "91fd94b7b837364511aca2e701a6adfc1b955c681a4cee9e9b22d9342d7990d0",
-                    downloadUrl = "https://huggingface.co/litert-community/granite-4.2-3b/resolve/093d6054d9b00a7cd8ce2e17ef210625016c1ad5/granite-4.2-3b_int4.litertlm"
-                )
-            )
-            ),
-        DesertAntModel.QWEN3_4B to (
-            "v1.0.0" to listOf(
-                ModelFileArtifact(
-                    relativePath = "qwen3_4b_mixed_int4.litertlm",
-                    sizeBytes = 2_272_935_936L,
-                    sha256 = "4877b236f09c0b519958612afeb3c6fc6575c7ce56080d0d3a5406150e0ff9ce",
-                    downloadUrl = "https://huggingface.co/litert-community/Qwen3-4B/resolve/2e62465be458fb02f7a92e339f98270f42dc9b32/qwen3_4b_mixed_int4.litertlm"
-                )
-            )
-            ),
         DesertAntModel.GEMMA_4_E2B to (
             "v1.0.0" to listOf(
                 ModelFileArtifact(

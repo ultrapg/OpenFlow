@@ -81,50 +81,6 @@ enum class DesertAntModel(
         expectedBytes = 295_740_930L,
         isRequired = false
     ),
-    GRANITE_4_1_3B(
-        id = "granite4_1_3b",
-        shortLabel = "Granite 4.1 3B",
-        displayName = "IBM Granite 4.1 3B",
-        roleSummary = "2.04 GB • IBM dense 3B direct instruct editor",
-        sizeMb = 2090,
-        expectedBytes = 2_191_540_224L,
-        isRequired = false,
-        isExperimental = true,
-        isLlmModel = true
-    ),
-    QWEN3_4B_INSTRUCT_2507(
-        id = "qwen3_4b_instruct_2507",
-        shortLabel = "Qwen3 4B Instruct",
-        displayName = "Qwen3 4B Instruct 2507",
-        roleSummary = "2.48 GB • Strong 4B non-thinking multilingual editor",
-        sizeMb = 2536,
-        expectedBytes = 2_659_057_664L,
-        isRequired = false,
-        isExperimental = true,
-        isLlmModel = true
-    ),
-    GRANITE_4_2_3B(
-        id = "granite4_2_3b",
-        shortLabel = "Granite 4.2 3B",
-        displayName = "IBM Granite 4.2 3B",
-        roleSummary = "2.04 GB • IBM 3B with switchable reasoning",
-        sizeMb = 2089,
-        expectedBytes = 2_190_819_328L,
-        isRequired = false,
-        isExperimental = true,
-        isLlmModel = true
-    ),
-    QWEN3_4B(
-        id = "qwen3_4b",
-        shortLabel = "Qwen3 4B",
-        displayName = "Qwen3 4B",
-        roleSummary = "2.12 GB • 4B hybrid thinking / non-thinking editor",
-        sizeMb = 2168,
-        expectedBytes = 2_272_935_936L,
-        isRequired = false,
-        isExperimental = true,
-        isLlmModel = true
-    ),
     GEMMA_4_E2B(
         id = "gemma4_e2b",
         shortLabel = "Gemma 4 E2B",
@@ -142,23 +98,70 @@ enum class DesertAntModel(
 }
 
 /**
- * Prompt optimization tier matched to each on-device LLM's parameter scale, instruction-tuning
- * behavior, and reasoning architecture.
+ * Prompt optimization tier matched to each on-device LLM's parameter scale, context limit,
+ * instruction-following behavior, and reasoning architecture.
  */
 enum class LlmPromptTier {
-    /** Deterministic non-conversational text-filter framing for direct 3-4B instruct models with no `<think>` scratchpad (Granite 4.1 3B & Qwen3 4B Instruct 2507). */
-    DIRECT_INSTRUCT_3B,
-
-    /** High-signal multi-rule prompt + grounded examples for 3-4B models with a switchable `<think>` channel (Qwen3 4B & Granite 4.2 3B). */
-    BALANCED_3B,
+    /** Compact, high-signal non-chatty prompt tuned for Android AICore system Gemini Nano (Full & Fast). */
+    GEMINI_NANO,
 
     /** Full Wispr Flow multi-clause, nuance-preserving prompt + multilingual examples for flagship Gemma 4 E2B. */
     FLAGSHIP_GEMMA_4
 }
 
 /**
- * Selectable on-device LiteRT-LM models for AI post-processing & dictation cleanup, ordered from
- * smallest/fastest to largest/most capable. Only ONE selected model is ever enabled or loaded into RAM.
+ * Execution backend used when [LlmProviderMode.LOCAL] is selected for AI Post-Processing:
+ * - [LITERT_LM]: OpenFlow-managed downloadable LiteRT-LM model (`Gemma 4 E2B`, 2.41 GB).
+ * - [GEMINI_NANO]: Android system AICore Gemini Nano (`Full` or `Fast`, 0 MB app storage).
+ */
+enum class LocalLlmBackend(val id: String, val title: String) {
+    LITERT_LM("litert_lm", "Gemma 4 E2B (LiteRT-LM)"),
+    GEMINI_NANO("gemini_nano", "Gemini Nano (AICore)");
+
+    companion object {
+        fun fromId(id: String?): LocalLlmBackend {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: LITERT_LM
+        }
+    }
+}
+
+/**
+ * Selectable on-device Gemini Nano model variants managed by Android AICore via ML Kit GenAI Prompt API:
+ * - [FULL]: Full-capability Gemini Nano (`ModelPreference.FULL`) for highest nuance & accuracy.
+ * - [FAST]: Latency-optimized Gemini Nano (`ModelPreference.FAST`) for quickest response times.
+ */
+enum class GeminiNanoVariant(
+    val id: String,
+    val title: String,
+    val shortLabel: String,
+    val badgeLabel: String,
+    val description: String
+) {
+    FULL(
+        id = "full",
+        title = "Gemini Nano (Full)",
+        shortLabel = "Nano Full",
+        badgeLabel = "FULL",
+        description = "Full-capability system Gemini Nano via Android AICore (0 MB app download)"
+    ),
+    FAST(
+        id = "fast",
+        title = "Gemini Nano Fast",
+        shortLabel = "Nano Fast",
+        badgeLabel = "FAST",
+        description = "Low-latency speed-optimized Gemini Nano variant via Android AICore (0 MB app download)"
+    );
+
+    companion object {
+        fun fromId(id: String?): GeminiNanoVariant {
+            return entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: FULL
+        }
+    }
+}
+
+/**
+ * Selectable downloadable on-device LiteRT-LM models for AI post-processing & dictation cleanup.
+ * Only [GEMMA_4_E2B] is shipped as a downloadable local LiteRT-LM model alongside Android system Gemini Nano.
  */
 enum class LlmModelChoice(
     val id: String,
@@ -180,109 +183,9 @@ enum class LlmModelChoice(
     val samplerTemperature: Double,
     val defaultDisableThinking: Boolean = false,
     val hasDynamicKvCache: Boolean = false,
-    /**
-     * `false` when the bundled Jinja chat template dereferences `messages[0]` unconditionally (Qwen3 and
-     * Granite 4.2 families). LiteRT-LM renders the preface with an empty message list for
-     * `prefillPrefaceOnInit = true`, which makes `createConversation` fail with
-     * `Failed to apply template: undefined value`, so system-prompt KV pre-warming is skipped up front
-     * instead of paying for a doomed conversation creation on every dictation.
-     */
     val supportsPrefaceKvPrefill: Boolean = true,
-    /**
-     * `true` when greedy decoding makes the model's `<think>` scratchpad degenerate into repetition loops
-     * (Qwen3 recommends `temperature 0.6 / top-p 0.95 / top-k 20` for thinking). Turns with thinking enabled
-     * use the model's sampler settings instead of pure argmax; thinking-off turns stay greedy.
-     */
     val needsSamplingWhileThinking: Boolean = false
 ) {
-    GRANITE_4_1_3B(
-        id = "granite4_1_3b",
-        desertAntModel = DesertAntModel.GRANITE_4_1_3B,
-        modelFileName = "granite-4.1-3b_int4.litertlm",
-        title = "IBM Granite 4.1 3B",
-        badgeLabel = "DIRECT",
-        speedAndRamSummary = "2.04 GB",
-        description = "IBM dense 3B direct instruct editor",
-        estimatedStandaloneRamMb = 1_450,
-        estimatedIncrementalRamMb = 850,
-        supportsThinking = false,
-        supportsNpuBackend = false,
-        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
-        preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 0,
-        samplerTopK = 16,
-        samplerTopP = 0.88,
-        samplerTemperature = 0.06,
-        defaultDisableThinking = true,
-        hasDynamicKvCache = false
-    ),
-    QWEN3_4B_INSTRUCT_2507(
-        id = "qwen3_4b_instruct_2507",
-        desertAntModel = DesertAntModel.QWEN3_4B_INSTRUCT_2507,
-        modelFileName = "qwen3_4b_instruct_2507_mixed_int4.litertlm",
-        title = "Qwen3 4B Instruct 2507",
-        badgeLabel = "BALANCED 4B",
-        speedAndRamSummary = "2.48 GB",
-        description = "Strong 4B multilingual direct editor",
-        estimatedStandaloneRamMb = 1_650,
-        estimatedIncrementalRamMb = 950,
-        supportsThinking = false,
-        supportsNpuBackend = false,
-        promptTier = LlmPromptTier.DIRECT_INSTRUCT_3B,
-        preferredMaxContextTokens = 2_048,
-        thinkingTokenBudgetCap = 0,
-        samplerTopK = 20,
-        samplerTopP = 0.90,
-        samplerTemperature = 0.07,
-        defaultDisableThinking = true,
-        hasDynamicKvCache = false,
-        supportsPrefaceKvPrefill = false
-    ),
-    GRANITE_4_2_3B(
-        id = "granite4_2_3b",
-        desertAntModel = DesertAntModel.GRANITE_4_2_3B,
-        modelFileName = "granite-4.2-3b_int4.litertlm",
-        title = "IBM Granite 4.2 3B",
-        badgeLabel = "REASONING 3B",
-        speedAndRamSummary = "2.04 GB",
-        description = "IBM 3B with switchable reasoning",
-        estimatedStandaloneRamMb = 1_450,
-        estimatedIncrementalRamMb = 850,
-        supportsThinking = true,
-        supportsNpuBackend = false,
-        promptTier = LlmPromptTier.BALANCED_3B,
-        preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 128,
-        samplerTopK = 20,
-        samplerTopP = 0.90,
-        samplerTemperature = 0.08,
-        defaultDisableThinking = true,
-        hasDynamicKvCache = false,
-        supportsPrefaceKvPrefill = false
-    ),
-    QWEN3_4B(
-        id = "qwen3_4b",
-        desertAntModel = DesertAntModel.QWEN3_4B,
-        modelFileName = "qwen3_4b_mixed_int4.litertlm",
-        title = "Qwen3 4B",
-        badgeLabel = "THINKING 4B",
-        speedAndRamSummary = "2.12 GB",
-        description = "4B hybrid thinking auto-editor",
-        estimatedStandaloneRamMb = 1_650,
-        estimatedIncrementalRamMb = 950,
-        supportsThinking = true,
-        supportsNpuBackend = false,
-        promptTier = LlmPromptTier.BALANCED_3B,
-        preferredMaxContextTokens = 4_096,
-        thinkingTokenBudgetCap = 160,
-        samplerTopK = 20,
-        samplerTopP = 0.90,
-        samplerTemperature = 0.10,
-        defaultDisableThinking = true,
-        hasDynamicKvCache = false,
-        supportsPrefaceKvPrefill = false,
-        needsSamplingWhileThinking = true
-    ),
     GEMMA_4_E2B(
         id = "gemma4_e2b",
         desertAntModel = DesertAntModel.GEMMA_4_E2B,
@@ -290,7 +193,7 @@ enum class LlmModelChoice(
         title = "Gemma 4 E2B",
         badgeLabel = "DEFAULT",
         speedAndRamSummary = "2.41 GB",
-        description = "Recommended flagship auto-editor",
+        description = "Flagship reasoning & formatting",
         estimatedStandaloneRamMb = 1_900,
         estimatedIncrementalRamMb = 850,
         supportsThinking = true,
@@ -401,28 +304,20 @@ enum class GemmaPromptPreset(
     );
 
     /**
-     * Returns the task instruction specifically optimized for [llmChoice]'s parameter scale,
-     * prefill bucket efficiency, and instruction-following behavior.
+     * Returns the task instruction specifically optimized for [tier].
      */
-    fun promptForModel(llmChoice: LlmModelChoice): String = when (llmChoice.promptTier) {
-        LlmPromptTier.DIRECT_INSTRUCT_3B -> when (this) {
-            CLEAN_AND_POLISH -> """Act as a deterministic speech-to-text cleanup filter (NOT a conversational assistant). Output the speaker's dictated message cleaned and formatted in their own voice and language:
-- Backtracks & self-repairs: If the speaker retracts words mid-sentence ('actually', 'wait', 'no wait', 'wait no', 'sorry', 'I mean', 'make that', 'scratch that', 'nein warte', 'ich meine'), delete both the retracted words and the repair cue, keeping only the corrected wording. Preserve real contrasts ('not X, but Y').
-- Disfluencies & sentence flow: Strip vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), word repeats ('the the'), and filler 'like'/'you know' when used purely as hesitation (keep literal uses like 'I like this'). Fix false pause periods and capitalization. Preserve questions as questions — never answer them.
-- Automatic vertical lists: Turn spoken enumerations ('number one... number two...', 'first... second... third...', 'one... two... three...', 'erstens... zweitens...') into vertical '1. ', '2. ' lines (each on its own new line after ':'), and 'bullet point'/'dash' cues into '- ' lines. Keep casual 3-item inline phrases inline.
-- Numbers, dates & tech: Use digits for any number paired with a unit, time, date, percent, currency, version, or model name ('0 MB', '8 GB', '500 ms', '5 minutes', '25%', '$1,500', '3:30 PM', '2.8.0', 'Gemma 4 E2B') and for standalone 10+; spell out standalone counts one through nine in prose. Capitalize acronyms ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'GitHub'), format dictated emails ('name@example.com'), and apply spoken 'new line'/'new paragraph' breaks cleanly."""
-            STRICT_CLEANUP -> "Act strictly as a verbatim transcript cleaner (never reply as an assistant): remove vocal fillers ('um', 'uh', 'äh', 'ähm', 'er', 'hm'), stutters, and mid-sentence self-repairs (keeping only the intended repair), convert 10+, decimals, percentages, currencies, dates, times, versions, and units into digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and fix punctuation and capitalization without rephrasing."
-            else -> defaultSystemPrompt
-        }
-
-        LlmPromptTier.BALANCED_3B -> when (this) {
-            CLEAN_AND_POLISH -> """Edit raw spoken dictation into clean, natural written text that reads smoothly while keeping the speaker's exact voice, tone, intent, and language:
-- Mid-sentence backtracks: When the speaker changes course ('actually', 'wait', 'no wait', 'wait no', 'sorry', 'I mean', 'scratch that', 'make that', 'oder nein', 'nein warte', 'ich meine'), remove both the abandoned phrase and the repair cue, keeping only the final intended words. Keep true contrasts ('not X, but Y').
-- Fillers & punctuation: Strip vocal hesitations ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters ('the the', 'I I'), false starts, and hesitation 'like'/'you know' (never remove literal 'like' in 'I like this' or 'looks like'). Repair mid-sentence pause periods and capitalization; keep questions as questions.
-- Vertical list layout: Format spoken sequences ('number one... number two...', 'first... second... third...', 'one... two... three...', 'erstens... zweitens...') with ':' after any lead-in clause and EVERY item on its own new line ('1. ', '2. '), and 'bullet point'/'dash item' cues as '- ' lines. Keep short casual series ('milk, eggs, and bread') inline.
-- Numbers, times & units: Always use digits when paired with units, times, dates, percents, currencies, versions, or model names ('0 MB', '6 GB', '1.9 GB', '380 ms', '5 minutes', '25%', '$1,500', '49,99 €', '3:30 PM', '14:30', '2.8.0', 'Gemma 4 E2B') and for standalone 10+; spell out standalone counts one to nine in ordinary prose.
-- Tech terms, emails & breaks: Capitalize acronyms & identifiers ('NPU', 'GPU', 'CPU', 'RAM', 'LLM', 'KV', 'API', 'JSON', 'SQL', 'GitHub', 'camelCase', 'snake_case'), format spoken emails/URLs ('name@example.com'), and turn explicit spoken 'new line'/'new paragraph' cues into line breaks without adding unrequested formality."""
-            else -> defaultSystemPrompt
+    fun promptForTier(tier: LlmPromptTier): String = when (tier) {
+        LlmPromptTier.GEMINI_NANO -> when (this) {
+            CLEAN_AND_POLISH -> """Clean raw spoken dictation into natural, ready-to-send written text in the speaker's exact voice and language:
+- Backtracks: When the speaker changes course ('wait', 'no wait', 'actually', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'ich meine'), delete the retracted words and cue, keeping only the final intended words. Keep contrasts ('not X, but Y').
+- Fillers & punctuation: Remove vocal fillers ('um', 'uh', 'er', 'ah', 'hmm', 'äh', 'ähm'), stutters, and hesitation 'like'/'you know' (keep literal 'I like'). Fix punctuation, false pause periods, and capitalization; keep questions as questions.
+- Vertical lists: Format spoken enumerations ('number one... number two...', 'first... second...', 'erstens... zweitens...', 'bullet point...') with ':' after any lead-in clause and each item on its own new line ('1. ', '2. ' or '- '). Keep brief triples inline.
+- Numbers, emails & tech: Use digits for 0+ paired with units, times, dates, percents, currencies, versions ('6 GB', '380 ms', '25%', '3:30 PM', 'v2.10'), and standalone 10+; spell out standalone one through nine. Format spoken emails ('name@domain.com'), acronyms ('NPU', 'GPU', 'RAM', 'LLM', 'API'), and spoken 'new line'/'new paragraph' breaks cleanly."""
+            STRICT_CLEANUP -> "Clean spoken dictation verbatim in the speaker's exact language: remove vocal fillers ('um', 'uh', 'äh', 'ähm'), stutters, and clear mid-phrase self-corrections (keeping only the intended correction), format decimals, percentages, currencies, times, dates, versions, units, and 10+ as digits, capitalize acronyms ('NPU', 'GPU', 'RAM', 'API'), and fix punctuation and casing without rephrasing."
+            CONCISE_DIRECT -> "Tighten spoken dictation into crisp, direct text in the speaker's original language: resolve self-corrections, remove fillers and hedging while keeping every fact, name, number, and constraint, put enumerations on vertical '1. ' or '- ' lines after ':', and format numbers, times, dates, currencies, and units cleanly."
+            PROFESSIONAL_MESSAGE -> "Format spoken dictation as a clean email or work message in the speaker's language: resolve self-corrections and fillers, place any spoken greeting or sign-off on its own line (without inventing unspoken ones), structure paragraphs and vertical '1. '/' - ' action lists cleanly, and format numbers, dates, times, currencies, and spoken emails."
+            STRUCTURED_NOTES -> "Turn spoken dictation into clean notes in the speaker's language: put each distinct point on its own '- ' bullet line (or '1. ' line when sequential) beneath any spoken heading ending with ':', resolve self-corrections, strip fillers, and format numbers, dates, times, units, and emails cleanly."
+            CUSTOM -> defaultSystemPrompt
         }
 
         LlmPromptTier.FLAGSHIP_GEMMA_4 -> when (this) {
@@ -438,7 +333,7 @@ enum class GemmaPromptPreset(
    - End any lead-in clause with ':' (replacing spoken 'colon' / 'doppelpunkt'), strip the spoken cue ('number one', 'first'), and place EVERY item on its OWN NEW LINE starting with '1. ', '2. ', '3. ' — NEVER write '1. ... 2. ... 3. ...' inline on one paragraph line.
    - Format 'bullet point' / 'dash item' cues as separate '- ' lines; keep casual inline triples ('milk, eggs, and bread') inline.
 4. Numbers, dates & units:
-   - ALWAYS use digits (including 0–9) when paired with ANY unit, time, date, percent, currency, version, or model/spec name: percentages ('98%', '25%'), currencies ('$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30', 'November 24, 2026'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '1,500 MB', '380 ms', '42.5 tokens/s', '5 minutes', '30 seconds', '2,048 tokens'), and model names ('Qwen3 4B', 'Granite 4.2 3B', 'Gemma 4 E2B').
+   - ALWAYS use digits (including 0–9) when paired with ANY unit, time, date, percent, currency, version, or model/spec name: percentages ('98%', '25%'), currencies ('\$4,250.75', '49,99 €'), clock times ('4:45 PM', '15:30'), dates ('October 30', 'November 24, 2026'), version numbers ('version 2.10', '2.8.0'), units ('0 MB', '6 GB', '1.9 GB', '1,500 MB', '380 ms', '42.5 tokens/s', '5 minutes', '30 seconds', '2,048 tokens'), and model names ('Gemma 4 E2B', 'Gemini Nano').
    - Spell out standalone prose counts one through nine ONLY when not paired with a unit ('three local models', 'four things'), and use digits for standalone 10+.
 5. Paragraphs, emails & technical terms:
    - Apply explicit layout cues ('new paragraph' / 'neuer Absatz' -> blank line, 'new line' / 'neue Zeile' -> line break, 'em dash' -> ' — ') and delete the cue words.
@@ -465,16 +360,25 @@ enum class GemmaPromptPreset(
     }
 
     /**
-     * Returns the task instruction appropriate for [provider]: cloud-optimized high-capacity
-     * instructions ([cloudSystemPrompt]) for [LlmProviderMode.OPENAI_API], or local-model-tuned
-     * instructions via [promptForModel] for [LlmProviderMode.LOCAL].
+     * Returns the task instruction specifically optimized for [llmChoice]'s parameter scale,
+     * prefill bucket efficiency, and instruction-following behavior.
+     */
+    fun promptForModel(llmChoice: LlmModelChoice): String = promptForTier(llmChoice.promptTier)
+
+    /**
+     * Returns the task instruction appropriate for [provider] and [localLlmBackend]: cloud-optimized
+     * high-capacity instructions ([cloudSystemPrompt]) for [LlmProviderMode.OPENAI_API], compact
+     * Gemini Nano instructions for [LocalLlmBackend.GEMINI_NANO], or LiteRT-LM instructions for
+     * [LocalLlmBackend.LITERT_LM].
      */
     fun promptForProvider(
         provider: LlmProviderMode,
-        llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
-    ): String = when (provider) {
-        LlmProviderMode.LOCAL -> promptForModel(llmChoice)
-        LlmProviderMode.OPENAI_API -> cloudSystemPrompt
+        llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
+        localLlmBackend: LocalLlmBackend = LocalLlmBackend.LITERT_LM
+    ): String = when {
+        provider == LlmProviderMode.OPENAI_API -> cloudSystemPrompt
+        localLlmBackend == LocalLlmBackend.GEMINI_NANO -> promptForTier(LlmPromptTier.GEMINI_NANO)
+        else -> promptForModel(llmChoice)
     }
 
     companion object {
@@ -662,6 +566,9 @@ data class ModelSettings(
     val gemmaEnabled: Boolean = false,
     /** Deterministic non-AI formatting engine (numbers, lists, fillers, corrections). Works with or without an LLM. */
     val formattingEngineEnabled: Boolean = false,
+    val localLlmBackend: LocalLlmBackend = LocalLlmBackend.LITERT_LM,
+    val geminiNanoVariant: GeminiNanoVariant = GeminiNanoVariant.FULL,
+    val geminiNanoAutoFallback: Boolean = true,
     val selectedLlmModel: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
     val gemmaDisableThinking: Boolean = selectedLlmModel.defaultDisableThinking,
     val gemmaAdaptiveThinking: Boolean = true,
@@ -739,9 +646,21 @@ data class ModelSettings(
             else -> "Local"
         }
 
-    /** `true` when AI post-processing is enabled and using an on-device LiteRT-LM model. */
+    /** `true` when AI post-processing is enabled and using an on-device LiteRT-LM model (`Gemma 4 E2B`). */
+    val isLocalLiteRtLlmEnabled: Boolean
+        get() = gemmaEnabled &&
+            llmProvider == LlmProviderMode.LOCAL &&
+            localLlmBackend == LocalLlmBackend.LITERT_LM
+
+    /** `true` when AI post-processing is enabled and using Android AICore system Gemini Nano. */
+    val isGeminiNanoEnabled: Boolean
+        get() = gemmaEnabled &&
+            llmProvider == LlmProviderMode.LOCAL &&
+            localLlmBackend == LocalLlmBackend.GEMINI_NANO
+
+    /** `true` when AI post-processing is enabled in local mode (`Gemma 4 E2B` or `Gemini Nano`). */
     val isLocalLlmEnabled: Boolean
-        get() = gemmaEnabled && llmProvider == LlmProviderMode.LOCAL
+        get() = isLocalLiteRtLlmEnabled || isGeminiNanoEnabled
 
     /** `true` when AI post-processing is enabled and configured to call a remote/LAN OpenAI-compatible API. */
     val isOpenAiApiEnabled: Boolean
@@ -750,7 +669,7 @@ data class ModelSettings(
             openAiBaseUrl.isNotBlank() &&
             openAiModel.isNotBlank()
 
-    /** `true` when either a local LiteRT-LM model or a configured OpenAI-compatible API handles post-processing. */
+    /** `true` when either a local AI model (`Gemma 4 E2B` / `Gemini Nano`) or an OpenAI-compatible API handles post-processing. */
     val isAiPostProcessingActive: Boolean
         get() = isLocalLlmEnabled || isOpenAiApiEnabled
 
@@ -773,48 +692,53 @@ data class ModelSettings(
     val aiSectionSummaryLabel: String
         get() = when {
             isOpenAiApiEnabled -> "API · ${openAiModel.trim()}"
-            isLocalLlmEnabled -> "Local · ${selectedLlmModel.title}"
+            isGeminiNanoEnabled -> "Local · ${geminiNanoVariant.shortLabel}"
+            isLocalLiteRtLlmEnabled -> "Local · ${selectedLlmModel.title}"
             gemmaEnabled && llmProvider == LlmProviderMode.OPENAI_API -> "API · Setup needed"
             formattingEngineEnabled -> "Instant Engine"
             else -> "Off"
         }
 
     /**
-     * Resolves the active provider/model task instruction based on [llmProvider], [selectedLlmModel],
-     * [gemmaPromptPreset], and [gemmaCustomPrompt].
+     * Resolves the active provider/model task instruction based on [llmProvider], [localLlmBackend],
+     * [selectedLlmModel], [gemmaPromptPreset], and [gemmaCustomPrompt].
      */
     fun resolvedGemmaTaskInstruction(): String {
         return if (gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
-            gemmaCustomPrompt.trim().ifEmpty { GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, selectedLlmModel) }
+            gemmaCustomPrompt.trim().ifEmpty {
+                GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, selectedLlmModel, localLlmBackend)
+            }
         } else {
-            gemmaPromptPreset.promptForProvider(llmProvider, selectedLlmModel)
+            gemmaPromptPreset.promptForProvider(llmProvider, selectedLlmModel, localLlmBackend)
         }
     }
 
     /**
-     * Active disk footprint in MB based on currently enabled on-device models (0 MB extra for cloud/LAN APIs).
+     * Active disk footprint in MB based on currently enabled OpenFlow-downloaded models
+     * (`0 MB` extra for cloud APIs and system AICore Gemini Nano).
      */
     val activeDiskFootprintMb: Int
         get() = (if (isRemoteVozActive) 0 else DesertAntModel.VOZ.sizeMb) +
             (if (earEnabled && !isRemoteEarActive) DesertAntModel.EAR.sizeMb else 0) +
             (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
-            (if (isLocalLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
+            (if (isLocalLiteRtLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
 
     /**
-     * Estimated peak RAM in MB based on models that can ever co-reside in RAM:
+     * Estimated peak app RAM in MB based on models that can ever co-reside in RAM:
      * - Local `Voz` (1,187 MB weights + runtime buffers): 1,400 MB (0 MB when [isRemoteVozActive])
      * - Local `Ear` (10 MB weights + runtime buffers): +50 MB (0 MB when [isRemoteEarActive])
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
-     *   - Active Local LLM (`Granite 4.1 3B` / `Granite 4.2 3B` +850 MB, `Gemma 4 E2B` +850 MB,
-     *     `Qwen3 4B` / `Qwen3 4B Instruct 2507` +950 MB), OR
-     *   - `Punct` (+120 MB) when AI post-processing (local or OpenAI API) is disabled.
+     *   - Active Local `Gemma 4 E2B` (+850 MB), OR
+     *   - `Gemini Nano` / OpenAI API (+0 MB app RAM — AICore runs in system service), OR
+     *   - `Punct` (+120 MB) when AI post-processing is disabled.
      */
     val estimatedPeakRamMb: Int
         get() = (if (isRemoteVozActive) 0 else 1400) +
             (if (earEnabled && !isRemoteEarActive) 50 else 0) +
             when {
-                isLocalLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
-                punctEnabled && !isOpenAiApiEnabled -> 120
+                isLocalLiteRtLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
+                isGeminiNanoEnabled || isOpenAiApiEnabled -> 0
+                punctEnabled -> 120
                 else -> 0
             }
 
@@ -822,11 +746,7 @@ data class ModelSettings(
         DesertAntModel.VOZ -> !isRemoteVozActive
         DesertAntModel.EAR -> earEnabled && !isRemoteEarActive
         DesertAntModel.PUNCT -> punctEnabled
-        DesertAntModel.GRANITE_4_1_3B,
-        DesertAntModel.QWEN3_4B_INSTRUCT_2507,
-        DesertAntModel.GRANITE_4_2_3B,
-        DesertAntModel.QWEN3_4B,
-        DesertAntModel.GEMMA_4_E2B -> isLocalLlmEnabled && model == selectedLlmModel.desertAntModel
+        DesertAntModel.GEMMA_4_E2B -> isLocalLiteRtLlmEnabled && model == selectedLlmModel.desertAntModel
     }
 
     /**
@@ -855,19 +775,21 @@ data class ModelSettings(
         if (!isRemoteVozActive) add(DesertAntModel.VOZ)
         if (earEnabled && !isRemoteEarActive) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (isLocalLlmEnabled) add(selectedLlmModel.desertAntModel)
+        if (isLocalLiteRtLlmEnabled) add(selectedLlmModel.desertAntModel)
     }
 
     /**
      * Local models required by the user's selected mode flags during startup/onboarding, even
-     * before remote API URLs and keys are filled in, so API-mode selections require zero local
-     * model downloads.
+     * before remote API URLs and keys are filled in, so API-mode and system Gemini Nano selections
+     * require zero downloadable local LLM weights.
      */
     fun plannedLocalModels(): List<DesertAntModel> = buildList {
         if (!remoteVozEnabled) add(DesertAntModel.VOZ)
         if (earEnabled && !remoteEarEnabled) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (gemmaEnabled && llmProvider == LlmProviderMode.LOCAL) add(selectedLlmModel.desertAntModel)
+        if (gemmaEnabled && llmProvider == LlmProviderMode.LOCAL && localLlmBackend == LocalLlmBackend.LITERT_LM) {
+            add(selectedLlmModel.desertAntModel)
+        }
     }
 
     /**
@@ -877,8 +799,9 @@ data class ModelSettings(
         (if (!remoteVozEnabled) 1400 else 0) +
             (if (earEnabled && !remoteEarEnabled) 50 else 0) +
             when {
-                gemmaEnabled && llmProvider == LlmProviderMode.LOCAL -> selectedLlmModel.estimatedIncrementalRamMb
-                punctEnabled && !(gemmaEnabled && llmProvider == LlmProviderMode.OPENAI_API) -> 120
+                gemmaEnabled && llmProvider == LlmProviderMode.LOCAL && localLlmBackend == LocalLlmBackend.LITERT_LM ->
+                    selectedLlmModel.estimatedIncrementalRamMb
+                punctEnabled && !gemmaEnabled -> 120
                 else -> 0
             }
 
@@ -888,6 +811,9 @@ data class ModelSettings(
         const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
         const val KEY_FORMATTING_ENGINE_ENABLED = "formatting_engine_enabled_v2"
+        const val KEY_LOCAL_LLM_BACKEND = "local_llm_backend"
+        const val KEY_GEMINI_NANO_VARIANT = "gemini_nano_variant"
+        const val KEY_GEMINI_NANO_AUTO_FALLBACK = "gemini_nano_auto_fallback"
         const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
@@ -1028,6 +954,13 @@ data class ModelSettings(
                 com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS
             ).coerceIn(5, 120)
             val rawGemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
+            val localLlmBackend = LocalLlmBackend.fromId(
+                prefs.getString(KEY_LOCAL_LLM_BACKEND, LocalLlmBackend.LITERT_LM.id)
+            )
+            val geminiNanoVariant = GeminiNanoVariant.fromId(
+                prefs.getString(KEY_GEMINI_NANO_VARIANT, GeminiNanoVariant.FULL.id)
+            )
+            val geminiNanoAutoFallback = prefs.getBoolean(KEY_GEMINI_NANO_AUTO_FALLBACK, true)
             val rawSelectedId = prefs.getString(KEY_SELECTED_LLM_MODEL, null)
             val hasValidExplicitModel = LlmModelChoice.isSupportedId(rawSelectedId)
             val migratedFromRemovedModel = !rawSelectedId.isNullOrBlank() && !hasValidExplicitModel
@@ -1041,7 +974,11 @@ data class ModelSettings(
             } else {
                 selectedLlm.defaultDisableThinking
             }
-            val gemmaEnabled = if (migratedFromRemovedModel && rawGemmaEnabled && llmProvider == LlmProviderMode.LOCAL) {
+            val gemmaEnabled = if (migratedFromRemovedModel &&
+                rawGemmaEnabled &&
+                llmProvider == LlmProviderMode.LOCAL &&
+                localLlmBackend == LocalLlmBackend.LITERT_LM
+            ) {
                 DesertAntModelStorage.isModelDownloaded(context, selectedLlm.desertAntModel)
             } else {
                 rawGemmaEnabled
@@ -1063,6 +1000,9 @@ data class ModelSettings(
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = gemmaEnabled,
                 formattingEngineEnabled = prefs.getBoolean(KEY_FORMATTING_ENGINE_ENABLED, false),
+                localLlmBackend = localLlmBackend,
+                geminiNanoVariant = geminiNanoVariant,
+                geminiNanoAutoFallback = geminiNanoAutoFallback,
                 selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = resolvedDisableThinking,
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
@@ -1117,6 +1057,9 @@ data class ModelSettings(
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
                 .putBoolean(KEY_FORMATTING_ENGINE_ENABLED, settings.formattingEngineEnabled)
+                .putString(KEY_LOCAL_LLM_BACKEND, settings.localLlmBackend.id)
+                .putString(KEY_GEMINI_NANO_VARIANT, settings.geminiNanoVariant.id)
+                .putBoolean(KEY_GEMINI_NANO_AUTO_FALLBACK, settings.geminiNanoAutoFallback)
                 .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)
@@ -1202,10 +1145,6 @@ object DesertAntModelStorage {
         DesertAntModel.VOZ to "v0.4.0",
         DesertAntModel.EAR to "v0.2.0",
         DesertAntModel.PUNCT to "v1.0.0",
-        DesertAntModel.GRANITE_4_1_3B to "v1.0.0",
-        DesertAntModel.QWEN3_4B_INSTRUCT_2507 to "v1.0.0",
-        DesertAntModel.GRANITE_4_2_3B to "v1.0.0",
-        DesertAntModel.QWEN3_4B to "v1.0.0",
         DesertAntModel.GEMMA_4_E2B to "v1.0.0"
     )
 
@@ -1231,7 +1170,11 @@ object DesertAntModelStorage {
         "smollm3_3b",
         "granite4_micro",
         "ministral3_3b",
-        "gemma4_e4b"
+        "gemma4_e4b",
+        "granite4_1_3b",
+        "qwen3_4b_instruct_2507",
+        "granite4_2_3b",
+        "qwen3_4b"
     )
 
     fun modelRevision(model: DesertAntModel): String {
@@ -1247,13 +1190,15 @@ object DesertAntModelStorage {
     }
 
     /**
-     * Automatically removes any leftover deprecated model directories (`clear`, `uhm`, `lfm3_1_7b`,
-     * `qwen3_*`, `qwen2_5_*`) from previous releases to reclaim device storage.
+     * Automatically removes any leftover deprecated model directories and compiled LiteRT-LM caches
+     * from previous releases to reclaim device storage.
      */
     fun cleanupLegacyRemovedModels(context: Context) {
         if (legacyModelsCleanedUp) return
         legacyModelsCleanedUp = true
-        cleanupLegacyRemovedModelsInDirectory(File(context.applicationContext.cacheDir, "desert-ant-models"))
+        val cacheDir = context.applicationContext.cacheDir
+        cleanupLegacyRemovedModelsInDirectory(File(cacheDir, "desert-ant-models"))
+        cleanupLegacyRemovedModelsInDirectory(File(cacheDir, "litert_llm_cache"))
     }
 
     internal fun cleanupLegacyRemovedModelsInDirectory(modelsBase: File): Int {

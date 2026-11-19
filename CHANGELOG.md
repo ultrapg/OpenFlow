@@ -2,6 +2,21 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.23.0] - 2026-11-19
+
+### Added
+- **System Gemini Nano Support via Android AICore (`core/speech/GeminiNanoTextProcessor`, `core/speech/SmartPipeline`, `settings/ModelSettings`):**
+  - Integrated `com.google.mlkit:genai-prompt:1.0.0-beta5` supporting both **Gemini Nano Full** (`ModelPreference.FULL`) and **Gemini Nano Fast** (`ModelPreference.FAST`) across `Stable` and `Preview` release tracks.
+  - Added live AICore availability probing (`Available`, `Downloadable`, `Downloading`, `Unavailable`), on-demand download triggering (`client.download()`) with progress telemetry and cancellation, token-limit/capability inspection, and a foreground **Quick Test** benchmark action.
+  - Added compact `LlmPromptTier.GEMINI_NANO` prompt generation reusing OpenFlow's deterministic fast-path bypass, spoken normalization, sentence sieve, chunking, and output sanitizer, plus optional **Auto-Fallback** (`geminiNanoAutoFallback`) to `Gemma 4 E2B` / `Punct` / `FormattingEngine` if AICore declines background overlay requests (`BACKGROUND_USE_BLOCKED`).
+- **Collapsible Gemini Nano Controls in Settings (`ui/settings/SpeechRecognitionSettingsSection`, `ui/onboarding/OnboardingScreen`):**
+  - Added a collapsible **Gemini Nano (System AICore)** section under the Local Offline Model settings with backend switching (`Gemini Nano` vs `Gemma 4 E2B`), separate **Full** and **Fast** variant status/download cards, fallback toggle, diagnostics banner, and Quick Test button, plus an optional `0 MB` Gemini Nano chip in onboarding.
+
+### Removed & Changed
+- **Gemma 4 E2B-Only Local LiteRT-LM Catalog (`settings/ModelSettings`, `settings/ModelDownloadManager`):**
+  - Removed `Granite 4.1 3B`, `Granite 4.2 3B`, `Qwen3 4B`, and `Qwen3 4B Instruct 2507`, leaving **`Gemma 4 E2B` (`2.41 GB`)** as the sole downloadable local LiteRT-LM LLM alongside system **Gemini Nano** and Cloud API backends.
+  - Added all 4 removed model IDs to `DesertAntModelStorage.REMOVED_LEGACY_MODEL_IDS` so legacy weights and `litert_llm_cache` compiler artifacts are automatically reclaimed on upgrade while preserving `Gemma 4 E2B`.
+
 ## [2.21.0] - 2026-11-15
 
 ### Added

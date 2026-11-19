@@ -33,8 +33,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 62
-        versionName = "2.22.1"
+        versionCode = 63
+        versionName = "2.23.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -180,11 +180,14 @@ dependencies {
     // ONNX Runtime Android with NNAPI / QNN NPU & XNNPACK Execution Providers for Punctuation & Casing Restoration
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
-    // Google AI Edge LiteRT-LM 0.19.0 & NPU Compiler/Dispatch Runtimes (LFM3 1.7B kv_cache_c GPU/CPU, Gemma 4 E2B & Qwen on NPU/GPU/CPU)
+    // Google AI Edge LiteRT-LM 0.19.0 & NPU Compiler/Dispatch Runtimes (Gemma 4 E2B on NPU/GPU/CPU)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.19.0")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-qualcomm:2.3.2")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.2")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.2")
+
+    // Google ML Kit GenAI Prompt API for system on-device Gemini Nano (Full & Fast via Android AICore)
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
