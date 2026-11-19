@@ -67,15 +67,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+/* GEMINI_NANO_DISABLED
 import com.voicebubble.openflow.core.speech.GeminiNanoAvailability
 import com.voicebubble.openflow.core.speech.GeminiNanoManager
+*/
 import com.voicebubble.openflow.core.speech.SmartPipeline
 import com.voicebubble.openflow.settings.DesertAntModel
 import com.voicebubble.openflow.settings.DesertAntModelStorage
 import com.voicebubble.openflow.settings.DownloadSessionState
 import com.voicebubble.openflow.settings.LlmModelChoice
 import com.voicebubble.openflow.settings.LlmProviderMode
+/* GEMINI_NANO_DISABLED
 import com.voicebubble.openflow.settings.LocalLlmBackend
+*/
 import com.voicebubble.openflow.settings.ModelDownloadManager
 import com.voicebubble.openflow.settings.ModelQueueStatus
 import com.voicebubble.openflow.settings.ModelSettings
@@ -104,12 +108,14 @@ fun OnboardingScreen(
     var punctSelected by remember { mutableStateOf(initialSettings.punctEnabled) }
     var gemmaSelected by remember { mutableStateOf(initialSettings.gemmaEnabled) }
     var llmProvider by remember { mutableStateOf(initialSettings.llmProvider) }
+    /* GEMINI_NANO_DISABLED
     var localLlmBackend by remember { mutableStateOf(initialSettings.localLlmBackend) }
     val nanoCatalog by GeminiNanoManager.catalogState.collectAsState()
 
     LaunchedEffect(Unit) {
         GeminiNanoManager.refreshStatusesAsync(force = false)
     }
+    */
 
     var step by remember {
         mutableStateOf(
@@ -127,8 +133,10 @@ fun OnboardingScreen(
         remoteEarEnabled = earSelected && remoteEarSelected,
         punctEnabled = punctSelected,
         gemmaEnabled = gemmaSelected,
-        llmProvider = llmProvider,
-        localLlmBackend = localLlmBackend
+        llmProvider = llmProvider
+        /* GEMINI_NANO_DISABLED
+        , localLlmBackend = localLlmBackend
+        */
     )
 
     val modelsToDownload = configuredSettings.plannedLocalModels()
@@ -345,22 +353,27 @@ fun OnboardingScreen(
 
                         HorizontalDivider()
 
-                        // AI Post-Processing (Gemma 4 E2B, System Gemini Nano, or OpenAI-Compatible API)
+                        // AI Post-Processing (Gemma 4 E2B or OpenAI-Compatible API)
                         val onboardingLlm = configuredSettings.selectedLlmModel
+                        /* GEMINI_NANO_DISABLED
                         val nanoStatus = nanoCatalog.statusOf(configuredSettings.geminiNanoVariant)
                         val nanoAnyReadyOrDownloadable = nanoCatalog.anyAvailable || nanoCatalog.anyDownloadable
+                        */
                         OnboardingModelRow(
                             title = when {
                                 gemmaSelected && llmProvider == LlmProviderMode.OPENAI_API ->
                                     "AI Post-Processing (OpenAI-Compatible API · 0 MB)"
+                                /* GEMINI_NANO_DISABLED
                                 gemmaSelected && localLlmBackend == LocalLlmBackend.GEMINI_NANO ->
                                     "Gemini Nano — System AI Post-Processing (0 MB)"
+                                */
                                 else ->
                                     "${onboardingLlm.title} — AI Post-Processing (${onboardingLlm.desertAntModel.sizeMb} MB, Optional)"
                             },
                             subtitle = when {
                                 gemmaSelected && llmProvider == LlmProviderMode.OPENAI_API ->
                                     "Cleans dictation using your own cloud or LAN OpenAI-compatible API endpoint."
+                                /* GEMINI_NANO_DISABLED
                                 gemmaSelected && localLlmBackend == LocalLlmBackend.GEMINI_NANO ->
                                     when (nanoStatus.availability) {
                                         GeminiNanoAvailability.AVAILABLE ->
@@ -370,8 +383,9 @@ fun OnboardingScreen(
                                         else ->
                                             "Uses Android system AICore when available (configure Full / Fast in Settings)."
                                     }
+                                */
                                 else ->
-                                    "${onboardingLlm.description} (or switch to system Gemini Nano in Settings)"
+                                    onboardingLlm.description
                             },
                             checked = gemmaSelected,
                             enabled = true,
@@ -379,6 +393,15 @@ fun OnboardingScreen(
                             onCheckedChange = { gemmaSelected = it }
                         )
                         if (gemmaSelected) {
+                            OnboardingModeChipRow(
+                                localLabel = "${onboardingLlm.title} (${onboardingLlm.desertAntModel.sizeMb} MB)",
+                                remoteLabel = "OpenAI API (0 MB)",
+                                isRemote = llmProvider == LlmProviderMode.OPENAI_API,
+                                onSelectRemote = { useRemote ->
+                                    llmProvider = if (useRemote) LlmProviderMode.OPENAI_API else LlmProviderMode.LOCAL
+                                }
+                            )
+                            /* GEMINI_NANO_DISABLED
                             FlowRow(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -410,6 +433,7 @@ fun OnboardingScreen(
                                     label = { Text("OpenAI API (0 MB)", maxLines = 1, softWrap = false) }
                                 )
                             }
+                            */
                         }
                     }
                 }

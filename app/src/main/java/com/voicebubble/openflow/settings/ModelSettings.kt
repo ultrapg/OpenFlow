@@ -102,13 +102,16 @@ enum class DesertAntModel(
  * instruction-following behavior, and reasoning architecture.
  */
 enum class LlmPromptTier {
+    /* GEMINI_NANO_DISABLED
     /** Compact, high-signal non-chatty prompt tuned for Android AICore system Gemini Nano (Full & Fast). */
     GEMINI_NANO,
+    */
 
     /** Full Wispr Flow multi-clause, nuance-preserving prompt + multilingual examples for flagship Gemma 4 E2B. */
     FLAGSHIP_GEMMA_4
 }
 
+/* GEMINI_NANO_DISABLED
 /**
  * Execution backend used when [LlmProviderMode.LOCAL] is selected for AI Post-Processing:
  * - [LITERT_LM]: OpenFlow-managed downloadable LiteRT-LM model (`Gemma 4 E2B`, 2.41 GB).
@@ -158,10 +161,11 @@ enum class GeminiNanoVariant(
         }
     }
 }
+*/
 
 /**
  * Selectable downloadable on-device LiteRT-LM models for AI post-processing & dictation cleanup.
- * Only [GEMMA_4_E2B] is shipped as a downloadable local LiteRT-LM model alongside Android system Gemini Nano.
+ * Only [GEMMA_4_E2B] is shipped as a downloadable local LiteRT-LM model.
  */
 enum class LlmModelChoice(
     val id: String,
@@ -307,6 +311,7 @@ enum class GemmaPromptPreset(
      * Returns the task instruction specifically optimized for [tier].
      */
     fun promptForTier(tier: LlmPromptTier): String = when (tier) {
+        /* GEMINI_NANO_DISABLED
         LlmPromptTier.GEMINI_NANO -> when (this) {
             CLEAN_AND_POLISH -> """Clean raw spoken dictation into natural, ready-to-send written text in the speaker's exact voice and language:
 - Backtracks: When the speaker changes course ('wait', 'no wait', 'actually', 'sorry', 'I mean', 'scratch that', 'make that', 'nein warte', 'ich meine'), delete the retracted words and cue, keeping only the final intended words. Keep contrasts ('not X, but Y').
@@ -319,6 +324,7 @@ enum class GemmaPromptPreset(
             STRUCTURED_NOTES -> "Turn spoken dictation into clean notes in the speaker's language: put each distinct point on its own '- ' bullet line (or '1. ' line when sequential) beneath any spoken heading ending with ':', resolve self-corrections, strip fillers, and format numbers, dates, times, units, and emails cleanly."
             CUSTOM -> defaultSystemPrompt
         }
+        */
 
         LlmPromptTier.FLAGSHIP_GEMMA_4 -> when (this) {
             CLEAN_AND_POLISH -> """Edit raw spoken dictation into clean, natural, ready-to-send text in the speaker's exact voice, tone, and language:
@@ -373,11 +379,15 @@ enum class GemmaPromptPreset(
      */
     fun promptForProvider(
         provider: LlmProviderMode,
-        llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
-        localLlmBackend: LocalLlmBackend = LocalLlmBackend.LITERT_LM
+        llmChoice: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B
+        /* GEMINI_NANO_DISABLED
+        , localLlmBackend: LocalLlmBackend = LocalLlmBackend.LITERT_LM
+        */
     ): String = when {
         provider == LlmProviderMode.OPENAI_API -> cloudSystemPrompt
+        /* GEMINI_NANO_DISABLED
         localLlmBackend == LocalLlmBackend.GEMINI_NANO -> promptForTier(LlmPromptTier.GEMINI_NANO)
+        */
         else -> promptForModel(llmChoice)
     }
 
@@ -566,9 +576,11 @@ data class ModelSettings(
     val gemmaEnabled: Boolean = false,
     /** Deterministic non-AI formatting engine (numbers, lists, fillers, corrections). Works with or without an LLM. */
     val formattingEngineEnabled: Boolean = false,
+    /* GEMINI_NANO_DISABLED
     val localLlmBackend: LocalLlmBackend = LocalLlmBackend.LITERT_LM,
     val geminiNanoVariant: GeminiNanoVariant = GeminiNanoVariant.FULL,
     val geminiNanoAutoFallback: Boolean = true,
+    */
     val selectedLlmModel: LlmModelChoice = LlmModelChoice.GEMMA_4_E2B,
     val gemmaDisableThinking: Boolean = selectedLlmModel.defaultDisableThinking,
     val gemmaAdaptiveThinking: Boolean = true,
@@ -646,21 +658,21 @@ data class ModelSettings(
             else -> "Local"
         }
 
-    /** `true` when AI post-processing is enabled and using an on-device LiteRT-LM model (`Gemma 4 E2B`). */
+    /** `true` when AI post-processing is enabled in local LiteRT-LM mode (`Gemma 4 E2B`). */
+    val isLocalLlmEnabled: Boolean
+        get() = gemmaEnabled && llmProvider == LlmProviderMode.LOCAL
+
+    /* GEMINI_NANO_DISABLED
     val isLocalLiteRtLlmEnabled: Boolean
         get() = gemmaEnabled &&
             llmProvider == LlmProviderMode.LOCAL &&
             localLlmBackend == LocalLlmBackend.LITERT_LM
 
-    /** `true` when AI post-processing is enabled and using Android AICore system Gemini Nano. */
     val isGeminiNanoEnabled: Boolean
         get() = gemmaEnabled &&
             llmProvider == LlmProviderMode.LOCAL &&
             localLlmBackend == LocalLlmBackend.GEMINI_NANO
-
-    /** `true` when AI post-processing is enabled in local mode (`Gemma 4 E2B` or `Gemini Nano`). */
-    val isLocalLlmEnabled: Boolean
-        get() = isLocalLiteRtLlmEnabled || isGeminiNanoEnabled
+    */
 
     /** `true` when AI post-processing is enabled and configured to call a remote/LAN OpenAI-compatible API. */
     val isOpenAiApiEnabled: Boolean
@@ -669,7 +681,7 @@ data class ModelSettings(
             openAiBaseUrl.isNotBlank() &&
             openAiModel.isNotBlank()
 
-    /** `true` when either a local AI model (`Gemma 4 E2B` / `Gemini Nano`) or an OpenAI-compatible API handles post-processing. */
+    /** `true` when either a local AI model (`Gemma 4 E2B`) or an OpenAI-compatible API handles post-processing. */
     val isAiPostProcessingActive: Boolean
         get() = isLocalLlmEnabled || isOpenAiApiEnabled
 
@@ -692,36 +704,38 @@ data class ModelSettings(
     val aiSectionSummaryLabel: String
         get() = when {
             isOpenAiApiEnabled -> "API · ${openAiModel.trim()}"
+            /* GEMINI_NANO_DISABLED
             isGeminiNanoEnabled -> "Local · ${geminiNanoVariant.shortLabel}"
-            isLocalLiteRtLlmEnabled -> "Local · ${selectedLlmModel.title}"
+            */
+            isLocalLlmEnabled -> "Local · ${selectedLlmModel.title}"
             gemmaEnabled && llmProvider == LlmProviderMode.OPENAI_API -> "API · Setup needed"
             formattingEngineEnabled -> "Instant Engine"
             else -> "Off"
         }
 
     /**
-     * Resolves the active provider/model task instruction based on [llmProvider], [localLlmBackend],
+     * Resolves the active provider/model task instruction based on [llmProvider],
      * [selectedLlmModel], [gemmaPromptPreset], and [gemmaCustomPrompt].
      */
     fun resolvedGemmaTaskInstruction(): String {
         return if (gemmaPromptPreset == GemmaPromptPreset.CUSTOM) {
             gemmaCustomPrompt.trim().ifEmpty {
-                GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, selectedLlmModel, localLlmBackend)
+                GemmaPromptPreset.CUSTOM.promptForProvider(llmProvider, selectedLlmModel)
             }
         } else {
-            gemmaPromptPreset.promptForProvider(llmProvider, selectedLlmModel, localLlmBackend)
+            gemmaPromptPreset.promptForProvider(llmProvider, selectedLlmModel)
         }
     }
 
     /**
      * Active disk footprint in MB based on currently enabled OpenFlow-downloaded models
-     * (`0 MB` extra for cloud APIs and system AICore Gemini Nano).
+     * (`0 MB` extra for cloud APIs).
      */
     val activeDiskFootprintMb: Int
         get() = (if (isRemoteVozActive) 0 else DesertAntModel.VOZ.sizeMb) +
             (if (earEnabled && !isRemoteEarActive) DesertAntModel.EAR.sizeMb else 0) +
             (if (punctEnabled) DesertAntModel.PUNCT.sizeMb else 0) +
-            (if (isLocalLiteRtLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
+            (if (isLocalLlmEnabled) selectedLlmModel.desertAntModel.sizeMb else 0)
 
     /**
      * Estimated peak app RAM in MB based on models that can ever co-reside in RAM:
@@ -729,15 +743,15 @@ data class ModelSettings(
      * - Local `Ear` (10 MB weights + runtime buffers): +50 MB (0 MB when [isRemoteEarActive])
      * - Text cleanup stage (strictly mutually exclusive in RAM — `Punct` is never loaded alongside an active LLM):
      *   - Active Local `Gemma 4 E2B` (+850 MB), OR
-     *   - `Gemini Nano` / OpenAI API (+0 MB app RAM — AICore runs in system service), OR
+     *   - OpenAI API (+0 MB app RAM), OR
      *   - `Punct` (+120 MB) when AI post-processing is disabled.
      */
     val estimatedPeakRamMb: Int
         get() = (if (isRemoteVozActive) 0 else 1400) +
             (if (earEnabled && !isRemoteEarActive) 50 else 0) +
             when {
-                isLocalLiteRtLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
-                isGeminiNanoEnabled || isOpenAiApiEnabled -> 0
+                isLocalLlmEnabled -> selectedLlmModel.estimatedIncrementalRamMb
+                isOpenAiApiEnabled -> 0
                 punctEnabled -> 120
                 else -> 0
             }
@@ -746,7 +760,7 @@ data class ModelSettings(
         DesertAntModel.VOZ -> !isRemoteVozActive
         DesertAntModel.EAR -> earEnabled && !isRemoteEarActive
         DesertAntModel.PUNCT -> punctEnabled
-        DesertAntModel.GEMMA_4_E2B -> isLocalLiteRtLlmEnabled && model == selectedLlmModel.desertAntModel
+        DesertAntModel.GEMMA_4_E2B -> isLocalLlmEnabled && model == selectedLlmModel.desertAntModel
     }
 
     /**
@@ -775,19 +789,19 @@ data class ModelSettings(
         if (!isRemoteVozActive) add(DesertAntModel.VOZ)
         if (earEnabled && !isRemoteEarActive) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (isLocalLiteRtLlmEnabled) add(selectedLlmModel.desertAntModel)
+        if (isLocalLlmEnabled) add(selectedLlmModel.desertAntModel)
     }
 
     /**
      * Local models required by the user's selected mode flags during startup/onboarding, even
-     * before remote API URLs and keys are filled in, so API-mode and system Gemini Nano selections
-     * require zero downloadable local LLM weights.
+     * before remote API URLs and keys are filled in, so API-mode selections require zero
+     * downloadable local LLM weights.
      */
     fun plannedLocalModels(): List<DesertAntModel> = buildList {
         if (!remoteVozEnabled) add(DesertAntModel.VOZ)
         if (earEnabled && !remoteEarEnabled) add(DesertAntModel.EAR)
         if (punctEnabled) add(DesertAntModel.PUNCT)
-        if (gemmaEnabled && llmProvider == LlmProviderMode.LOCAL && localLlmBackend == LocalLlmBackend.LITERT_LM) {
+        if (gemmaEnabled && llmProvider == LlmProviderMode.LOCAL) {
             add(selectedLlmModel.desertAntModel)
         }
     }
@@ -799,7 +813,7 @@ data class ModelSettings(
         (if (!remoteVozEnabled) 1400 else 0) +
             (if (earEnabled && !remoteEarEnabled) 50 else 0) +
             when {
-                gemmaEnabled && llmProvider == LlmProviderMode.LOCAL && localLlmBackend == LocalLlmBackend.LITERT_LM ->
+                gemmaEnabled && llmProvider == LlmProviderMode.LOCAL ->
                     selectedLlmModel.estimatedIncrementalRamMb
                 punctEnabled && !gemmaEnabled -> 120
                 else -> 0
@@ -811,9 +825,11 @@ data class ModelSettings(
         const val KEY_PUNCT_ENABLED = "punct_enabled"
         const val KEY_GEMMA_ENABLED = "gemma_enabled"
         const val KEY_FORMATTING_ENGINE_ENABLED = "formatting_engine_enabled_v2"
+        /* GEMINI_NANO_DISABLED
         const val KEY_LOCAL_LLM_BACKEND = "local_llm_backend"
         const val KEY_GEMINI_NANO_VARIANT = "gemini_nano_variant"
         const val KEY_GEMINI_NANO_AUTO_FALLBACK = "gemini_nano_auto_fallback"
+        */
         const val KEY_SELECTED_LLM_MODEL = "selected_llm_model"
         const val KEY_GEMMA_DISABLE_THINKING = "gemma_disable_thinking"
         const val KEY_GEMMA_ADAPTIVE_THINKING = "gemma_adaptive_thinking"
@@ -954,6 +970,7 @@ data class ModelSettings(
                 com.voicebubble.openflow.core.speech.OpenAiCompatibleClient.DEFAULT_AUDIO_TIMEOUT_SECONDS
             ).coerceIn(5, 120)
             val rawGemmaEnabled = prefs.getBoolean(KEY_GEMMA_ENABLED, false)
+            /* GEMINI_NANO_DISABLED
             val localLlmBackend = LocalLlmBackend.fromId(
                 prefs.getString(KEY_LOCAL_LLM_BACKEND, LocalLlmBackend.LITERT_LM.id)
             )
@@ -961,6 +978,7 @@ data class ModelSettings(
                 prefs.getString(KEY_GEMINI_NANO_VARIANT, GeminiNanoVariant.FULL.id)
             )
             val geminiNanoAutoFallback = prefs.getBoolean(KEY_GEMINI_NANO_AUTO_FALLBACK, true)
+            */
             val rawSelectedId = prefs.getString(KEY_SELECTED_LLM_MODEL, null)
             val hasValidExplicitModel = LlmModelChoice.isSupportedId(rawSelectedId)
             val migratedFromRemovedModel = !rawSelectedId.isNullOrBlank() && !hasValidExplicitModel
@@ -976,8 +994,7 @@ data class ModelSettings(
             }
             val gemmaEnabled = if (migratedFromRemovedModel &&
                 rawGemmaEnabled &&
-                llmProvider == LlmProviderMode.LOCAL &&
-                localLlmBackend == LocalLlmBackend.LITERT_LM
+                llmProvider == LlmProviderMode.LOCAL
             ) {
                 DesertAntModelStorage.isModelDownloaded(context, selectedLlm.desertAntModel)
             } else {
@@ -1000,9 +1017,11 @@ data class ModelSettings(
                 punctEnabled = prefs.getBoolean(KEY_PUNCT_ENABLED, false),
                 gemmaEnabled = gemmaEnabled,
                 formattingEngineEnabled = prefs.getBoolean(KEY_FORMATTING_ENGINE_ENABLED, false),
+                /* GEMINI_NANO_DISABLED
                 localLlmBackend = localLlmBackend,
                 geminiNanoVariant = geminiNanoVariant,
                 geminiNanoAutoFallback = geminiNanoAutoFallback,
+                */
                 selectedLlmModel = selectedLlm,
                 gemmaDisableThinking = resolvedDisableThinking,
                 gemmaAdaptiveThinking = prefs.getBoolean(KEY_GEMMA_ADAPTIVE_THINKING, true),
@@ -1057,9 +1076,11 @@ data class ModelSettings(
                 .putBoolean(KEY_PUNCT_ENABLED, settings.punctEnabled)
                 .putBoolean(KEY_GEMMA_ENABLED, settings.gemmaEnabled)
                 .putBoolean(KEY_FORMATTING_ENGINE_ENABLED, settings.formattingEngineEnabled)
+                /* GEMINI_NANO_DISABLED
                 .putString(KEY_LOCAL_LLM_BACKEND, settings.localLlmBackend.id)
                 .putString(KEY_GEMINI_NANO_VARIANT, settings.geminiNanoVariant.id)
                 .putBoolean(KEY_GEMINI_NANO_AUTO_FALLBACK, settings.geminiNanoAutoFallback)
+                */
                 .putString(KEY_SELECTED_LLM_MODEL, settings.selectedLlmModel.id)
                 .putBoolean(KEY_GEMMA_DISABLE_THINKING, settings.gemmaDisableThinking)
                 .putBoolean(KEY_GEMMA_ADAPTIVE_THINKING, settings.gemmaAdaptiveThinking)

@@ -21,6 +21,9 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// Disabled for now (needs more work later): keeps Gemini Nano sources in the repository without compiling them into the app.
+val enableGeminiNano = false
+
 android {
     namespace = "com.voicebubble.openflow"
     compileSdk = 35
@@ -33,8 +36,8 @@ android {
         applicationId = "com.voicebubble.openflow"
         minSdk = 26
         targetSdk = 35
-        versionCode = 63
-        versionName = "2.23.0"
+        versionCode = 64
+        versionName = "2.23.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -57,6 +60,14 @@ android {
             val bundleOffline = project.findProperty("bundleOfflineModels")?.toString()?.toBoolean() == true
             if (bundleOffline && bundledCacheDir.exists()) {
                 assets.srcDirs("src/main/assets", bundledCacheDir.absolutePath)
+            }
+            if (enableGeminiNano) {
+                java.srcDir("src/geminiNano/java")
+            }
+        }
+        getByName("test") {
+            if (enableGeminiNano) {
+                java.srcDir("src/geminiNanoTest/java")
             }
         }
     }
@@ -186,8 +197,10 @@ dependencies {
     implementation("com.google.ai.edge.litert:litert-npu-runtime-mediatek:2.3.2")
     implementation("com.google.ai.edge.litert:litert-npu-runtime-google-tensor:2.3.2")
 
-    // Google ML Kit GenAI Prompt API for system on-device Gemini Nano (Full & Fast via Android AICore)
-    implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
+    // Google ML Kit GenAI Prompt API for system on-device Gemini Nano (disabled until re-enabled via enableGeminiNano)
+    if (enableGeminiNano) {
+        implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
+    }
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")

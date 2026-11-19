@@ -1461,9 +1461,11 @@ class FloatingBubbleService : LifecycleService(), ViewModelStoreOwner, SavedStat
                         if (activeModelSettings.punctEnabled && !activeModelSettings.gemmaEnabled) append("+punct")
                         if (activeModelSettings.isOpenAiApiEnabled) {
                             append("+api:${activeModelSettings.openAiModel.trim()}")
+                        /* GEMINI_NANO_DISABLED
                         } else if (activeModelSettings.isGeminiNanoEnabled) {
                             append("+gemini-nano:${activeModelSettings.geminiNanoVariant.id}")
-                        } else if (activeModelSettings.isLocalLiteRtLlmEnabled) {
+                        */
+                        } else if (activeModelSettings.isLocalLlmEnabled) {
                             append("+${activeModelSettings.selectedLlmModel.id}")
                         }
                     }

@@ -116,17 +116,6 @@ class SmartPipelineTest {
             com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
             defaultSettings.selectedLlmModel
         )
-        assertEquals(
-            "Default local LLM backend must be LiteRT-LM",
-            com.voicebubble.openflow.settings.LocalLlmBackend.LITERT_LM,
-            defaultSettings.localLlmBackend
-        )
-        assertEquals(
-            "Default Gemini Nano variant must be FULL",
-            com.voicebubble.openflow.settings.GeminiNanoVariant.FULL,
-            defaultSettings.geminiNanoVariant
-        )
-        assertTrue("Gemini Nano auto-fallback must be enabled by default", defaultSettings.geminiNanoAutoFallback)
         assertTrue("Gemma 4 E2B must be marked experimental", com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B.isExperimental)
         assertEquals(
             com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
@@ -142,20 +131,6 @@ class SmartPipelineTest {
         // Punct is never loaded into RAM alongside an active LLM (zero double-loading)
         assertEquals(2300, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).estimatedPeakRamMb)
         assertEquals(3947, ModelSettings(earEnabled = true, punctEnabled = true, gemmaEnabled = true).activeDiskFootprintMb)
-
-        // Gemini Nano backend bypasses LiteRT-LM Gemma 4 E2B download requirement & disk/RAM footprint
-        val geminiNanoSettings = ModelSettings(
-            earEnabled = true,
-            punctEnabled = false,
-            gemmaEnabled = true,
-            localLlmBackend = com.voicebubble.openflow.settings.LocalLlmBackend.GEMINI_NANO,
-            geminiNanoVariant = com.voicebubble.openflow.settings.GeminiNanoVariant.FAST
-        )
-        assertTrue(geminiNanoSettings.isGeminiNanoEnabled)
-        assertFalse(geminiNanoSettings.isLocalLiteRtLlmEnabled)
-        assertFalse(geminiNanoSettings.isModelLocallyRequired(com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B))
-        assertEquals(defaultSettings.estimatedPeakRamMb, geminiNanoSettings.estimatedPeakRamMb)
-        assertEquals(defaultSettings.activeDiskFootprintMb, geminiNanoSettings.activeDiskFootprintMb)
 
         // Strict single-LLM exclusivity in enabledModels() and isModelEnabled()
         for (choice in com.voicebubble.openflow.settings.LlmModelChoice.entries) {
@@ -1576,16 +1551,7 @@ class SmartPipelineTest {
             assertEquals(64, artifacts.single().sha256.length)
         }
 
-        // Per-tier default CLEAN_AND_POLISH optimization checks (Gemini Nano vs Flagship Gemma 4 E2B)
-        val nanoPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = true,
-            llmChoice = com.voicebubble.openflow.settings.LlmModelChoice.GEMMA_4_E2B,
-            promptTierOverride = com.voicebubble.openflow.settings.LlmPromptTier.GEMINI_NANO
-        )
-        assertTrue(nanoPrompt.contains("<transcript>"))
-        assertFalse("Gemini Nano prompt must never receive internal reasoning hints", nanoPrompt.contains("internal reasoning"))
-
+        // Per-tier default CLEAN_AND_POLISH optimization checks for Flagship Gemma 4 E2B
         val thinkingPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
             preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
             disableThinking = false,
@@ -2870,33 +2836,20 @@ class SmartPipelineTest {
         assertTrue(noPrewarmReport.canPrewarmLlmPromptCache(gemma2b))
         assertFalse(gemma2b.needsSamplingWhileThinking)
 
-        // Prompts across both FLAGSHIP_GEMMA_4 and GEMINI_NANO tiers omit legacy Metadata headers
+        // Prompts across active LlmPromptTier entries omit legacy Metadata headers
         for (tier in com.voicebubble.openflow.settings.LlmPromptTier.entries) {
             for (category in com.voicebubble.openflow.core.speech.AppContextCategory.entries) {
-                val disableThink = tier == com.voicebubble.openflow.settings.LlmPromptTier.GEMINI_NANO
                 val prompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
                     preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-                    disableThinking = disableThink,
+                    disableThinking = gemma2b.defaultDisableThinking,
                     fieldContext = com.voicebubble.openflow.core.speech.FlowFieldContext(appCategory = category),
                     llmChoice = gemma2b,
                     promptTierOverride = tier
                 )
                 assertFalse("${tier.name} must not receive a Metadata header", prompt.startsWith("## Metadata"))
                 assertTrue(prompt.contains("<transcript>"))
-                if (disableThink) {
-                    assertFalse("${tier.name} with thinking disabled must not append reasoning hints", prompt.contains("internal reasoning"))
-                }
             }
         }
-
-        // Compact Gemini Nano system prompt fits easily inside on-device AICore token budgets
-        val nanoPrompt = com.voicebubble.openflow.core.speech.GemmaTextProcessor.buildSystemInstruction(
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            disableThinking = true,
-            llmChoice = gemma2b,
-            promptTierOverride = com.voicebubble.openflow.settings.LlmPromptTier.GEMINI_NANO
-        )
-        assertTrue("Gemini Nano prompt must stay compact, got ${nanoPrompt.length} chars", nanoPrompt.length < 4_600)
 
         // Automatic cleanup of all 16 removed legacy model directories (including Granite 4.1/4.2 & Qwen3 4B) preserves Gemma 4 E2B & Voz
         val modelsRoot = kotlin.io.path.createTempDirectory("legacy_cleanup_test").toFile()
@@ -3802,139 +3755,5 @@ class SmartPipelineTest {
         } finally {
             tempRoot.deleteRecursively()
         }
-    }
-
-    @Test
-    fun `Gemini Nano backend exposes FULL and FAST variants, AICore status selection, token budgeting, and model delete freedom`() {
-        // 1. Backend & variant serialization roundtrips + safe fallbacks
-        assertEquals(
-            com.voicebubble.openflow.settings.LocalLlmBackend.GEMINI_NANO,
-            com.voicebubble.openflow.settings.LocalLlmBackend.fromId("gemini_nano")
-        )
-        assertEquals(
-            com.voicebubble.openflow.settings.LocalLlmBackend.LITERT_LM,
-            com.voicebubble.openflow.settings.LocalLlmBackend.fromId("unknown_backend")
-        )
-        assertEquals(
-            com.voicebubble.openflow.settings.GeminiNanoVariant.FULL,
-            com.voicebubble.openflow.settings.GeminiNanoVariant.fromId("full")
-        )
-        assertEquals(
-            com.voicebubble.openflow.settings.GeminiNanoVariant.FAST,
-            com.voicebubble.openflow.settings.GeminiNanoVariant.fromId("fast")
-        )
-        assertEquals(
-            com.voicebubble.openflow.settings.GeminiNanoVariant.FULL,
-            com.voicebubble.openflow.settings.GeminiNanoVariant.fromId(null)
-        )
-
-        // 2. ML Kit ModelPreference mapping
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelPreference.FULL,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.toModelPreference(
-                com.voicebubble.openflow.settings.GeminiNanoVariant.FULL
-            )
-        )
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelPreference.FAST,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.toModelPreference(
-                com.voicebubble.openflow.settings.GeminiNanoVariant.FAST
-            )
-        )
-
-        // 3. Stage resolution prefers STABLE AVAILABLE -> PREVIEW AVAILABLE -> DOWNLOADING/DOWNLOADABLE
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelReleaseStage.STABLE to com.google.mlkit.genai.common.FeatureStatus.AVAILABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.chooseBestStageStatus(
-                stableStatus = com.google.mlkit.genai.common.FeatureStatus.AVAILABLE,
-                previewStatus = com.google.mlkit.genai.common.FeatureStatus.AVAILABLE
-            )
-        )
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelReleaseStage.PREVIEW to com.google.mlkit.genai.common.FeatureStatus.AVAILABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.chooseBestStageStatus(
-                stableStatus = com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE,
-                previewStatus = com.google.mlkit.genai.common.FeatureStatus.AVAILABLE
-            )
-        )
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelReleaseStage.STABLE to com.google.mlkit.genai.common.FeatureStatus.DOWNLOADABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.chooseBestStageStatus(
-                stableStatus = com.google.mlkit.genai.common.FeatureStatus.DOWNLOADABLE,
-                previewStatus = com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE
-            )
-        )
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelReleaseStage.PREVIEW to com.google.mlkit.genai.common.FeatureStatus.DOWNLOADING,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.chooseBestStageStatus(
-                stableStatus = com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE,
-                previewStatus = com.google.mlkit.genai.common.FeatureStatus.DOWNLOADING
-            )
-        )
-        assertEquals(
-            com.google.mlkit.genai.prompt.ModelReleaseStage.STABLE to com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.chooseBestStageStatus(
-                stableStatus = com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE,
-                previewStatus = com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE
-            )
-        )
-
-        // 4. FeatureStatus enum mapping
-        assertEquals(
-            com.voicebubble.openflow.core.speech.GeminiNanoAvailability.AVAILABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.mapFeatureStatus(com.google.mlkit.genai.common.FeatureStatus.AVAILABLE)
-        )
-        assertEquals(
-            com.voicebubble.openflow.core.speech.GeminiNanoAvailability.DOWNLOADABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.mapFeatureStatus(com.google.mlkit.genai.common.FeatureStatus.DOWNLOADABLE)
-        )
-        assertEquals(
-            com.voicebubble.openflow.core.speech.GeminiNanoAvailability.DOWNLOADING,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.mapFeatureStatus(com.google.mlkit.genai.common.FeatureStatus.DOWNLOADING)
-        )
-        assertEquals(
-            com.voicebubble.openflow.core.speech.GeminiNanoAvailability.UNAVAILABLE,
-            com.voicebubble.openflow.core.speech.GeminiNanoManager.mapFeatureStatus(com.google.mlkit.genai.common.FeatureStatus.UNAVAILABLE)
-        )
-
-        // 5. Token budgeting adapts to device tokenLimit and stays clamped safely
-        val defaultInputChars = com.voicebubble.openflow.core.speech.GeminiNanoTextProcessor.computeMaxInputCharsPerPass(
-            tokenLimit = null,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
-        )
-        val largeInputChars = com.voicebubble.openflow.core.speech.GeminiNanoTextProcessor.computeMaxInputCharsPerPass(
-            tokenLimit = 4_096,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH
-        )
-        assertTrue(defaultInputChars >= 380)
-        assertTrue(largeInputChars > defaultInputChars)
-
-        val noThinkOut = com.voicebubble.openflow.core.speech.GeminiNanoTextProcessor.computeMaxOutputTokensForPass(
-            inputText = "um hey can we move the design review meeting to tomorrow morning",
-            tokenLimit = 2_048,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            thinkingEnabled = false
-        )
-        val thinkOut = com.voicebubble.openflow.core.speech.GeminiNanoTextProcessor.computeMaxOutputTokensForPass(
-            inputText = "um hey can we move the design review meeting to tomorrow morning",
-            tokenLimit = 2_048,
-            preset = com.voicebubble.openflow.settings.GemmaPromptPreset.CLEAN_AND_POLISH,
-            thinkingEnabled = true
-        )
-        assertTrue(thinkOut > noThinkOut)
-        assertTrue(thinkOut <= 1_536)
-
-        // 6. Selecting Gemini Nano allows deleting Gemma 4 E2B weights cleanly
-        val nanoActive = ModelSettings(
-            earEnabled = true,
-            punctEnabled = false,
-            gemmaEnabled = true,
-            localLlmBackend = com.voicebubble.openflow.settings.LocalLlmBackend.GEMINI_NANO,
-            geminiNanoVariant = com.voicebubble.openflow.settings.GeminiNanoVariant.FAST
-        )
-        assertTrue(nanoActive.isGeminiNanoEnabled)
-        assertFalse(nanoActive.isLocalLiteRtLlmEnabled)
-        assertFalse(nanoActive.isModelLocallyRequired(com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B))
-        assertTrue(nanoActive.canDeleteModel(com.voicebubble.openflow.settings.DesertAntModel.GEMMA_4_E2B))
     }
 }

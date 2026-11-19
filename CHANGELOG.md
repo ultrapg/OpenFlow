@@ -2,6 +2,13 @@
 
 All notable changes to the **OpenFlow** project are documented in this file.
 
+## [2.23.1] - 2026-11-19
+
+### Changed
+- **Disabled Gemini Nano Compilation (`app/build.gradle.kts`, `GeminiNanoTextProcessor`, `GeminiNanoSettingsComponents`, `GeminiNanoTest`):**
+  - Left the complete Android AICore Gemini Nano implementation, Settings panel (`GeminiNanoSettingsComponents.kt`), and unit tests (`GeminiNanoTest.kt`) intact in the repository, while disabling `com.google.mlkit:genai-prompt` and excluding `**/GeminiNano*.kt` and Gemini Nano integration paths from app compilation (`enableGeminiNano = false`) until further on-device refinement.
+  - Preserved the **`Gemma 4 E2B` (`2.41 GB`)** streamlined local LiteRT-LM catalog and automatic legacy storage cleanup alongside Cloud/OpenAI-compatible APIs.
+
 ## [2.23.0] - 2026-11-19
 
 ### Added
